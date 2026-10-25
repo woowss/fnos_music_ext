@@ -82,7 +82,6 @@ def suite_environment(name: str, work: Path) -> dict[str, str]:
         "FNMUSIC_PLAY_HISTORY_DIR": isolation_root / "history",
         "FNMUSIC_RECOMMEND_DIR": isolation_root / "recommend",
         "FNMUSIC_LIBRARY_DIR": isolation_root / "music-library",
-        "FNMUSIC_TEE_SAVE_DIR": isolation_root / "music-library",
         "FNMUSIC_NM_PLAYLISTS_DIR": isolation_root / "nm-playlists",
         "FNMUSIC_PUBLIC_PLAYLISTS_DIR": isolation_root / "public-playlists",
         "WEBUI_REPO_DIR": isolation_root / "repo",
@@ -94,6 +93,9 @@ def suite_environment(name: str, work: Path) -> dict[str, str]:
     env.update({
         "FNMUSIC_TEST_ISOLATION_ROOT": str(isolation_root),
         "FNMUSIC_HOME": str(isolation_root),
+        # Empty selects the isolated library discovered from CONF at runtime.
+        # A separate explicit tee directory would bypass per-test library paths.
+        "FNMUSIC_TEE_SAVE_DIR": "",
         "FNMUSIC_MUSIC_DB": str(isolation_root / "music.db"),
         "FNMUSIC_UPSTREAM_SOCK": str(isolation_root / "upstream.sock"),
         "FNMUSIC_ENV_FILE": str(isolation_root / ".env"),

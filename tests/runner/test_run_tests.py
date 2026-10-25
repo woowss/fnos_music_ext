@@ -57,6 +57,7 @@ def test_proxy_suite_environment_isolated_and_parent_unchanged(tmp_path, monkeyp
     parent_home = str(tmp_path / "external-home")
     monkeypatch.setenv("PYTHONPATH", inherited_pythonpath)
     monkeypatch.setenv("FNMUSIC_HOME", parent_home)
+    monkeypatch.setenv("FNMUSIC_TEE_SAVE_DIR", str(tmp_path / "external-tee"))
     parent_environment = os.environ.copy()
     work = tmp_path / "runner"
     work.mkdir()
@@ -73,13 +74,13 @@ def test_proxy_suite_environment_isolated_and_parent_unchanged(tmp_path, monkeyp
     for key in (
         "FNMUSIC_LOG_DIR", "FNMUSIC_CACHE_DIR", "FNMUSIC_FAV_DIR",
         "FNMUSIC_PLAY_HISTORY_DIR", "FNMUSIC_RECOMMEND_DIR",
-        "FNMUSIC_LIBRARY_DIR", "FNMUSIC_TEE_SAVE_DIR",
+        "FNMUSIC_LIBRARY_DIR",
         "FNMUSIC_NM_PLAYLISTS_DIR", "FNMUSIC_PUBLIC_PLAYLISTS_DIR",
         "WEBUI_REPO_DIR",
     ):
         assert Path(env[key]).is_relative_to(root), key
         assert Path(env[key]).is_dir(), key
-    assert env["FNMUSIC_LIBRARY_DIR"] == env["FNMUSIC_TEE_SAVE_DIR"]
+    assert env["FNMUSIC_TEE_SAVE_DIR"] == ""
     for key, filename in (
         ("FNMUSIC_MUSIC_DB", "music.db"),
         ("FNMUSIC_UPSTREAM_SOCK", "upstream.sock"),

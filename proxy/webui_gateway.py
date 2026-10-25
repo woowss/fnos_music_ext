@@ -390,6 +390,11 @@ def handle_maintenance(client: socket.socket, head_raw: bytes, method: str, targ
             if key in headers:
                 raise ValueError("重复请求头")
             headers[key] = value.strip()
+        if "transfer-encoding" in headers:
+            raise ValueError("不支持 Transfer-Encoding")
+        length = headers.get("content-length", "0")
+        if not re.fullmatch(r"[0-9]{1,10}", length) or int(length) > MAINTENANCE_MAX_BODY:
+            raise ValueError("Content-Length 无效")
         # Keep strict raw-claim parsing for privileged gateway handlers. The
         # claim remains untrusted and is not an authentication proof.
         if not _admin_claim_from_raw_head(head_raw):
@@ -400,11 +405,6 @@ def handle_maintenance(client: socket.socket, head_raw: bytes, method: str, targ
                 (method == "GET" and re.fullmatch(cleanup + r"/[0-9a-fA-F]{32}", target))):
             client.sendall(_json_response(404, {"ok": False, "error": "未知维护接口"}))
             return
-        if "transfer-encoding" in headers:
-            raise ValueError("不支持 Transfer-Encoding")
-        length = headers.get("content-length", "0")
-        if not re.fullmatch(r"[0-9]{1,10}", length) or int(length) > MAINTENANCE_MAX_BODY:
-            raise ValueError("Content-Length 无效")
         body = head_raw.split(b"\r\n\r\n", 1)[1][:int(length)]
         deadline = time.monotonic() + CONNECT_TIMEOUT
         while len(body) < int(length):

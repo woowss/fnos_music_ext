@@ -395,6 +395,76 @@ def test_maintenance_rejects_bad_headers(tmp_path, extra):
     assert _request(sock, _maintenance_request(extra=extra)).startswith(b"HTTP/1.1 400")
 
 
+@pytest.mark.parametrize(
+    ("content_length", "transfer_encoding", "admin", "expected", "expected_auth_checks"),
+    [
+        ("64", "chunked", "true", b"HTTP/1.1 400", 0),
+        (None, "chunked", "true", b"HTTP/1.1 400", 0),
+        ("invalid", None, "true", b"HTTP/1.1 400", 0),
+        (str(_MOD.MAINTENANCE_MAX_BODY + 1), None, "true", b"HTTP/1.1 400", 0),
+        ("64", None, "false", b"HTTP/1.1 403", 1),
+    ],
+)
+def test_maintenance_rejects_before_body_or_backend_io(
+    monkeypatch, content_length, transfer_encoding, admin, expected,
+    expected_auth_checks,
+):
+    class Client:
+        def __init__(self):
+            self.responses = []
+            self.recv_calls = 0
+            self.closed = False
+
+        def settimeout(self, _timeout):
+            pass
+
+        def sendall(self, data):
+            self.responses.append(data)
+
+        def recv(self, _size):
+            self.recv_calls += 1
+            raise AssertionError("rejected requests must not read a request body")
+
+        def close(self):
+            self.closed = True
+
+    client = Client()
+    auth_checks = []
+    backend_calls = []
+    check_admin = _MOD._admin_claim_from_raw_head
+
+    def tracked_admin_check(head):
+        auth_checks.append(True)
+        return check_admin(head)
+
+    def backend_socket(*_args, **_kwargs):
+        backend_calls.append(True)
+        raise AssertionError("rejected requests must not create a backend socket")
+
+    monkeypatch.setattr(_MOD, "_admin_claim_from_raw_head", tracked_admin_check)
+    monkeypatch.setattr(_MOD.socket, "socket", backend_socket)
+    headers = [
+        "POST /api/maintenance/cleanup HTTP/1.1",
+        "Host: localhost",
+        f"X-Trim-Isadmin: {admin}",
+    ]
+    if content_length is not None:
+        headers.append(f"Content-Length: {content_length}")
+    if transfer_encoding is not None:
+        headers.append(f"Transfer-Encoding: {transfer_encoding}")
+    # Keep any declared positive Content-Length, but intentionally provide only
+    # the head. A rejected request must not attempt to read a missing body.
+    raw = "\r\n".join(headers).encode("ascii") + b"\r\n\r\n"
+
+    _MOD.handle_maintenance(client, raw, "POST", "/api/maintenance/cleanup")
+
+    assert client.responses[0].startswith(expected)
+    assert client.recv_calls == 0
+    assert len(auth_checks) == expected_auth_checks
+    assert backend_calls == []
+    assert client.closed
+
+
 @pytest.mark.parametrize("prefix", ["", "/app/fnmusic-ext"])
 def test_maintenance_real_unix_delegation(tmp_path, monkeypatch, prefix):
     spec = importlib.util.spec_from_file_location(
