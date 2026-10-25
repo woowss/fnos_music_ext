@@ -16,6 +16,8 @@
 首版不包括自动同步、整理已有媒体或直接写官方音乐数据库。
 音频取得和 NCM 转换的受支持路径仍需验证；账号登录、预览可用不等于文件可下载。
 
+NetEase-MusicBox 版本 `0.5.3` 已由固定 CI 运行及 PyPI SHA-256 核验；其歌单、播放 URL、Cookie 与独立 CLI 文件写入源码证据见[静态交付与调用路径记录](NETEASE_DELIVERY_EVIDENCE.md)。这不证明扩展已接通该下载 CLI、NCM→FLAC、G0 或 NAS 曲库验收。
+
 ## 2. 版本与已有工作
 
 实际开发工作区为 `E:\fnmusic-ext-dev`，Git common directory 为其 `.git`。
