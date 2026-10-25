@@ -236,6 +236,17 @@ def _fs_check(sock_path: Path, path: str, is_admin: str = "true") -> "tuple[byte
     return head.split(b"\r\n", 1)[0], (json.loads(body.decode()) if body else {})
 
 
+def test_probe_dir_writable_preserves_preexisting_name_collision(tmp_path: Path, monkeypatch):
+    fixed_uuid = type("FixedUUID", (), {"hex": "0123456789abcdef"})()
+    monkeypatch.setattr(_MOD.os, "getpid", lambda: 4242)
+    monkeypatch.setattr(_MOD.uuid, "uuid4", lambda: fixed_uuid)
+    probe = tmp_path / ".fnmusic-fscheck-4242-01234567"
+    probe.write_bytes(b"pre-existing data")
+
+    assert _MOD._probe_dir_writable(str(tmp_path)) is False
+    assert probe.read_bytes() == b"pre-existing data"
+
+
 def test_fs_check_requires_admin(tmp_path: Path):
     upstream = _TestHTTPServer(("127.0.0.1", 0), _Handler)
     port = upstream.server_address[1]

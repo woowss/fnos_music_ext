@@ -227,17 +227,28 @@ def handle_host_file(client: socket.socket, headers: dict[str, str], head_raw: b
 def _probe_dir_writable(path: str) -> bool:
     """写入试探：os.access 对只读挂载等场景可能误报，落一个临时文件再删才算数。"""
     probe = os.path.join(path, f".fnmusic-fscheck-{os.getpid()}-{uuid.uuid4().hex[:8]}")
+    fd = None
+    created = False
     try:
         fd = os.open(probe, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600)
-        os.close(fd)
+        created = True
+        close_fd, fd = fd, None
+        os.close(close_fd)
         return True
     except OSError:
         return False
     finally:
-        try:
-            os.unlink(probe)
-        except OSError:
-            pass
+        if fd is not None:
+            close_fd, fd = fd, None
+            try:
+                os.close(close_fd)
+            except OSError:
+                pass
+        if created:
+            try:
+                os.unlink(probe)
+            except OSError:
+                pass
 
 
 def handle_fs_check(client: socket.socket, headers: dict[str, str], head_raw: bytes) -> None:
