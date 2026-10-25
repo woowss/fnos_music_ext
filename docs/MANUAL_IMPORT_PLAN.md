@@ -21,10 +21,16 @@
 实际开发工作区为 `E:\fnmusic-ext-dev`，Git common directory 为其 `.git`。
 独立的 `E:\fnmusic` 桌面客户端工作区不属于本批实现范围。
 
-当前工作树有 38 条未提交状态路径（13 个已跟踪文件修改、25 个未跟踪文件），
-涵盖预览、离线任务/字节核心、身份解析与维护观察候选及其文档/测试；必须保留。
-`origin/main` 当前仍指向同一基准提交 `839fd314015e6e9fd1c1da5641a5c0d20d61b722`；
-这只证明提交引用一致。工作树改动仍是本地未提交内容，尚未与云端同步；本轮没有提交、推送或部署。
+本次文档修订前的只读快照（2026-10-25）：工作区位于分支
+`codex/fnmusic-prelaunch-20261025`，HEAD 为
+`d1dd9e604f065ba56fcc781cfd087a30a369ab19`，当时工作树干净。只读命令
+`git ls-remote origin refs/heads/codex/fnmusic-prelaunch-20261025` 返回该提交，
+`git ls-remote origin refs/heads/main` 返回基准提交
+`839fd314015e6e9fd1c1da5641a5c0d20d61b722`。这核验的是远端 `origin` 上的分支引用，
+不代表本地存在对应的 `refs/remotes/origin/*`。当前工作树因本次文档修订而有未提交改动。
+候选分支的提交级同步不表示 PR 已合并或应用已部署。
+本文早先记录的 38 条未提交状态路径属于更早的候选快照，现已过期；该记录不表示
+当时每个未提交文件都进入了当前分支。
 
 | 项目 | 已有证据 | 尚不能证明 |
 | --- | --- | --- |
@@ -34,7 +40,7 @@
 | OfflineLinuxStore 候选 | [POSIX 候选契约](OFFLINE_POSIX_STORE.md)；此前隔离 Linux 运行 22 项 POSIX 测试通过 | 候选没有接入服务、HTTP 路由、任务 worker 或 NAS 曲库；测试不证明生产授权、NAS/Btrfs 耐久性或真实曲库行为 |
 | Linux 账本/core/POSIX 集成候选 | [流水线验证记录](OFFLINE_SAVE_PIPELINE.md)：隔离 Linux 运行 5 项测试通过、0 跳过 | 仅为 `/tmp` 中合成 SQLite、测试字节及临时目录；没有真实音频、NCM 转换、生产接线、目标曲库或 NAS 验收 |
 | 手动保存与导入 | 本文方案与验收条件；用户保存/导入功能尚未实现或部署 | 实际用户保存、整歌单导入及 NAS 落库 |
-| 已安装网关脚本 | 2026-10-22 的历史观察中，已安装 `proxy/webui_gateway.py` 哈希 `b87e39fd8e03fed104a59e9926891c353c4c09d695142182486fe074d78fdb22` 与旧 `main@c4a257a007c355b483c9916df834bf615d5d7351` 源码一致 | 该文件不同于当前基准 `main@839fd314015e6e9fd1c1da5641a5c0d20d61b722` 的哈希 `8113788dfe63a42584148989e6802bb5e6bbf49dd5c1c0c96025ff61af9f511f`；当前 dirty candidate 未部署；该观察不能证明整套已安装源码与当前工作区一致 |
+| 已安装网关脚本 | 2026-10-22 的历史观察中，已安装 `proxy/webui_gateway.py` 哈希 `b87e39fd8e03fed104a59e9926891c353c4c09d695142182486fe074d78fdb22` 与旧 `main@c4a257a007c355b483c9916df834bf615d5d7351` 源码一致 | 该文件不同于当前基准 `main@839fd314015e6e9fd1c1da5641a5c0d20d61b722` 的哈希 `8113788dfe63a42584148989e6802bb5e6bbf49dd5c1c0c96025ff61af9f511f`；当前候选分支尚未部署；该观察不能证明整套已安装源码与当前工作区一致 |
 | 目标曲库 | 原生 UI 显示 `music` 库位于 `/vol1/1000/music` | 最终目标选择、写权限、覆盖授权 |
 | NCM、实际落盘与入库 | 尚未执行真实验收 | 已转换、已保存、已索引 |
 
