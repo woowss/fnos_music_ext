@@ -14,10 +14,10 @@
 ```bash
 python3 -m py_compile proxy/app.py proxy/recommend.py proxy/env_merge.py
 while IFS= read -r -d '' script; do bash -n "$script"; done < <(git ls-files -z '*.sh')
-python3 -m pytest   # 单条命令跑全部测试（proxy + 各音源服务），见 pytest.ini
+python3 scripts/run_tests.py --jobs 2  # 与 CI 相同的隔离套件调度，见 pytest.ini
 ```
 
-提 PR 前请确保 `python3 -m pytest` 全绿。CI 在 main/dev 的 push 和所有 PR 上执行：
+提 PR 前请确保 `python3 scripts/run_tests.py --jobs 2` 全绿。CI 在 main/dev 的 push 和所有 PR 上执行：
 
 - Python 3.11/3.13 确定性测试、逐文件 Shell 语法检查、阻断式 Shellcheck error 检查。
 - 三个音源各自安装真实生产依赖，运行离线导入和 CLI 契约检查。

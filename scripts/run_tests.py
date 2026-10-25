@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the offline suites without sharing app/conftest/environment globals.
 
-Usage: python3 scripts/run_tests.py [--jobs 1] [--suite webui] [--coverage]
+Usage: python3 scripts/run_tests.py [--jobs 1] [--suite webui|offline] [--coverage]
 Proxy/socket/deployment tests and infrastructure tests run exclusively. Only
 service suites may overlap, in separate interpreters; no xdist is involved.
 Node behavior tests are already included by webui-service/test_app_js.py.
@@ -29,6 +29,8 @@ PHASES = (
         "lxmusic": ("lxmusic-service",),
     },
     {"infrastructure": ("container", "packaging/tests", "tests/runner")},
+    # Keep stdlib-only safety regressions in their own interpreter and phase.
+    {"offline": ("offline_tests",)},
 )
 SUITES = {name: paths for phase in PHASES for name, paths in phase.items()}
 COVERAGE_TARGETS = (
@@ -49,6 +51,62 @@ def pytest_command(paths: tuple[str, ...], coverage: bool) -> list[str]:
         command.extend(f"--cov={target}" for target in COVERAGE_TARGETS)
         command.append("--cov-report=")
     return command
+
+
+def print_child_log(text: str) -> None:
+    """Write decoded child output without failing on the console code page."""
+    stream = sys.stdout
+    encoding = getattr(stream, "encoding", None)
+    if encoding:
+        text = text.encode(encoding, errors="backslashreplace").decode(encoding)
+    stream.write(text)
+    stream.flush()
+
+
+def suite_environment(name: str, work: Path) -> dict[str, str]:
+    """Build a suite environment without leaking test state to the caller."""
+    env = os.environ.copy()
+    if name != "proxy":
+        return env
+
+    isolation_root = (work / "proxy" / "app").resolve()
+    directory_paths = {
+        "HOME": isolation_root / "home",
+        "USERPROFILE": isolation_root / "home",
+        "XDG_CONFIG_HOME": isolation_root / "xdg" / "config",
+        "XDG_DATA_HOME": isolation_root / "xdg" / "data",
+        "XDG_CACHE_HOME": isolation_root / "xdg" / "cache",
+        "FNMUSIC_LOG_DIR": isolation_root / "logs",
+        "FNMUSIC_CACHE_DIR": isolation_root / "cache",
+        "FNMUSIC_FAV_DIR": isolation_root / "favorites",
+        "FNMUSIC_PLAY_HISTORY_DIR": isolation_root / "history",
+        "FNMUSIC_RECOMMEND_DIR": isolation_root / "recommend",
+        "FNMUSIC_LIBRARY_DIR": isolation_root / "music-library",
+        "FNMUSIC_TEE_SAVE_DIR": isolation_root / "music-library",
+        "FNMUSIC_NM_PLAYLISTS_DIR": isolation_root / "nm-playlists",
+        "FNMUSIC_PUBLIC_PLAYLISTS_DIR": isolation_root / "public-playlists",
+        "WEBUI_REPO_DIR": isolation_root / "repo",
+    }
+    for directory in directory_paths.values():
+        directory.mkdir(parents=True, exist_ok=True)
+
+    env.update({key: str(value) for key, value in directory_paths.items()})
+    env.update({
+        "FNMUSIC_TEST_ISOLATION_ROOT": str(isolation_root),
+        "FNMUSIC_HOME": str(isolation_root),
+        "FNMUSIC_MUSIC_DB": str(isolation_root / "music.db"),
+        "FNMUSIC_UPSTREAM_SOCK": str(isolation_root / "upstream.sock"),
+        "FNMUSIC_ENV_FILE": str(isolation_root / ".env"),
+        "FNMUSIC_LLM_USAGE_FILE": str(isolation_root / "llm_usage.json"),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    })
+
+    proxy_dir = str((ROOT.resolve() / "proxy").resolve())
+    inherited_pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join(
+        [proxy_dir] + ([inherited_pythonpath] if inherited_pythonpath else [])
+    )
+    return env
 
 
 def stop_children(running: dict[str, Running]) -> None:
@@ -96,7 +154,7 @@ def run_phase(
                     exhausted = True
                     break
                 name, paths = entry
-                env = os.environ.copy()
+                env = suite_environment(name, work)
                 # Each process owns its cache and coverage output. tmp_path uses
                 # pytest's unique per-session base (short enough for Unix sockets).
                 env["COVERAGE_FILE"] = str(work / "coverage" / f".coverage.{name}")
@@ -119,7 +177,7 @@ def run_phase(
                     continue
                 elapsed = time.monotonic() - item.started
                 item.log.seek(0)
-                print(item.log.read().decode("utf-8", errors="replace"), end="", flush=True)
+                print_child_log(item.log.read().decode("utf-8", errors="replace"))
                 item.log.close()
                 print(f"=== {name}: exit {code}, {elapsed:.2f}s ===", flush=True)
                 results[name] = code

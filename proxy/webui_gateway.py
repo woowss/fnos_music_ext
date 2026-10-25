@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import errno
 import os
 import re
 import http.client
@@ -28,6 +29,12 @@ import time
 import uuid
 from urllib.parse import unquote
 from pathlib import Path
+
+if __package__:
+    from . import gateway_identity, gateway_observation
+else:  # direct execution from the proxy source directory
+    import gateway_identity
+    import gateway_observation
 
 UPSTREAM = ("127.0.0.1", 8774)
 SOCK_NAME = "fnmusic-ext.sock"
@@ -145,10 +152,36 @@ def _json_response(status: int, obj: dict) -> bytes:
                           "application/json; charset=utf-8")
 
 
+def _admin_claim_from_raw_head(head_raw: bytes) -> bool:
+    """Return whether one canonical admin claim exists in a well-formed head.
+
+    The shared parser deliberately returns an untrusted claim, not an
+    authorization decision. This only removes duplicate/malformed-header
+    order ambiguity before these two privileged gateway handlers act.
+    """
+    header, separator, _body = head_raw.partition(b"\r\n\r\n")
+    if not separator:
+        return False
+    lines = header.split(b"\r\n")
+    if not lines:
+        return False
+    pairs: list[tuple[bytes, bytes]] = []
+    for line in lines[1:]:
+        name, colon, value = line.partition(b":")
+        if not colon:
+            return False
+        pairs.append((name, value))
+    try:
+        claims = gateway_identity.parse_untrusted_identity(pairs)
+    except gateway_identity.HeaderClaimsError:
+        return False
+    return claims.admin_claim is True
+
+
 def handle_host_file(client: socket.socket, headers: dict[str, str], head_raw: bytes) -> None:
     """POST /api/host-file：校验 admin + .js 路径，读文件内容回 JSON {script}。"""
     try:
-        if headers.get("x-trim-isadmin", "").lower() != "true":
+        if not _admin_claim_from_raw_head(head_raw):
             client.sendall(_json_response(403, {"ok": False, "error": "仅管理员可读取主机文件"}))
             return
         body = _read_full_body(client, headers, head_raw)
@@ -212,7 +245,7 @@ def handle_fs_check(client: socket.socket, headers: dict[str, str], head_raw: by
     root 跑的 proxy）探测目录存在性与可写性。无副作用：不创建目录，临时探测
     文件即落即删。目录不存在时用最近存在祖先目录的可写性代表"能否创建"。"""
     try:
-        if headers.get("x-trim-isadmin", "").lower() != "true":
+        if not _admin_claim_from_raw_head(head_raw):
             client.sendall(_json_response(403, {"ok": False, "error": "仅管理员可校验目录"}))
             return
         body = _read_full_body(client, headers, head_raw, FS_CHECK_MAX_BODY)
@@ -263,19 +296,42 @@ def handle_fs_check(client: socket.socket, headers: dict[str, str], head_raw: by
             pass
 
 
-def serve(sock_path: Path, upstream: tuple[str, int] = UPSTREAM) -> None:
-    sock_path.parent.mkdir(parents=True, exist_ok=True)
+def serve(sock_path: Path, upstream: tuple[str, int] = UPSTREAM,
+          observer: "gateway_observation.GatewayObserver | None" = None) -> None:
+    server = None
     try:
-        sock_path.unlink()
-    except FileNotFoundError:
-        pass
-    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server.bind(str(sock_path))
-    os.chmod(sock_path, 0o666)
-    server.listen(64)
-    while True:
-        client, _addr = server.accept()
-        threading.Thread(target=_handle, args=(client, upstream), daemon=True).start()
+        sock_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            sock_path.unlink()
+        except FileNotFoundError:
+            pass
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(sock_path))
+        os.chmod(sock_path, 0o666)
+        server.listen(64)
+        if observer is not None:
+            try:
+                observer.start()
+            except Exception:
+                # Observation must never change the gateway's service behavior.
+                pass
+        while True:
+            client, _addr = server.accept()
+            if observer is None:
+                thread = threading.Thread(target=_handle, args=(client, upstream), daemon=True)
+            else:
+                thread = threading.Thread(
+                    target=_handle, args=(client, upstream, observer), daemon=True,
+                )
+            thread.start()
+    finally:
+        if observer is not None:
+            try:
+                observer.stop()
+            except Exception:
+                pass
+        if server is not None:
+            server.close()
 
 
 def _post_request_path(head_raw: bytes) -> "str | None":
@@ -334,7 +390,9 @@ def handle_maintenance(client: socket.socket, head_raw: bytes, method: str, targ
             if key in headers:
                 raise ValueError("重复请求头")
             headers[key] = value.strip()
-        if headers.get("x-trim-isadmin", "").lower() != "true":
+        # Keep strict raw-claim parsing for privileged gateway handlers. The
+        # claim remains untrusted and is not an authentication proof.
+        if not _admin_claim_from_raw_head(head_raw):
             client.sendall(_json_response(403, {"ok": False, "error": "仅管理员可执行维护"}))
             return
         cleanup = MAINTENANCE_ROOT + "/cleanup"
@@ -393,13 +451,21 @@ def handle_maintenance(client: socket.socket, head_raw: bytes, method: str, targ
         client.close()
 
 
-def _handle(client: socket.socket, upstream: tuple[str, int]) -> None:
+def _handle(client: socket.socket, upstream: tuple[str, int],
+            observer: "gateway_observation.GatewayObserver | None" = None) -> None:
     client.settimeout(CONNECT_TIMEOUT)
     head = _read_request_head(client)
     if head is None:
         client.close()
         return
     head_raw, headers = head
+    if observer is not None:
+        try:
+            # Inspect only the already-read request head. Any diagnostic failure
+            # is isolated from the original branch and forwarding bytes below.
+            observer.observe(client, head_raw)
+        except Exception:
+            pass
     maintenance = _maintenance_target(head_raw)
     if maintenance is not None:
         handle_maintenance(client, head_raw, *maintenance)
@@ -457,21 +523,147 @@ def _daemonize() -> None:
             pass
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = argv if argv is not None else sys.argv[1:]
-    base = Path(args[0]) if args else Path(__file__).resolve().parent.parent
-    path = socket_path_for(base)
-    _stop_previous()
-    _daemonize()
-    PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-    PID_FILE.write_text(str(os.getpid()))
-    try:
-        serve(path)
-    finally:
+def _parse_main_args(args: list[str] | None) -> tuple[Path, gateway_observation.ObservationOptions | None] | None:
+    values = list(sys.argv[1:] if args is None else args)
+    positional: list[str] = []
+    marker: str | None = None
+    seconds: int | None = None
+    index = 0
+    while index < len(values):
+        value = values[index]
+        if value in ("--g0-observe-marker", "--g0-observe-seconds"):
+            if index + 1 >= len(values):
+                return None
+            parameter = values[index + 1]
+            if value == "--g0-observe-marker":
+                if marker is not None:
+                    return None
+                marker = parameter
+            else:
+                if seconds is not None or not parameter or not parameter.isascii() or not parameter.isdecimal():
+                    return None
+                try:
+                    seconds = int(parameter, 10)
+                except ValueError:
+                    return None
+            index += 2
+            continue
+        if value.startswith("--"):
+            return None
+        positional.append(value)
+        index += 1
+
+    if len(positional) > 1 or (seconds is not None and marker is None):
+        return None
+    if marker is None:
+        if seconds is not None:
+            return None
+        options = None
+    else:
         try:
-            PID_FILE.unlink()
-        except OSError:
-            pass
+            options = gateway_observation.validate_options(marker, seconds if seconds is not None else 60)
+        except gateway_observation.ObservationSetupError:
+            return None
+    base = Path(positional[0]) if positional else Path(__file__).resolve().parent.parent
+    return base, options
+
+
+def _diagnostic_previous_pid_is_live() -> bool:
+    """Return whether a readable PID file still names a live process.
+
+    Malformed or inaccessible records fail closed with a stable startup error.
+    This diagnostic-only check never signals a process or changes a socket.
+    """
+    try:
+        raw_pid = PID_FILE.read_text(encoding="ascii").strip()
+    except FileNotFoundError:
+        return False
+    except UnicodeError:
+        raise gateway_observation.ObservationSetupError("PID_FILE_INVALID") from None
+    except OSError:
+        raise gateway_observation.ObservationSetupError("PID_FILE_READ_FAILED") from None
+    if not raw_pid or not raw_pid.isascii() or not raw_pid.isdecimal():
+        raise gateway_observation.ObservationSetupError("PID_FILE_INVALID")
+    try:
+        pid = int(raw_pid, 10)
+    except ValueError:
+        raise gateway_observation.ObservationSetupError("PID_FILE_INVALID") from None
+    if pid <= 0:
+        raise gateway_observation.ObservationSetupError("PID_FILE_INVALID")
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            return False
+        if exc.errno == errno.EPERM:
+            return True
+        raise gateway_observation.ObservationSetupError("PID_CHECK_FAILED") from None
+    except OverflowError:
+        raise gateway_observation.ObservationSetupError("PID_FILE_INVALID") from None
+    return True
+
+
+def main(argv: list[str] | None = None) -> int:
+    parsed = _parse_main_args(argv)
+    if parsed is None:
+        return 2
+    base, options = parsed
+    observer = None
+    if options is not None:
+        output_fd = None
+        try:
+            if _diagnostic_previous_pid_is_live():
+                return 3
+            output_fd = gateway_observation.prepare_output_fd(options.marker)
+            observer = gateway_observation.GatewayObserver(
+                options.marker, options.seconds, output_fd,
+            )
+            output_fd = None
+        except gateway_observation.ObservationSetupError:
+            if output_fd is not None:
+                try:
+                    os.close(output_fd)
+                except OSError:
+                    pass
+            return 3
+        except Exception:
+            if output_fd is not None:
+                try:
+                    os.close(output_fd)
+                except OSError:
+                    pass
+            return 3
+    try:
+        path = socket_path_for(base)
+        if options is None:
+            _stop_previous()
+        _daemonize()
+        PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PID_FILE.write_text(str(os.getpid()))
+    except Exception:
+        if observer is not None:
+            observer.stop()
+        return 4
+    try:
+        if observer is None:
+            serve(path)
+        else:
+            serve(path, observer=observer)
+    finally:
+        if observer is None:
+            try:
+                PID_FILE.unlink()
+            except OSError:
+                pass
+        else:
+            try:
+                observer.stop()
+            except Exception:
+                pass
     return 0
 
 

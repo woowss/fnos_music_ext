@@ -508,6 +508,298 @@ def playlist_track_ids(playlist_id: int) -> "list[int] | None":
     return ids
 
 
+_PLAYLIST_PREVIEW_MAX_POSITIONS = 1000
+_PLAYLIST_PREVIEW_DETAIL_BATCH_SIZE = 100
+_PLAYLIST_PREVIEW_VERSION_FIELDS = ("updateTime", "trackUpdateTime", "trackNumberUpdateTime")
+
+
+class _PlaylistPreviewUnsupported(Exception):
+    """The upstream response cannot support a bounded, comparable preview."""
+
+
+def _strict_account_id(value: Any) -> int | None:
+    if type(value) is int and value > 0:
+        return value
+    if isinstance(value, str) and value.isascii() and value.isdecimal():
+        parsed = int(value)
+        return parsed if parsed > 0 else None
+    return None
+
+
+def _playlist_preview_source_id(item: Any) -> tuple[int | None, tuple[Any, ...]]:
+    raw_id = item.get("id") if isinstance(item, dict) else item
+    if type(raw_id) is int and raw_id > 0:
+        return raw_id, ("id", raw_id)
+    try:
+        marker = json.dumps(raw_id, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        marker = type(raw_id).__name__
+    return None, ("invalid", type(raw_id).__name__, marker)
+
+
+def _playlist_preview_snapshot(api: Any, playlist_id: int) -> dict[str, Any]:
+    raw = api.eapi_request("/api/v6/playlist/detail", {
+        "id": int(playlist_id), "n": _PLAYLIST_PREVIEW_MAX_POSITIONS, "s": 0,
+    })
+    if not isinstance(raw, dict):
+        raise _PlaylistPreviewUnsupported("playlist response is not an object")
+    if raw.get("code", 200) != 200:
+        raise RuntimeError("playlist detail request failed")
+    playlist = raw.get("playlist")
+    if not isinstance(playlist, dict) or not isinstance(playlist.get("trackIds"), list):
+        raise _PlaylistPreviewUnsupported("playlist track list is unavailable")
+
+    track_count = playlist.get("trackCount")
+    if type(track_count) is not int or track_count < 0:
+        raise _PlaylistPreviewUnsupported("playlist track count is not comparable")
+
+    version = {
+        field: playlist[field]
+        for field in _PLAYLIST_PREVIEW_VERSION_FIELDS
+        if type(playlist.get(field)) is int and playlist[field] >= 0
+    }
+    if not version:
+        raise _PlaylistPreviewUnsupported("playlist version is not comparable")
+
+    source_entries = [_playlist_preview_source_id(item) for item in playlist["trackIds"]]
+    return {
+        "track_count": track_count,
+        "version": version,
+        "track_ids": [entry[0] for entry in source_entries],
+        "sequence": tuple(entry[1] for entry in source_entries),
+        "position_count": len(source_entries),
+    }
+
+
+def _read_playlist_preview_source(playlist_id: int) -> tuple[int | None, dict[str, Any] | None]:
+    with _api_lock:
+        api = _get_api_locked()
+        info = api.get_account_info()
+        if not isinstance(info, dict):
+            raise RuntimeError("account response is unavailable")
+        has_response_code = "code" in info
+        response_code = info.get("code")
+        if has_response_code and type(response_code) is int and response_code == 301:
+            return None, None
+        if has_response_code and (type(response_code) is not int or response_code != 200):
+            raise RuntimeError("account request failed")
+        if "account" not in info and "profile" not in info:
+            raise RuntimeError("account response is unsupported")
+        account = info.get("account") if isinstance(info, dict) else None
+        profile = info.get("profile") if isinstance(info, dict) else None
+        if account is not None and not isinstance(account, dict):
+            raise RuntimeError("account response is unsupported")
+        if profile is not None and not isinstance(profile, dict):
+            raise RuntimeError("account response is unsupported")
+        if not account and not profile:
+            if has_response_code:
+                return None, None
+            raise RuntimeError("account response is unsupported")
+        uid = None
+        for source in (account, profile):
+            if isinstance(source, dict):
+                uid = _strict_account_id(source.get("id")) or _strict_account_id(source.get("userId"))
+                if uid:
+                    break
+        if uid is None:
+            raise RuntimeError("account identifier is unavailable")
+        return uid, _playlist_preview_snapshot(api, playlist_id)
+
+
+def _playlist_preview_song_details(ids: list[int]) -> tuple[dict[int, dict[str, Any]], set[int]]:
+    """Fetch one raw song-detail batch and keep upstream failure distinct from no rows."""
+    if not ids:
+        return {}, set()
+    params = {
+        "c": json.dumps([{"id": song_id} for song_id in ids]),
+        "ids": json.dumps(ids),
+    }
+    with _api_lock:
+        api = _get_api_locked()
+        response = api.request("POST", "/weapi/v3/song/detail", params)
+
+    if (
+        not isinstance(response, dict)
+        or type(response.get("code")) is not int
+        or response.get("code") != 200
+        or not isinstance(response.get("songs"), list)
+    ):
+        raise RuntimeError("song detail batch failed")
+
+    requested = set(ids)
+    detail_map: dict[int, dict[str, Any]] = {}
+    mapping_failures: set[int] = set()
+    for raw_item in response["songs"]:
+        if not isinstance(raw_item, dict):
+            raise RuntimeError("song detail response is unsupported")
+        try:
+            mapped = _map_song_detail(raw_item)
+        except Exception:
+            raw_id = raw_item.get("id") or raw_item.get("song_id")
+            failed_id = _strict_account_id(raw_id)
+            if failed_id is None or failed_id not in requested:
+                raise RuntimeError("song detail mapping failed")
+            mapping_failures.add(failed_id)
+            continue
+        song_id = mapped.get("song_id")
+        if type(song_id) is int and song_id in requested:
+            detail_map[song_id] = mapped
+    return detail_map, mapping_failures
+
+
+def _playlist_preview_base(
+    playlist_id: int,
+    status: str,
+    *,
+    ok: bool,
+    error_code: str | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "ok": ok,
+        "status": status,
+        "complete": False,
+        "enumeration_complete": False,
+        "metadata_complete": False,
+        "import_ready": False,
+        "playlist_id": int(playlist_id),
+    }
+    if error_code:
+        result["error_code"] = error_code
+    return result
+
+
+def user_playlist_preview(playlist_id: int) -> dict[str, Any]:
+    """Return a bounded, ephemeral preview of a logged-in user's playlist.
+
+    This endpoint only reads playlist and song metadata. It never asks for audio
+    URLs, downloads, or writes, and it does not make the preview import-ready.
+    """
+    try:
+        account_uid, before = _read_playlist_preview_source(playlist_id)
+    except _PlaylistPreviewUnsupported:
+        return _playlist_preview_base(
+            playlist_id, "unsupported", ok=True, error_code="UNSUPPORTED_SOURCE",
+        )
+    except Exception as exc:
+        logger.warning("playlist preview source read failed: %s", type(exc).__name__)
+        return _playlist_preview_base(
+            playlist_id, "upstream_error", ok=False, error_code="SOURCE_READ_FAILED",
+        )
+
+    if account_uid is None or before is None:
+        result = _playlist_preview_base(playlist_id, "not_logged_in", ok=False)
+        result.update({"error": "not_logged_in", "logged_in": False})
+        return result
+
+    count = before["track_count"]
+    position_count = before["position_count"]
+    if count > _PLAYLIST_PREVIEW_MAX_POSITIONS or position_count > _PLAYLIST_PREVIEW_MAX_POSITIONS:
+        result = _playlist_preview_base(
+            playlist_id, "unsupported", ok=True, error_code="POSITION_LIMIT_EXCEEDED",
+        )
+        result.update({
+            "track_count": count,
+            "position_count": position_count,
+            "truncated": True,
+        })
+        return result
+
+    track_ids: list[int | None] = before["track_ids"]
+    unique_ids = list(dict.fromkeys(song_id for song_id in track_ids if song_id is not None))
+    detail_map: dict[int, dict[str, Any]] = {}
+    failed_batches: set[int] = set()
+    failed_mappings: set[int] = set()
+    for start in range(0, len(unique_ids), _PLAYLIST_PREVIEW_DETAIL_BATCH_SIZE):
+        batch = unique_ids[start:start + _PLAYLIST_PREVIEW_DETAIL_BATCH_SIZE]
+        try:
+            rows, mapping_failures = _playlist_preview_song_details(batch)
+        except Exception as exc:
+            logger.warning("playlist preview detail batch failed: %s", type(exc).__name__)
+            failed_batches.update(batch)
+            continue
+        detail_map.update(rows)
+        failed_mappings.update(mapping_failures)
+
+    items: list[dict[str, Any]] = []
+    for position, song_id in enumerate(track_ids, start=1):
+        if song_id is None:
+            items.append({
+                "position": position, "song_id": None, "status": "invalid_id",
+                "error_code": "INVALID_TRACK_ID", "song": None,
+            })
+        elif song_id in detail_map:
+            items.append({
+                "position": position, "song_id": song_id, "status": "ok",
+                "error_code": None, "song": detail_map[song_id],
+            })
+        elif song_id in failed_batches:
+            items.append({
+                "position": position, "song_id": song_id, "status": "unavailable",
+                "error_code": "DETAILS_FETCH_FAILED", "song": None,
+            })
+        elif song_id in failed_mappings:
+            items.append({
+                "position": position, "song_id": song_id, "status": "unavailable",
+                "error_code": "DETAIL_MAPPING_FAILED", "song": None,
+            })
+        else:
+            items.append({
+                "position": position, "song_id": song_id, "status": "missing",
+                "error_code": "DETAIL_NOT_FOUND", "song": None,
+            })
+
+    try:
+        after_uid, after = _read_playlist_preview_source(playlist_id)
+    except Exception as exc:
+        logger.warning("playlist preview source recheck failed: %s", type(exc).__name__)
+        after_uid, after = None, None
+
+    same_source = (
+        after_uid == account_uid
+        and after is not None
+        and after["track_count"] == before["track_count"]
+        and after["version"] == before["version"]
+        and after["sequence"] == before["sequence"]
+        and after["position_count"] == before["position_count"]
+    )
+    valid_position_count = sum(song_id is not None for song_id in track_ids)
+    source_shape_complete = (
+        position_count == count
+        and valid_position_count == count
+        and position_count <= _PLAYLIST_PREVIEW_MAX_POSITIONS
+    )
+    enumeration_complete = same_source and source_shape_complete
+    metadata_complete = all(item["status"] == "ok" for item in items)
+
+    if enumeration_complete:
+        status = "complete"
+        error_code = None
+    else:
+        status = "incomplete"
+        if not same_source:
+            error_code = "SOURCE_CHANGED_OR_RECHECK_FAILED"
+        elif position_count != count:
+            error_code = "TRACK_COUNT_MISMATCH"
+        else:
+            error_code = "INVALID_TRACK_ID"
+
+    return {
+        "ok": True,
+        "status": status,
+        "complete": enumeration_complete,
+        "enumeration_complete": enumeration_complete,
+        "metadata_complete": metadata_complete,
+        "import_ready": False,
+        "playlist_id": int(playlist_id),
+        "track_count": count,
+        "position_count": position_count,
+        "account_uid": account_uid,
+        "source_version": before["version"],
+        "items": items,
+        "error_code": error_code,
+    }
+
+
 def _public_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
     from NEMbox.api import BASE_URL
 
