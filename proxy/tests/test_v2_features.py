@@ -2,6 +2,9 @@
 import asyncio
 import json
 import os
+import subprocess
+import sys
+from pathlib import Path
 
 import httpx
 import pytest
@@ -25,6 +28,53 @@ from proxy.app import (
     resolve_netease_url,
     _aggregate_search,
 )
+
+
+@pytest.mark.parametrize(
+    "configured, expected",
+    [(None, "False"), ("true", "True"), ("1", "True"), ("yes", "True"), ("false", "False")],
+)
+def test_tee_save_is_opt_in_when_environment_key_is_missing(configured, expected, tmp_path):
+    """缺省关闭；显式真值仍可开启，显式 false 仍关闭。"""
+    env = os.environ.copy()
+    env.pop("FNMUSIC_TEE_SAVE_ENABLED", None)
+    if configured is not None:
+        env["FNMUSIC_TEE_SAVE_ENABLED"] = configured
+    env["FNMUSIC_HOME"] = str(tmp_path / "home")
+    env["FNMUSIC_LOG_DIR"] = str(tmp_path / "logs")
+    result = subprocess.run(
+        [sys.executable, "-c", "from proxy.app import CONF; print(CONF['tee_save_enabled'])"],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith(expected)
+
+
+def test_installer_tee_save_default_is_opt_in_and_preserves_existing_choice():
+    """fresh env 得到 false；升级时只补缺失项并保留已有用户选择。"""
+    from proxy.env_merge import merge_env
+
+    root = Path(__file__).resolve().parents[2]
+    install = (root / "install.sh").read_text(encoding="utf-8")
+    assert 'echo "FNMUSIC_TEE_SAVE_ENABLED=\'false\'"' in install
+    explicit_start = install.index('ENV_EXPLICIT="')
+    explicit_end = install.index('\nif [ -f "${ENV_PATH}" ]', explicit_start)
+    assert "FNMUSIC_TEE_SAVE_ENABLED" not in install[explicit_start:explicit_end]
+
+    desired = [("FNMUSIC_TEE_SAVE_ENABLED", "false")]
+    for previous in ("true", "false"):
+        merged, summary = merge_env(
+            [("FNMUSIC_TEE_SAVE_ENABLED", previous)], desired, explicit=set()
+        )
+        assert dict(merged)["FNMUSIC_TEE_SAVE_ENABLED"] == previous
+        assert summary["preserved"] == ["FNMUSIC_TEE_SAVE_ENABLED"]
+    merged, summary = merge_env([], desired, explicit=set())
+    assert dict(merged)["FNMUSIC_TEE_SAVE_ENABLED"] == "false"
+    assert summary["added"] == ["FNMUSIC_TEE_SAVE_ENABLED"]
 
 
 @pytest.fixture(autouse=True)
