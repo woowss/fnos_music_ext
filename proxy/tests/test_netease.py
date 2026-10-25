@@ -37,6 +37,7 @@ def setup_netease_env(tmp_path, monkeypatch):
     os.makedirs(fav_dir, exist_ok=True)
     monkeypatch.setitem(CONF, "cache_dir", cache_dir)
     monkeypatch.setitem(CONF, "library_dir", library_dir)
+    monkeypatch.setitem(CONF, "tee_save_dir", library_dir)
     monkeypatch.setitem(CONF, "fav_dir", fav_dir)
     monkeypatch.setitem(CONF, "search_list_path", "data.list")
     monkeypatch.setitem(CONF, "online_limit", 30)

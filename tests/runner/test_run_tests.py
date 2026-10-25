@@ -80,7 +80,12 @@ def test_proxy_suite_environment_isolated_and_parent_unchanged(tmp_path, monkeyp
     ):
         assert Path(env[key]).is_relative_to(root), key
         assert Path(env[key]).is_dir(), key
-    assert env["FNMUSIC_TEE_SAVE_DIR"] == ""
+    tee_save_dir = Path(env["FNMUSIC_TEE_SAVE_DIR"])
+    assert env["FNMUSIC_TEE_SAVE_DIR"]
+    assert tee_save_dir.is_absolute()
+    assert tee_save_dir.is_relative_to(root)
+    assert tee_save_dir == Path(env["FNMUSIC_LIBRARY_DIR"])
+    assert tee_save_dir.is_dir()
     for key, filename in (
         ("FNMUSIC_MUSIC_DB", "music.db"),
         ("FNMUSIC_UPSTREAM_SOCK", "upstream.sock"),
