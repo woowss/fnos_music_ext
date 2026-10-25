@@ -561,6 +561,7 @@ def test_search_merge_lx_items():
 # 4. stream_track lx 分支：直链透传 + tee 落盘 + 缓存回放
 # =========================================================================
 def test_stream_track_lx_direct_stream_and_cache(monkeypatch, tmp_path):
+    monkeypatch.setitem(CONF, "tee_save_enabled", True)
     audio_content = b"KG_TRACKERCDN_FLAC_TEST_PAYLOAD_" * 80
     content_len = str(len(audio_content))
 
