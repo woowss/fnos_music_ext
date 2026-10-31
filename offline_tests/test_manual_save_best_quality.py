@@ -583,6 +583,78 @@ class BestAvailableQualityTests(unittest.TestCase):
         self.assertEqual(result.items[0].reason, "evidence_expired")
         self.assertFalse(result.all_selected)
 
+    def test_playlist_final_recheck_covers_every_selected_song(self):
+        req_a = request(request_id="req-a", attempt_id="attempt-a", song_id=10)
+        req_b = request(request_id="req-b", attempt_id="attempt-b", song_id=20)
+        req_c = request(request_id="req-c", attempt_id="attempt-c", song_id=30)
+        proof_b = [replace(item, expires_at=1056) for item in tier_evidence(req_b)]
+        rows = [
+            (req_a, ladder(), tier_evidence(req_a)),
+            (req_b, ladder(), proof_b),
+            (req_c, ladder(), tier_evidence(req_c)),
+        ]
+        verifier = FakeVerifier()
+        result = policy.evaluate_playlist(
+            rows,
+            verifier,
+            SequenceClock(1050, 1051, 1052, 1053, 1054, 1055, 1056),
+        )
+        self.assertTrue(result.completed)
+        self.assertFalse(result.all_selected)
+        self.assertEqual(result.reason, "playlist_evaluated")
+        self.assertEqual(len(result.items), 3)
+        self.assertIs(result.items[0].status, policy.EvaluationStatus.SELECTED)
+        self.assertEqual(result.items[0].reason, "preferred_tier_available")
+        self.assertIs(result.items[1].status, policy.EvaluationStatus.REJECTED)
+        self.assertEqual(result.items[1].reason, "evidence_expired")
+        self.assertIs(result.items[1].requested_tier, policy.QualityTier.ULTRA_MASTER)
+        self.assertIsNone(result.items[1].selected_tier)
+        self.assertFalse(result.items[1].fallback)
+        self.assertIs(result.items[2].status, policy.EvaluationStatus.SELECTED)
+        self.assertEqual(result.items[2].reason, "preferred_tier_available")
+        self.assertEqual(verifier.calls, 3)
+
+    def test_playlist_final_recheck_applies_to_fallback_selected_song(self):
+        req_a = request(request_id="req-a", attempt_id="attempt-a", song_id=10)
+        req_b = request(request_id="req-b", attempt_id="attempt-b", song_id=20)
+        proof_a = [
+            replace(item, expires_at=1054)
+            for item in tier_evidence(
+                req_a, unavailable=(policy.QualityTier.ULTRA_MASTER,)
+            )
+        ]
+        rows = [
+            (req_a, ladder(), proof_a),
+            (req_b, ladder(), tier_evidence(req_b)),
+        ]
+        fresh = policy.evaluate_playlist(
+            rows,
+            FakeVerifier(),
+            SequenceClock(1050, 1051, 1052, 1053, 1053),
+        )
+        self.assertTrue(fresh.all_selected)
+        self.assertIs(fresh.items[0].status, policy.EvaluationStatus.SELECTED)
+        self.assertIs(fresh.items[0].selected_tier, policy.QualityTier.HI_RES)
+        self.assertTrue(fresh.items[0].fallback)
+
+        verifier = FakeVerifier()
+        expired = policy.evaluate_playlist(
+            rows,
+            verifier,
+            SequenceClock(1050, 1051, 1052, 1053, 1054),
+        )
+        self.assertTrue(expired.completed)
+        self.assertFalse(expired.all_selected)
+        self.assertEqual(expired.reason, "playlist_evaluated")
+        self.assertEqual(len(expired.items), 2)
+        self.assertIs(expired.items[0].status, policy.EvaluationStatus.REJECTED)
+        self.assertEqual(expired.items[0].reason, "evidence_expired")
+        self.assertIs(expired.items[0].requested_tier, policy.QualityTier.ULTRA_MASTER)
+        self.assertIsNone(expired.items[0].selected_tier)
+        self.assertFalse(expired.items[0].fallback)
+        self.assertIs(expired.items[1].status, policy.EvaluationStatus.SELECTED)
+        self.assertEqual(verifier.calls, 2)
+
     def test_playlist_final_recheck_enforces_request_and_age_limits(self):
         stale_req = request(
             request_id="req-a", attempt_id="attempt-a", song_id=10, requested_at=1
