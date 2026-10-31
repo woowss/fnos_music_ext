@@ -102,9 +102,10 @@ function clearDirty() {
 function switchPage(page) {
   $$(".page").forEach((el) => el.classList.toggle("active", el.id === "page-" + page));
   $$("[data-page]").forEach((el) => el.classList.toggle("active", el.dataset.page === page));
-  // 储存父标题：边听边存/目录设置任一子页激活时强调（子项保持各自的实心高亮）
+  // 储存父标题：边听边存/目录设置/保存到 NAS 任一子页激活时强调（子项保持各自的实心高亮）
   const storageTitle = $("#nav-storage-title");
-  if (storageTitle) storageTitle.classList.toggle("active", page === "tee" || page === "dirs");
+  if (storageTitle) storageTitle.classList.toggle("active", page === "tee" || page === "dirs" || page === "save");
+  if (page === "save") loadSaveStatus().catch(() => {});
   if (page === "about") loadAbout().catch((exc) => { $("#about-logs").textContent = "加载失败：" + exc.message; });
 }
 $$("[data-page]").forEach((btn) => btn.addEventListener("click", () => switchPage(btn.dataset.page)));
@@ -1937,6 +1938,229 @@ window.addEventListener("keydown", (ev) => {
     (document.activeElement === cancel ? $("#cleanup-confirm-btn") : cancel).focus();
   }
 });
+
+/* -------------------------------------------------------------- 保存到 NAS */
+const saveState = {
+  enabled: false,
+  statusLoaded: false,
+  searching: false,
+  saving: new Set(),
+  searchSeq: 0,
+};
+
+async function manualSaveApi(path, options = {}) {
+  const headers = Object.assign({}, options.headers || {}, { "x-fnmusic-save": "1" });
+  const resp = await fetch(APP_BASE + path, Object.assign({}, options, { headers }));
+  let body = {};
+  try { body = await resp.json(); } catch (_) { /* 非 JSON 响应 */ }
+  return { status: resp.status, ok: resp.ok, body };
+}
+
+function manualSaveMessage(body, fallback) {
+  if (body && body.code === "conflict") return "目标目录已存在同名文件，未覆盖。";
+  if (body && body.code === "busy") return "已有保存任务进行中，请稍后再试。";
+  if (body && typeof body.message === "string" && body.message) return body.message;
+  return fallback;
+}
+
+function formatSaveSize(bytes) {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value <= 0) return "";
+  return (value / (1024 * 1024)).toFixed(1) + " MB";
+}
+
+function formatSaveDuration(ms) {
+  const totalSeconds = Math.floor(Number(ms) / 1000);
+  if (!Number.isFinite(totalSeconds) || totalSeconds <= 0) return "";
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = String(totalSeconds % 60).padStart(2, "0");
+  return minutes + ":" + seconds;
+}
+
+function setSaveControlsEnabled(enabled) {
+  const input = $("#save-keyword");
+  const button = $("#save-search-btn");
+  if (input) input.disabled = !enabled;
+  if (button) button.disabled = !enabled;
+}
+
+async function loadSaveStatus() {
+  const statusEl = $("#save-status");
+  if (!statusEl) return;
+  try {
+    const { status, ok, body } = await manualSaveApi("/api/manual-save/status");
+    const data = (body && body.data) || {};
+    saveState.enabled = !!(ok && body && body.ok === true && data.enabled === true);
+    saveState.statusLoaded = true;
+    if (saveState.enabled) {
+      const target = typeof data.target_dir === "string" && data.target_dir ? "，目标目录 " + data.target_dir : "";
+      statusEl.textContent = "手动保存已启用" + target + "；保存不会覆盖同名文件。";
+      setSaveControlsEnabled(true);
+    } else if (body && body.code === "disabled") {
+      statusEl.textContent = "手动保存未启用：请在 .env 设置 FNMUSIC_MANUAL_SAVE_ENABLED=true，并填写 FNMUSIC_MANUAL_SAVE_TARGET / FNMUSIC_MANUAL_SAVE_STAGING 后重启代理。";
+      setSaveControlsEnabled(false);
+      const results = $("#save-results");
+      if (results) results.innerHTML = "";
+      const resultEl = $("#save-result");
+      if (resultEl) resultEl.textContent = "";
+    } else {
+      statusEl.textContent = "无法读取手动保存状态（HTTP " + status + "），请确认正通过飞牛桌面打开管理台。";
+      setSaveControlsEnabled(false);
+    }
+  } catch (exc) {
+    saveState.enabled = false;
+    saveState.statusLoaded = true;
+    statusEl.textContent = "读取手动保存状态失败：" + (exc && exc.message ? exc.message : "网络错误");
+    setSaveControlsEnabled(false);
+  }
+}
+
+function renderSaveResults(items) {
+  const container = $("#save-results");
+  if (!container) return;
+  if (!items.length) {
+    container.innerHTML = `<span class="muted pad">没有找到匹配的歌曲</span>`;
+    return;
+  }
+  container.innerHTML = items.map((item) => {
+    const title = escapeHtml(item.title || "未知标题");
+    const meta = [item.artist, item.album, item.quality, formatSaveDuration(item.duration)]
+      .filter((part) => typeof part === "string" && part)
+      .map((part) => escapeHtml(part))
+      .join(" · ");
+    return `
+      <div class="lx-item save-item">
+        <div class="lx-item-main">
+          <div class="lx-item-header"><span class="lx-item-name">${title}</span></div>
+          <div class="lx-item-url">${meta || "未知歌手"}</div>
+        </div>
+        <div class="lx-item-btns">
+          <button class="btn small save-track-btn" type="button" data-song-id="${Number(item.song_id) || 0}">保存</button>
+          <span class="muted save-track-state"></span>
+        </div>
+      </div>`;
+  }).join("");
+  container.querySelectorAll(".save-track-btn").forEach((button) => {
+    button.addEventListener("click", () => { void saveOneTrack(button); });
+  });
+}
+
+async function searchSaveTracks() {
+  if (!saveState.enabled || saveState.searching) return;
+  const input = $("#save-keyword");
+  const resultEl = $("#save-result");
+  const keyword = input ? input.value.trim() : "";
+  if (!keyword) {
+    if (resultEl) resultEl.textContent = "请输入搜索关键词";
+    return;
+  }
+  const seq = ++saveState.searchSeq;
+  saveState.searching = true;
+  const button = $("#save-search-btn");
+  if (button) button.disabled = true;
+  if (resultEl) resultEl.textContent = "搜索中…";
+  try {
+    const { ok, body } = await manualSaveApi(
+      "/api/manual-save/search?keyword=" + encodeURIComponent(keyword),
+    );
+    if (seq !== saveState.searchSeq) return;
+    if (!ok || !body || body.ok !== true) {
+      if (resultEl) resultEl.textContent = "搜索失败：" + manualSaveMessage(body, "服务不可用");
+      renderSaveResults([]);
+      return;
+    }
+    const items = body.data && Array.isArray(body.data.items) ? body.data.items : [];
+    if (resultEl) {
+      resultEl.textContent = items.length
+        ? "共找到 " + items.length + " 首，点击「保存」写入目标目录"
+        : "没有找到匹配的歌曲";
+    }
+    renderSaveResults(items);
+  } catch (exc) {
+    if (seq === saveState.searchSeq && resultEl) {
+      resultEl.textContent = "搜索失败：" + (exc && exc.message ? exc.message : "网络错误");
+    }
+  } finally {
+    if (seq === saveState.searchSeq) {
+      saveState.searching = false;
+      if (button) button.disabled = !saveState.enabled;
+    }
+  }
+}
+
+async function saveOneTrack(button) {
+  if (!saveState.enabled) return;
+  const songId = Number(button.dataset.songId);
+  if (!Number.isInteger(songId) || songId <= 0) return;
+  if (saveState.saving.has(songId)) return;
+  saveState.saving.add(songId);
+  button.disabled = true;
+  const row = button.closest(".save-item");
+  const stateEl = row ? row.querySelector(".save-track-state") : null;
+  if (stateEl) stateEl.textContent = "保存中…";
+  const resultEl = $("#save-result");
+  if (resultEl) resultEl.textContent = "正在保存，请保持页面打开…";
+  try {
+    const { body } = await manualSaveApi("/api/manual-save/track", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ song_id: songId }),
+    });
+    if (body && body.ok === true && body.code === "ok") {
+      const data = body.data || {};
+      const parts = [
+        data.quality_actual, data.format, formatSaveSize(data.size),
+        data.basename, data.target_dir,
+      ].filter((part) => typeof part === "string" && part);
+      const coverLabels = {
+        embedded: "封面已嵌入", preserved: "源封面已保留",
+        unavailable: "音源未提供封面", unsupported: "封面格式不受 MP3 支持",
+        error: "封面获取或嵌入失败",
+      };
+      const lyricLabels = {
+        published: "歌词已保存为同名 LRC", unavailable: "音源未提供歌词",
+        error: "歌词获取或保存失败", conflict: "同名 LRC 已存在，未覆盖",
+        not_attempted: "歌词未处理", unknown: "歌词发布结果待核对",
+      };
+      parts.push(coverLabels[data.cover_status] || "封面状态未知");
+      parts.push(lyricLabels[data.lyric_status] || "歌词状态未知");
+      parts.push(data.artist_status === "tagged" ? "歌手标签已写入" : "音源未提供歌手");
+      const lyricist = data.lyricist_status === "tagged" && data.lyricist
+        ? "词：" + data.lyricist : "词：未提供";
+      const composer = data.composer_status === "tagged" && data.composer
+        ? "曲：" + data.composer : "曲：未提供";
+      parts.push(lyricist + " / " + composer);
+      const metadataFailed = data.cover_status === "error"
+        || data.lyric_status === "error" || data.lyric_status === "unknown";
+      const prefix = metadataFailed
+        ? "音频已发布；部分元数据/歌词附加项失败（文件分开发布）："
+        : "音频已保存；元数据状态：";
+      if (stateEl) stateEl.textContent = "已保存";
+      if (resultEl) resultEl.textContent = prefix + parts.join(" · ");
+    } else if (body && body.code === "conflict") {
+      if (stateEl) stateEl.textContent = "已存在";
+      if (resultEl) resultEl.textContent = "目标目录已存在同名文件，未覆盖。";
+    } else {
+      if (stateEl) stateEl.textContent = "失败";
+      if (resultEl) resultEl.textContent = "保存失败：" + manualSaveMessage(body, "内部错误");
+    }
+  } catch (exc) {
+    if (stateEl) stateEl.textContent = "失败";
+    if (resultEl) resultEl.textContent = "保存失败：" + (exc && exc.message ? exc.message : "网络错误");
+  } finally {
+    saveState.saving.delete(songId);
+    button.disabled = false;
+  }
+}
+
+const saveSearchButton = $("#save-search-btn");
+if (saveSearchButton) saveSearchButton.addEventListener("click", () => { void searchSaveTracks(); });
+const saveKeywordInput = $("#save-keyword");
+if (saveKeywordInput) {
+  saveKeywordInput.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); void searchSaveTracks(); }
+  });
+}
 
 /* -------------------------------------------------------------- 启动 */
 (async function boot() {

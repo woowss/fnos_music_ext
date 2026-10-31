@@ -28,6 +28,7 @@
           <button class="nav-item nav-group-title" id="nav-storage-title">储存</button>
           <button class="nav-item nav-sub" data-page="tee">边听边存</button>
           <button class="nav-item nav-sub" data-page="dirs">目录设置</button>
+          <button class="nav-item nav-sub" data-page="save">保存到 NAS</button>
         </div>
         <button class="nav-item" data-page="llm">高级 · 大模型</button>
         <button class="nav-item" data-page="settings">设置</button>
@@ -281,6 +282,22 @@
         </div>
       </section>
 
+      <!-- 保存到 NAS -->
+      <section class="page" id="page-save">
+        <h2>保存到 NAS</h2>
+        <div class="card">
+          <div class="card-title">手动保存单曲</div>
+          <p class="hint" id="save-status" role="status">正在读取手动保存状态…</p>
+          <p class="hint">搜索网易云曲目并保存到已配置的目标目录。保存只写入新文件，同名文件不会被覆盖（会提示已存在）；整个保存过程中同一时间只执行一个任务。</p>
+          <div class="btn-row">
+            <input class="input grow" id="save-keyword" placeholder="输入歌名、歌手或关键词" aria-label="搜索关键词">
+            <button class="btn" id="save-search-btn" type="button">搜索</button>
+          </div>
+          <p class="hint" id="save-result" role="status" aria-live="polite"></p>
+          <div class="stack" id="save-results"></div>
+        </div>
+      </section>
+
       <!-- LLM -->
       <section class="page" id="page-llm">
         <h2>高级 · 大模型</h2>
@@ -381,6 +398,7 @@
     <button class="nav-item" data-page="search">搜索</button>
     <button class="nav-item" data-page="tee">边听</button>
     <button class="nav-item" data-page="dirs">目录</button>
+    <button class="nav-item" data-page="save">保存</button>
     <button class="nav-item" data-page="llm">高级</button>
     <button class="nav-item" data-page="settings">设置</button>
     <button class="nav-item" data-page="about">关于<span class="nav-dot" hidden></span></button>

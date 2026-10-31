@@ -41,6 +41,7 @@ def setup_test_env(tmp_path, monkeypatch):
     os.makedirs(fav_dir, exist_ok=True)
     monkeypatch.setitem(CONF, "cache_dir", cache_dir)
     monkeypatch.setitem(CONF, "library_dir", library_dir)
+    monkeypatch.setitem(CONF, "tee_save_dir", library_dir)
     monkeypatch.setitem(CONF, "fav_dir", fav_dir)
     monkeypatch.setitem(CONF, "search_list_path", "data.list")
     monkeypatch.setitem(CONF, "online_limit", 30)
@@ -549,6 +550,7 @@ def test_search_track_deduplication():
 
 def test_stream_online_guid_range_and_tee_cache(monkeypatch):
     """用例 d: stream online guid Range 转发与落盘 (mock musicdl 返回带 Content-Length 的 200 流，断言 cache 文件生成且内容一致)。"""
+    monkeypatch.setitem(CONF, "tee_save_enabled", True)
     # 自动下载歌词开启场景：落库后同名 .lrc 一并写入（默认关，见 test_tee_cache.py）
     monkeypatch.setitem(CONF, "lyric_auto_dl", True)
     audio_content = b"RIFF....WAVEfmt....FAKE_MP3_STREAM_CONTENT" * 50

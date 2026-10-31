@@ -2,7 +2,7 @@
 
 定位：同容器内经 127.0.0.1 访问三源服务，subprocess 调 supervisorctl 切换音源
 进程，直接读写挂载在 /repo 的仓库目录下的 .env（proxy 靠热重载生效）。
-不挂 docker.sock、不做容器级操作。管理接口只接受飞牛网关注入的管理员身份。
+不挂 docker.sock、不做容器级操作。管理接口检查飞牛网管理员身份 claim；本服务本身不证明 claim 来源可信。
 
 前端为原生单页（static/，无构建、无 CDN 资产）。
 """
@@ -50,6 +50,7 @@ from proxy.fnlog import (  # noqa: E402
     setup_logging,
 )
 from proxy import llm_usage  # noqa: E402  # 每日大模型 token 账本（纯 stdlib）
+from proxy.gateway_identity import HeaderClaimsError, UntrustedIdentityClaims, parse_untrusted_identity  # noqa: E402
 
 logger = logging.getLogger("webui_service")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -118,7 +119,7 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_RECOMMEND_DAILY": {"kind": "bool", "default": "true", "group": "recommend", "reload": "hot", "label": "每日推荐"},
     "FNMUSIC_PUBLIC_PLAYLISTS_ENABLED": {"kind": "bool", "default": "false", "group": "recommend", "reload": "hot", "label": "公共歌单"},
     "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": {"kind": "str", "default": "[]", "group": "recommend", "reload": "hot", "label": "公共歌单选择"},
-    "FNMUSIC_TEE_SAVE_ENABLED": {"kind": "bool", "default": "true", "group": "tee", "reload": "hot", "label": "边听边存"},
+    "FNMUSIC_TEE_SAVE_ENABLED": {"kind": "bool", "default": "false", "group": "tee", "reload": "hot", "label": "边听边存"},
     "FNMUSIC_TEE_SAVE_DIR": {"kind": "dir", "default": "", "group": "storage", "reload": "hot", "label": "下载目录（留空自动探测共享曲库）"},
     "FNMUSIC_CACHE_DIR": {"kind": "dir", "default": "", "group": "storage", "reload": "hot", "label": "歌曲缓存目录（留空=安装目录 cache）"},
     "FNMUSIC_TEE_CACHE_MAX": {"kind": "int", "default": "2", "min": 1, "max": 100, "group": "tee", "reload": "hot", "label": "关闭时滚动缓存数"},
@@ -1078,15 +1079,33 @@ async def healthz():
     return {"ok": True}
 
 
-def _header_map(scope) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for key, value in scope.get("headers") or []:
-        out[key.decode("latin-1").lower()] = value.decode("latin-1")
-    return out
+def _identity_claims_from_scope(scope) -> UntrustedIdentityClaims | None:
+    """Parse identity claims from raw ASGI headers without trusting them.
+
+    ASGI supplies a sequence of byte pairs. Keep every pair so duplicate or
+    malformed identity fields fail closed instead of depending on dict order.
+    A parsed admin claim is still only a claim from the gateway header chain.
+    """
+    raw_headers = scope.get("headers")
+    if type(raw_headers) not in (list, tuple):
+        return None
+    pairs: list[tuple[bytes, bytes]] = []
+    for pair in raw_headers:
+        if type(pair) not in (list, tuple) or len(pair) != 2:
+            return None
+        name, value = pair
+        if type(name) is not bytes or type(value) is not bytes:
+            return None
+        pairs.append((name, value))
+    try:
+        return parse_untrusted_identity(pairs)
+    except HeaderClaimsError:
+        return None
 
 
-def _is_admin(headers: dict[str, str]) -> bool:
-    return headers.get("x-trim-isadmin", "").lower() == "true"
+def _has_admin_claim(scope) -> bool:
+    claims = _identity_claims_from_scope(scope)
+    return claims is not None and claims.admin_claim is True
 
 
 @app.get("/api/status")
@@ -1965,7 +1984,7 @@ class DesktopPrefixMiddleware:
 
 
 class AuthMiddleware:
-    """管理接口要求飞牛网关注入的管理员身份。桌面前缀由外层中间件先剥掉。"""
+    """管理接口只解析单个规范管理员 claim；本中间件不认证 claim 来源。"""
 
     def __init__(self, app):
         self.app = app
@@ -1975,7 +1994,7 @@ class AuthMiddleware:
             await self.app(scope, receive, send)
             return
         path = scope.get("path") or ""
-        if not path.startswith("/api/") or _is_admin(_header_map(scope)):
+        if not path.startswith("/api/") or _has_admin_claim(scope):
             await self.app(scope, receive, send)
             return
         body = '{"ok":false,"error":"需要管理员"}'.encode()

@@ -26,6 +26,7 @@ from netease_ext import (
     song_lyric_pair,
     vip_entitled,
     user_playlists as fetch_user_playlists,
+    user_playlist_preview as fetch_user_playlist_preview,
 )
 import runner
 import playback
@@ -281,6 +282,12 @@ def user_playlists(limit: int = Query(100, ge=1, le=100)):
     if res is None:
         return {"ok": False, "error": "not_logged_in", "logged_in": False}
     return {"ok": True, "data": res["playlists"], "account_uid": res["uid"], "logged_in": True}
+
+
+@app.get("/api/v1/user/playlists/{playlist_id}/preview")
+def user_playlist_preview(playlist_id: int = Path(..., ge=1)):
+    """读取当前账号歌单的临时预览；不下载、不保存，也不代表可导入。"""
+    return fetch_user_playlist_preview(playlist_id)
 
 
 @app.get("/api/v1/user/playlists/{playlist_id}/tracks")
