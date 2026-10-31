@@ -134,6 +134,16 @@ _COVER_MIME_EXTENSIONS = {
     "image/png": ".png",
     "image/webp": ".webp",
 }
+# The source CDN declares JPEG with the non-standard `image/jpg` alias. Only this
+# closed alias table is accepted; declared parameters are limited to one
+# `charset=<token>`. Nothing here relaxes the magic-byte comparison (A1).
+_COVER_DECLARED_MIME_ALIASES = {
+    "image/jpeg": "image/jpeg",
+    "image/jpg": "image/jpeg",
+    "image/png": "image/png",
+    "image/webp": "image/webp",
+}
+_COVER_MIME_PARAM_TOKEN_RE = re.compile(r"[A-Za-z0-9._-]{1,32}")
 UNKNOWN_ARTIST = "未知歌手"
 ARTIST_SEPARATOR = "/"
 MD5_RE = re.compile(r"[0-9a-fA-F]{32}")
@@ -1061,6 +1071,32 @@ def _sniff_cover_mime(data: bytes) -> str:
     return ""
 
 
+def _normalize_cover_declared_mime(value: object) -> str:
+    """Canonicalize one declared ``Content-Type`` or return ``""`` (A1).
+
+    Accepts only the closed alias table, optional OWS, and at most one
+    ``charset=<token>`` parameter. Multiple parameters, other names, quoted or
+    empty values, extra ``;``, commas, spaces in the token, ``*`` or ``/`` in the
+    media type all yield ``""``; the caller then fails closed as
+    ``cover_mime_invalid``.
+    """
+    if type(value) is not str:
+        return ""
+    segments = value.split(";")
+    if len(segments) > 2:
+        return ""
+    canonical = _COVER_DECLARED_MIME_ALIASES.get(segments[0].strip().casefold())
+    if canonical is None:
+        return ""
+    if len(segments) == 2:
+        name, separator, token = segments[1].partition("=")
+        if not separator or name.strip().casefold() != "charset":
+            return ""
+        if _COVER_MIME_PARAM_TOKEN_RE.fullmatch(token.strip()) is None:
+            return ""
+    return canonical
+
+
 def _default_cover_fetch(url: str) -> object:
     safe_url = _normalize_cover_url(url)
     parsed = urlsplit(safe_url)
@@ -1094,7 +1130,8 @@ def _default_cover_fetch(url: str) -> object:
             data = response.read(MAX_COVER_BYTES + 1)
             if not data or len(data) > MAX_COVER_BYTES:
                 raise ValueError("cover_too_large")
-            declared_mime = response.getheader("Content-Type", "").split(";", 1)[0].strip().casefold()
+            declared_mime = _normalize_cover_declared_mime(
+                response.getheader("Content-Type", ""))
             actual_mime = _sniff_cover_mime(data)
             if actual_mime not in _COVER_MIME_EXTENSIONS or declared_mime != actual_mime:
                 raise ValueError("cover_mime_invalid")
@@ -1181,9 +1218,13 @@ def _fetch_cover_asset(url: str, deps: SaveDeps | None) -> _CoverAsset:
         raise ValueError("cover_response_invalid")
     if type(data) is not bytes or not data or len(data) > MAX_COVER_BYTES:
         raise ValueError("cover_response_invalid")
-    if type(mime) is not str or mime.casefold() != _sniff_cover_mime(data):
+    if type(mime) is not str:
         raise ValueError("cover_mime_invalid")
-    normalized_mime = mime.casefold()
+    # The injected seam must already be canonical: `image/jpg` is NOT aliased
+    # here (only the default fetch normalizes the server-declared header).
+    normalized_mime = mime.strip().casefold()
+    if normalized_mime != _sniff_cover_mime(data):
+        raise ValueError("cover_mime_invalid")
     if normalized_mime not in _COVER_MIME_EXTENSIONS:
         raise ValueError("cover_mime_invalid")
     _validate_cover_dimensions(*_cover_dimensions(data, normalized_mime))

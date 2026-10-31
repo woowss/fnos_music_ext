@@ -21,6 +21,7 @@ from proxy.tests.test_manual_save_route import (
     _info_payload,
     _jpeg_header,
     _pipeline_deps,
+    _png_header,
     _url_payload,
 )
 
@@ -714,3 +715,228 @@ def test_save_default_http_uses_info_timeout_for_info_and_ladder(tmp_path, monke
     assert result["data"]["status"] == "published"
     assert recorded == [route.INFO_TIMEOUT, route.INFO_TIMEOUT]
 
+
+# ===========================================================================
+# Addendum A1: the source CDN declares JPEG as `image/jpg`
+# ===========================================================================
+
+class _FakeCoverResponse:
+    def __init__(self, data, *, content_type=None, status=200,
+                 content_length=None, content_encoding="identity"):
+        self.status = status
+        self._data = data
+        self._content_type = content_type
+        self._content_length = content_length
+        self._content_encoding = content_encoding
+
+    def getheader(self, name, default=""):
+        lowered = name.casefold()
+        if lowered == "content-type":
+            return default if self._content_type is None else self._content_type
+        if lowered == "content-length":
+            return self._content_length
+        if lowered == "content-encoding":
+            return self._content_encoding
+        return default
+
+    def read(self, _limit):
+        return self._data
+
+
+def _install_fake_cover_connection(monkeypatch, response, requests=None):
+    class FakeConnection:
+        def __init__(self, host, address):
+            self.host = host
+            self.address = address
+
+        def request(self, method, target, **_kwargs):
+            if requests is not None:
+                requests.append((method, target))
+
+        def getresponse(self):
+            return response
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        route, "_public_cover_addresses", lambda _host: ["93.184.216.34"])
+    monkeypatch.setattr(route, "_PinnedCoverConnection", FakeConnection)
+
+
+def test_cover_declared_mime_alias_table_is_closed():
+    assert route._COVER_DECLARED_MIME_ALIASES == {
+        "image/jpeg": "image/jpeg",
+        "image/jpg": "image/jpeg",
+        "image/png": "image/png",
+        "image/webp": "image/webp",
+    }
+    for value in (
+        "image/pjpeg", "image/x-png", "image/*", "text/html",
+        "application/octet-stream", "image/gif", "",
+    ):
+        assert route._normalize_cover_declared_mime(value) == ""
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param("image/jpg", "image/jpeg", id="jpg"),
+        pytest.param("IMAGE/JPG", "image/jpeg", id="jpg-upper"),
+        pytest.param(" image/jpg ", "image/jpeg", id="jpg-ows"),
+        pytest.param("\timage/jpeg\t", "image/jpeg", id="jpeg-tabs"),
+        pytest.param(" image/png ", "image/png", id="png-ows"),
+        pytest.param("IMAGE/WEBP", "image/webp", id="webp-upper"),
+    ],
+)
+def test_cover_declared_mime_normalizes_case_and_ows(raw, expected):
+    assert route._normalize_cover_declared_mime(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        pytest.param("image/jpg; charset=binary", "image/jpeg", id="jpg-value"),
+        pytest.param("image/jpg;charset=binary", "image/jpeg", id="no-space"),
+        pytest.param("image/jpg ; charset = binary", "image/jpeg", id="spaces"),
+        pytest.param("image/jpg; CHARSET=UTF-8", "image/jpeg", id="name-case"),
+        pytest.param("image/png;charset=x", "image/png", id="png-charset"),
+        pytest.param(
+            "image/webp; charset=0123456789._-", "image/webp", id="webp-token"),
+    ],
+)
+def test_cover_declared_mime_accepts_single_charset_token(raw, expected):
+    assert route._normalize_cover_declared_mime(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        pytest.param("image/jpg, image/png", id="comma-list"),
+        pytest.param("image/jpg; foo=bar", id="other-param"),
+        pytest.param('image/jpg; charset="binary"', id="quoted"),
+        pytest.param("image/jpg;", id="trailing-semicolon"),
+        pytest.param("image/jpg; charset=", id="empty-token"),
+        pytest.param("image/jpg; charset=binary; x=y", id="two-params"),
+        pytest.param("image/jpg; charset", id="no-equals"),
+        pytest.param("image/jpg; charset=binary=x", id="token-with-equals"),
+        pytest.param("image/jpg; charset=binary extra", id="token-with-space"),
+        pytest.param("image/jpg; charset=binary/foo", id="token-with-slash"),
+        pytest.param("image/jpg; charset=binary*", id="token-with-star"),
+        pytest.param("image/jpg; ;", id="double-empty"),
+        pytest.param("image/pjpeg", id="pjpeg"),
+        pytest.param("image/x-png", id="x-png"),
+        pytest.param("image/*", id="wildcard"),
+        pytest.param("image/jpg/extra", id="extra-slash"),
+        pytest.param("text/html", id="html"),
+        pytest.param("", id="empty"),
+        pytest.param(" ", id="blank"),
+    ],
+)
+def test_cover_declared_mime_rejects_other_or_malformed_parameters(raw):
+    assert route._normalize_cover_declared_mime(raw) == ""
+
+
+@pytest.mark.parametrize("value", [None, 5, 1.5, b"image/jpg", ["image/jpg"]])
+def test_cover_declared_mime_rejects_non_strings(value):
+    assert route._normalize_cover_declared_mime(value) == ""
+
+
+def test_default_cover_fetch_normalizes_image_jpg_to_jpeg(monkeypatch):
+    data = _jpeg_header(80, 40)
+    requests = []
+    _install_fake_cover_connection(
+        monkeypatch,
+        _FakeCoverResponse(data, content_type="image/jpg"),
+        requests=requests,
+    )
+    fetched = route._default_cover_fetch(
+        "http://p1.music.126.net/cover.jpg")
+    assert fetched == {"data": data, "mime": "image/jpeg"}
+    assert requests == [("GET", "/cover.jpg")]
+
+
+def test_default_cover_fetch_rejects_image_jpg_with_png_magic(monkeypatch):
+    _install_fake_cover_connection(
+        monkeypatch,
+        _FakeCoverResponse(_png_header(80, 40), content_type="image/jpg"),
+    )
+    with pytest.raises(ValueError) as caught:
+        route._default_cover_fetch("http://p1.music.126.net/cover.jpg")
+    assert str(caught.value) == "cover_fetch_payload_invalid"
+    assert route._cover_error_code(caught.value) == "payload_invalid"
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    [pytest.param("text/html", id="html"),
+     pytest.param("", id="empty"),
+     pytest.param(None, id="missing")],
+)
+def test_default_cover_fetch_rejects_non_image_or_missing_content_type(
+    monkeypatch, content_type,
+):
+    _install_fake_cover_connection(
+        monkeypatch,
+        _FakeCoverResponse(_jpeg_header(80, 40), content_type=content_type),
+    )
+    with pytest.raises(ValueError) as caught:
+        route._default_cover_fetch("https://p1.music.126.net/cover.jpg")
+    assert str(caught.value) == "cover_fetch_payload_invalid"
+    assert route._cover_error_code(caught.value) == "payload_invalid"
+
+
+def test_default_cover_fetch_mime_invalid_is_payload_invalid(monkeypatch):
+    _install_fake_cover_connection(
+        monkeypatch,
+        _FakeCoverResponse(_jpeg_header(80, 40), content_type="image/*"),
+    )
+    with pytest.raises(ValueError) as caught:
+        route._default_cover_fetch("https://p1.music.126.net/cover.jpg")
+    assert str(caught.value) == "cover_fetch_payload_invalid"
+    assert route._cover_error_code(caught.value) == "payload_invalid"
+    assert route._cover_error_code(
+        ValueError("cover_mime_invalid")) == "payload_invalid"
+
+
+def test_fetch_cover_asset_injected_mime_must_be_canonical():
+    data = _jpeg_header(80, 40)
+    url = "https://p1.music.126.net/cover.jpg"
+
+    with pytest.raises(ValueError, match="cover_mime_invalid"):
+        route._fetch_cover_asset(
+            url, route.SaveDeps(cover_fetch=lambda _u: (data, "image/jpg")))
+
+    canonical = route._fetch_cover_asset(
+        url, route.SaveDeps(cover_fetch=lambda _u: (data, "image/jpeg")))
+    assert canonical.mime == "image/jpeg"
+    padded = route._fetch_cover_asset(
+        url, route.SaveDeps(cover_fetch=lambda _u: {"data": data, "mime": " image/jpeg "}))
+    assert padded.mime == "image/jpeg"
+
+
+def test_image_jpg_alias_pipeline_embeds_cover_with_jpg_extension(
+    tmp_path, monkeypatch,
+):
+    data = _jpeg_header(80, 40)
+    response = _FakeCoverResponse(data, content_type="image/jpg")
+    _install_fake_cover_connection(monkeypatch, response)
+    info = _info_payload()
+    info["data"]["al"]["picUrl"] = "http://p1.music.126.net/cover.jpg"
+    seen = {}
+
+    def tag(source, tagged, metadata):
+        seen["cover_path"] = metadata.cover_path
+        tagged.write_bytes(b"TAGGED:" + source.read_bytes())
+
+    deps, store, _workdir = _pipeline_deps(tmp_path, info=info, tag=tag)
+    result = _save(deps)
+    assert result["ok"] is True
+    save_data = result["data"]
+    assert save_data["status"] == "published"
+    assert save_data["cover_status"] == "embedded"
+    assert save_data["cover_embedded"] is True
+    assert save_data["cover_error"] == ""
+    assert seen["cover_path"] is not None
+    assert seen["cover_path"].name.endswith(".jpg")
+    assert store.published_names[0].endswith(".flac")

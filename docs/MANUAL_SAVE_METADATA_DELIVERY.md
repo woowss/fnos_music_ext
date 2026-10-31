@@ -154,3 +154,83 @@ cd webui-service && node test_app_js.js
   解码/标签预算叠加后仍低于网关 1200s，但极慢服务下会接近上限。
 - **`cover_error` 只是归类**：它不泄露 host/URL/IP，排障只能定位到类别；具体
   CDN 需要看审计日志（本模块不记录 URL）。
+
+## 6. Addendum A1：`image/jpg` 声明别名规范化
+
+### 真机证据（2026-11-01 03:0x，隔离 /tmp，只读探针）
+
+- 同一首歌 `al.picUrl` host 在 1 小时内由 **p2 轮换回 p1**，证明"精确白名单"策略
+  正确（不是白名单写错，也不是需要通配）。
+- 音频 PASS（published、jymaster/reported、126,459,367、md5 `8ab58d1b…`、
+  FLAC 192k/24bit、标签、mode 0600、staging 空）。
+- 歌词 PASS（`lyric_status="published"`，同名 LRC 944 字节；30s+2 次重试生效）。
+- 封面 FAIL：`cover_status="error"`、`cover_error="payload_invalid"`。p1 URL 的
+  pinned GET 实际返回：`status 200`、`Content-Type: image/jpg`、
+  无 `Content-Encoding`、**446480 字节**、magic `ffd8ffe0…`（JPEG）。
+  旧校验要求 `declared == sniffed`（`image/jpg` vs `image/jpeg`）→
+  `cover_mime_invalid` → `payload_invalid`。这是服务端**非标准别名**，内容本身合法。
+
+### 别名表与参数文法（封闭，不扩表）
+
+```python
+_COVER_DECLARED_MIME_ALIASES = {
+    "image/jpeg": "image/jpeg",
+    "image/jpg": "image/jpeg",   # 真机观测到的非标准别名
+    "image/png": "image/png",
+    "image/webp": "image/webp",
+}
+_COVER_MIME_PARAM_TOKEN_RE = "^[A-Za-z0-9._-]{1,32}$"
+```
+
+`_normalize_cover_declared_mime(value)`（纯函数）：
+
+1. 非 `str` → `""`；
+2. 按 `;` 切段：首段 `strip().casefold()` 必须**精确命中**别名表（逗号多值
+   `image/jpg, image/png` 自然不命中）→ 否则 `""`；
+3. 参数最多 1 个；无参数合法；唯一允许参数名 `charset`（casefold）；其值
+   `strip()` 后必须匹配 `^[A-Za-z0-9._-]{1,32}$`（值本身被忽略）；拒绝其它参数名、
+   引号值、空值、多个 `;`、参数含 `=`/逗号/空格/斜杠/星号、末尾空参数（`image/jpg;`）；
+4. 返回 canonical MIME（`image/jpg`→`image/jpeg`），否则 `""`。
+
+`_default_cover_fetch` 只把 `Content-Type` 的**声明值**经该函数规范化，随后仍强制：
+声明非空、magic sniff ∈ {jpeg,png,webp}、`declared == sniffed`，否则
+`cover_mime_invalid`（→ `payload_invalid`）。**绝不**只信 `Content-Type`，绝不放宽到
+`image/*`；`_COVER_MIME_EXTENSIONS` 不变。
+
+`_fetch_cover_asset` 注入 seam 只接受 **canonical** MIME：
+`mime.strip().casefold()` ∈ {image/jpeg,image/png,image/webp} 且等于 sniff；
+注入 `image/jpg` → `cover_mime_invalid`（不自动别名化；默认 fetch 已规范化）。
+
+### 判据正/反例（对应测试 `proxy/tests/test_manual_save_metadata.py`）
+
+| 输入 | 结果 | 测试 |
+|---|---|---|
+| `image/jpg`+JPEG / `IMAGE/JPG` / ` image/jpg ` / tab OWS | 接受→`image/jpeg` | `test_cover_declared_mime_normalizes_case_and_ows`、`test_default_cover_fetch_normalizes_image_jpg_to_jpeg` |
+| `image/jpg; charset=binary`、`;charset=binary`、` ; charset = binary`、`CHARSET=UTF-8` | 接受 | `test_cover_declared_mime_accepts_single_charset_token` |
+| `image/jpeg`/`png`/`webp` 对应 magic | 接受 | `test_default_cover_fetch_normalizes_image_jpg_to_jpeg`、`_cover_declared_mime_normalizes_case_and_ows` |
+| `image/jpg`+PNG magic | 拒绝 `cover_mime_invalid`→payload_invalid | `test_default_cover_fetch_rejects_image_jpg_with_png_magic` |
+| `text/html`、`""`、缺失 header、`image/*`、`image/pjpeg`、`image/x-png` | 拒绝 | `test_default_cover_fetch_rejects_non_image_or_missing_content_type`、`test_default_cover_fetch_mime_invalid_is_payload_invalid`、`test_cover_declared_mime_rejects_other_or_malformed_parameters` |
+| `image/jpg, image/png`、`image/jpg; foo=bar`、`charset="binary"`、`image/jpg;`、`charset=`、双参数 | 拒绝 | `test_cover_declared_mime_rejects_other_or_malformed_parameters` |
+| 注入 `image/jpg` / canonical `image/jpeg` | 拒绝 / 接受 | `test_fetch_cover_asset_injected_mime_must_be_canonical` |
+| p1 `image/jpg` 全链路 | embedded + `.jpg` 封面文件 + `cover_error==""` | `test_image_jpg_alias_pipeline_embeds_cover_with_jpg_extension` |
+| 别名表封闭性 | 仅 4 个精确键 | `test_cover_declared_mime_alias_table_is_closed` |
+
+### 真机验收判据 C1（A1 更新后）
+
+C1 通过需同时满足（p1 或 p2 均可）：
+
+- `cover_status == "embedded"`；
+- `cover_embedded is True`；
+- `cover_error == ""`；
+- ffprobe 能看到 attached_pic 封面流（`disposition.attached_pic == 1`）。
+
+### 残余风险
+
+- `image/pjpeg`、`image/x-png` 等其它历史别名仍 **fail closed**（
+  `cover_mime_invalid`→payload_invalid）；如真机再观测到，需按本流程单独取证加白，
+  不做通配或前缀匹配。
+- 重复 `Content-Type` 头取 `http.client` 的**首个**值；若服务端把真实类型放在第二个
+  头，仍会 fail closed（安全优先）。
+- 参数只允许单个 `charset=<token>`；`boundary=` 等其它参数一律拒绝（图片响应不需要）。
+- 该规范化只放宽"声明值与 magic 的别名差异"，不跳过 MIME→magic 一致性校验、不改变
+  大小/编码/尺寸/解码检查。
