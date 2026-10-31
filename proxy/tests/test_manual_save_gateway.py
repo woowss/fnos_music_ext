@@ -58,6 +58,15 @@ def _published_result():
             "target_dir": "/vol1/music",
             "tagged": True,
             "cover_embedded": False,
+            "title_status": "tagged",
+            "artist_status": "tagged",
+            "album_status": "tagged",
+            "lyricist": "",
+            "lyricist_status": "unavailable",
+            "composer": "",
+            "composer_status": "unavailable",
+            "cover_status": "unavailable",
+            "lyric_status": "unavailable",
             "published_size": 34,
             "published_md5": "b" * 32,
             "signed_url": SIGNED_URL,
@@ -336,7 +345,9 @@ def test_track_success_returns_sanitized_engine_result():
         "status", "song_id", "title", "artist", "album", "quality_requested",
         "quality_actual", "source_type", "format", "size", "md5", "basename",
         "target_dir", "tagged", "cover_embedded", "published_size",
-        "published_md5",
+        "published_md5", "title_status", "artist_status", "album_status",
+        "lyricist", "lyricist_status", "composer", "composer_status",
+        "cover_status", "lyric_status",
     }
     assert set(payload["data"]) == expected_fields
     assert payload["data"]["status"] == "published"

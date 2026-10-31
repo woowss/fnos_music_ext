@@ -539,6 +539,21 @@ def _sanitize_manual_save_data(data: object) -> dict:
     )
     sanitized["tagged"] = source.get("tagged") is True
     sanitized["cover_embedded"] = source.get("cover_embedded") is True
+    for name in ("lyricist", "composer"):
+        value = source.get(name)
+        sanitized[name] = value[:512] if type(value) is str else ""
+    status_values = {
+        "title_status": {"tagged", "unavailable"},
+        "artist_status": {"tagged", "unavailable"},
+        "album_status": {"tagged", "unavailable"},
+        "lyricist_status": {"tagged", "unavailable"},
+        "composer_status": {"tagged", "unavailable"},
+        "cover_status": {"embedded", "preserved", "unavailable", "unsupported", "error", "not_published"},
+        "lyric_status": {"published", "unavailable", "error", "conflict", "not_attempted", "unknown"},
+    }
+    for name, allowed in status_values.items():
+        value = source.get(name)
+        sanitized[name] = value if type(value) is str and value in allowed else "unavailable"
     return sanitized
 
 

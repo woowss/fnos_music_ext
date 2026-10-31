@@ -1735,6 +1735,33 @@ test("已选名称：瞬时失败缓存到期可恢复，不永久保留失败",
   assert.ok(els.get("#public-selected").innerHTML.includes("到期恢复"));
 });
 
+test("手动保存：显示封面/歌词/词曲状态并明确标注附加项部分失败", async () => {
+  enqueue("/app/fnmusic-ext/api/manual-save/status", {
+    ok: true, data: { enabled: true, target_dir: "/library" },
+  });
+  await global.loadSaveStatus();
+  enqueue("/app/fnmusic-ext/api/manual-save/track", {
+    ok: true, code: "ok", data: {
+      status: "published", quality_actual: "jymaster", format: "flac", size: 1024,
+      basename: "歌手 - 歌曲.flac", target_dir: "/library",
+      cover_status: "error", lyric_status: "unknown", artist_status: "tagged",
+      lyricist: "作词者", lyricist_status: "tagged", composer: "", composer_status: "unavailable",
+    },
+  });
+  const button = stubEl();
+  button.dataset.songId = "42";
+  const row = { querySelector: () => stateEl };
+  const stateEl = stubEl();
+  button.closest = () => row;
+  await global.saveOneTrack(button);
+  const message = els.get("#save-result").textContent;
+  assert.ok(message.includes("音频已发布；部分元数据/歌词附加项失败"));
+  assert.ok(message.includes("封面获取或嵌入失败"));
+  assert.ok(message.includes("歌词发布结果待核对"));
+  assert.ok(message.includes("词：作词者 / 曲：未提供"));
+  assert.strictEqual(stateEl.textContent, "已保存");
+});
+
 /* ------------------------------------------------ 运行 --------------------- */
 (async () => {
   let failed = 0;

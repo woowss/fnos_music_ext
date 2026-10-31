@@ -2112,8 +2112,31 @@ async function saveOneTrack(button) {
         data.quality_actual, data.format, formatSaveSize(data.size),
         data.basename, data.target_dir,
       ].filter((part) => typeof part === "string" && part);
+      const coverLabels = {
+        embedded: "封面已嵌入", preserved: "源封面已保留",
+        unavailable: "音源未提供封面", unsupported: "封面格式不受 MP3 支持",
+        error: "封面获取或嵌入失败",
+      };
+      const lyricLabels = {
+        published: "歌词已保存为同名 LRC", unavailable: "音源未提供歌词",
+        error: "歌词获取或保存失败", conflict: "同名 LRC 已存在，未覆盖",
+        not_attempted: "歌词未处理", unknown: "歌词发布结果待核对",
+      };
+      parts.push(coverLabels[data.cover_status] || "封面状态未知");
+      parts.push(lyricLabels[data.lyric_status] || "歌词状态未知");
+      parts.push(data.artist_status === "tagged" ? "歌手标签已写入" : "音源未提供歌手");
+      const lyricist = data.lyricist_status === "tagged" && data.lyricist
+        ? "词：" + data.lyricist : "词：未提供";
+      const composer = data.composer_status === "tagged" && data.composer
+        ? "曲：" + data.composer : "曲：未提供";
+      parts.push(lyricist + " / " + composer);
+      const metadataFailed = data.cover_status === "error"
+        || data.lyric_status === "error" || data.lyric_status === "unknown";
+      const prefix = metadataFailed
+        ? "音频已发布；部分元数据/歌词附加项失败（文件分开发布）："
+        : "音频已保存；元数据状态：";
       if (stateEl) stateEl.textContent = "已保存";
-      if (resultEl) resultEl.textContent = "保存成功：" + parts.join(" · ");
+      if (resultEl) resultEl.textContent = prefix + parts.join(" · ");
     } else if (body && body.code === "conflict") {
       if (stateEl) stateEl.textContent = "已存在";
       if (resultEl) resultEl.textContent = "目标目录已存在同名文件，未覆盖。";

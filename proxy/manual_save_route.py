@@ -4,11 +4,15 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import hashlib
+import http.client
+import ipaddress
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import socket
+import ssl
 import stat as stat_module
 import subprocess
 import sys
@@ -17,7 +21,7 @@ import threading
 import time
 import unicodedata
 import urllib.request
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 if __package__:
     from . import manual_save_core as core
@@ -28,9 +32,17 @@ else:  # direct execution from the proxy source directory
 QUALITY_ORDER = ("jymaster", "hires", "lossless", "exhigh")
 MAX_BYTES = 1 << 30
 DOWNLOAD_CHUNK_BYTES = 1 << 20
-MAX_TAGGED_EXTRA_BYTES = 1 << 20
 MAX_JSON_BYTES = 1 << 20
+MAX_COVER_BYTES = 10 * 1024 * 1024
+MAX_COVER_WIDTH = 8192
+MAX_COVER_HEIGHT = 8192
+MAX_COVER_PIXELS = 16_777_216
+MAX_COVER_DECODE_ALLOC = 96 * 1024 * 1024
+MAX_TAGGED_EXTRA_BYTES = MAX_COVER_BYTES + (1 << 20)
+MAX_LYRIC_BYTES = 1 << 20
 API_TIMEOUT = 15.0
+COVER_TIMEOUT = 8.0
+COVER_DECODE_TIMEOUT = 10.0
 # The NetEase CDN intermittently resets long transfers, and curl --retry does
 # NOT resume inside one invocation: continue-at = "-" only takes effect when the
 # output file already exists at curl start, so --retry restarts at byte 0.
@@ -62,6 +74,12 @@ FFPROBE_BIN = "/usr/bin/ffprobe"
 CURL_BIN = "/usr/bin/curl"
 CURL_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 CURL_REFERER = "https://music.163.com/"
+NETEASE_COVER_HOSTS = frozenset({"p1.music.126.net"})
+_COVER_MIME_EXTENSIONS = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+}
 UNKNOWN_ARTIST = "未知歌手"
 ARTIST_SEPARATOR = "/"
 MD5_RE = re.compile(r"[0-9a-fA-F]{32}")
@@ -124,6 +142,43 @@ class SaveDeps:
     tag: Callable[[Path, Path, Mapping[str, str]], None] | None = None
     open_store: Callable[[str, str], object] | None = None
     make_tempdir: Callable[[], Path] | None = None
+    lyric_json: Callable[[str], object] | None = None
+    verify_cover: Callable[[Path], None] | None = None
+    cover_fetch: Callable[[str], object] | None = None
+    validate_tagged: Callable[[Path, str, Mapping[str, str], bool], object] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _TrackMetadata:
+    title: str
+    artist: str
+    album: str
+    track_number: int | None
+    disc_number: int | None
+    cover_url: str
+    lyricist: str
+    composer: str
+
+
+class _TagMetadata(dict[str, str]):
+    """Normal tag fields plus trusted, non-tagging inputs for the tag adapter."""
+
+    def __init__(
+        self,
+        values: Mapping[str, str],
+        *,
+        cover_path: Path | None = None,
+        source_cover_indexes: tuple[int, ...] = (),
+    ):
+        super().__init__(values)
+        self.cover_path = cover_path
+        self.source_cover_indexes = source_cover_indexes
+
+
+@dataclass(frozen=True, slots=True)
+class _CoverAsset:
+    data: bytes
+    mime: str
 
 
 def _field(deps: SaveDeps | None, name: str, default):
@@ -429,9 +484,12 @@ def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
     open_store = _field(deps, "open_store", _default_open_store)
     make_tempdir = _field(deps, "make_tempdir", _default_make_tempdir)
 
-    title, artist, album, track_number, disc_number = _fetch_song_info(
-        http_json, config.musicbox_url, song_id
-    )
+    track_metadata = _fetch_song_info(http_json, config.musicbox_url, song_id)
+    title = track_metadata.title
+    artist = track_metadata.artist
+    album = track_metadata.album
+    track_number = track_metadata.track_number
+    disc_number = track_metadata.disc_number
     quality_requested, quality_data, media_url = _select_quality(
         http_json, config.musicbox_url, song_id
     )
@@ -480,6 +538,35 @@ def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
         except Exception:
             raise _SaveFailure("invalid_audio") from None
 
+        source_cover_indexes = _attached_pic_stream_indexes(probe_result)
+        cover_asset = None
+        cover_path = None
+        if source_cover_indexes:
+            cover_status = "preserved"
+        elif track_metadata.cover_url:
+            try:
+                cover_asset = _fetch_cover_asset(track_metadata.cover_url, deps)
+                if actual_format == "mp3" and cover_asset.mime == "image/webp":
+                    cover_status = "unsupported"
+                else:
+                    cover_path = _write_cover_file(workdir, cover_asset)
+                    _field(deps, "verify_cover", _default_verify_cover)(cover_path)
+                    cover_status = "embedded"
+            except Exception:
+                cover_asset = None
+                cover_path = None
+                cover_status = "error"
+        else:
+            cover_status = "unavailable"
+
+        lyric_bytes = None
+        try:
+            lyric_json = _field(deps, "lyric_json", _default_http_json)
+            lyric_bytes = _fetch_lyric_bytes(lyric_json, config.musicbox_url, song_id)
+            lyric_status = "unavailable" if lyric_bytes is None else "not_attempted"
+        except Exception:
+            lyric_status = "error"
+
         metadata: dict[str, str] = {"title": title}
         if artist:
             metadata["artist"] = artist
@@ -489,14 +576,37 @@ def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
             metadata["track"] = str(track_number)
         if disc_number is not None:
             metadata["disc"] = str(disc_number)
+        if track_metadata.lyricist:
+            metadata["lyricist"] = track_metadata.lyricist
+        if track_metadata.composer:
+            metadata["composer"] = track_metadata.composer
+        tag_metadata = _TagMetadata(
+            metadata,
+            cover_path=cover_path,
+            source_cover_indexes=source_cover_indexes,
+        )
         tagged_path = workdir / ("tagged." + actual_format)
         try:
-            tag(source_path, tagged_path, metadata)
+            tag(source_path, tagged_path, tag_metadata)
         except _SaveFailure:
             raise
         except Exception:
             raise _SaveFailure("tag_failed") from None
         _tagged_file_size(tagged_path)
+        expected_cover = bool(source_cover_indexes or cover_path is not None)
+        validate_tagged = _field(deps, "validate_tagged", _default_validate_tagged)
+        try:
+            tagged_probe = validate_tagged(tagged_path, actual_format, metadata, expected_cover)
+        except _SaveFailure:
+            raise _SaveFailure("tag_failed") from None
+        except Exception:
+            raise _SaveFailure("tag_failed") from None
+        cover_embedded = bool(_attached_pic_stream_indexes(tagged_probe))
+        if expected_cover:
+            cover_status = "preserved" if source_cover_indexes else "embedded"
+        elif cover_status in {"embedded", "preserved"}:
+            # A requested image that was not safely attached cannot be reported as present.
+            cover_status = "error"
 
         basename = build_basename(artist, title, actual_format)
         quality_actual = _text(quality_data.get("level"), quality_requested) or quality_requested
@@ -516,6 +626,18 @@ def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
             basename=basename,
             target_dir=config.target_dir,
         )
+        data.update({
+            "title_status": "tagged",
+            "artist_status": "tagged" if artist else "unavailable",
+            "album_status": "tagged" if album else "unavailable",
+            "lyricist": track_metadata.lyricist,
+            "lyricist_status": "tagged" if track_metadata.lyricist else "unavailable",
+            "composer": track_metadata.composer,
+            "composer_status": "tagged" if track_metadata.composer else "unavailable",
+            "cover_status": cover_status,
+            "lyric_status": lyric_status,
+            "cover_embedded": cover_embedded,
+        })
 
         try:
             store = open_store(config.target_dir, config.staging_dir)
@@ -552,9 +674,15 @@ def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
             raise _SaveFailure("publish_failed") from None
         outcome = _store_outcome(published)
         if outcome == "published":
+            if lyric_bytes is not None:
+                lyric_basename = basename.rsplit(".", 1)[0] + ".lrc"
+                data["lyric_status"] = _publish_sidecar(store, lyric_basename, lyric_bytes)
             return _result(True, "ok", data)
         if outcome == "conflict":
             data["status"] = "conflict"
+            data["cover_status"] = "not_published"
+            data["cover_embedded"] = False
+            data["lyric_status"] = "not_attempted"
             return _result(False, "conflict", data)
         raise _SaveFailure("publish_failed")
     finally:
@@ -569,7 +697,7 @@ def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
 
 def _fetch_song_info(
     http_json: Callable[[str], object], musicbox_url: str, song_id: int
-) -> tuple[str, str, str, int | None, int | None]:
+) -> _TrackMetadata:
     url = f"{musicbox_url.rstrip('/')}/api/v1/song/{song_id}/info"
     try:
         payload = http_json(url)
@@ -592,18 +720,403 @@ def _fetch_song_info(
                 if type(artist_name) is str and artist_name.strip():
                     artists.append(artist_name.strip())
     album = ""
+    cover_url = ""
     album_entry = data.get("al")
     if isinstance(album_entry, Mapping):
         album_name = album_entry.get("name")
         if type(album_name) is str and album_name.strip():
             album = album_name.strip()
-    return (
-        name.strip(),
-        ARTIST_SEPARATOR.join(artists),
-        album,
-        _positive_int(data.get("no")),
-        _positive_int(data.get("cd")),
+        raw_cover_url = album_entry.get("picUrl")
+        if type(raw_cover_url) is str:
+            cover_url = raw_cover_url.strip()
+    return _TrackMetadata(
+        title=name.strip(),
+        artist=ARTIST_SEPARATOR.join(artists),
+        album=album,
+        track_number=_positive_int(data.get("no")),
+        disc_number=_positive_int(data.get("cd")),
+        cover_url=cover_url,
+        lyricist=_credit_text(data.get("lyricist")),
+        composer=_credit_text(data.get("composer")),
     )
+
+
+def _credit_text(value: object) -> str:
+    """Read only an explicitly named credit; artists never stand in for credits."""
+    if type(value) is str:
+        return value.strip()[:256]
+    if isinstance(value, Mapping):
+        name = value.get("name")
+        return name.strip()[:256] if type(name) is str else ""
+    if isinstance(value, list):
+        names = [
+            entry.get("name", "").strip()[:256]
+            for entry in value
+            if isinstance(entry, Mapping) and type(entry.get("name")) is str
+            and entry.get("name").strip()
+        ]
+        return ARTIST_SEPARATOR.join(names)[:512]
+    return ""
+
+
+def _fetch_lyric_bytes(
+    http_json: Callable[[str], object], musicbox_url: str, song_id: int
+) -> bytes | None:
+    url = f"{musicbox_url.rstrip('/')}/api/v1/song/{song_id}/lyric"
+    payload = http_json(url)
+    if not isinstance(payload, Mapping) or payload.get("ok") is not True:
+        raise ValueError("lyric_unavailable")
+    data = payload.get("data")
+    if not isinstance(data, Mapping):
+        raise ValueError("lyric_payload_invalid")
+    lyric = data.get("lyric")
+    if lyric is None or (type(lyric) is str and not lyric.strip()):
+        lyric = data.get("tlyric")
+    if lyric is None:
+        return None
+    if type(lyric) is not str:
+        raise ValueError("lyric_payload_invalid")
+    cleaned = lyric.strip()
+    if not cleaned:
+        return None
+    try:
+        encoded = (cleaned + "\n").encode("utf-8", errors="strict")
+    except UnicodeError:
+        raise ValueError("lyric_payload_invalid") from None
+    if len(encoded) > MAX_LYRIC_BYTES:
+        raise ValueError("lyric_too_large")
+    return encoded
+
+
+def _attached_pic_stream_indexes(probe_result: object) -> tuple[int, ...]:
+    if not isinstance(probe_result, Mapping):
+        return ()
+    streams = probe_result.get("streams")
+    if not isinstance(streams, list):
+        return ()
+    indexes: list[int] = []
+    for stream in streams:
+        if not isinstance(stream, Mapping) or stream.get("codec_type") != "video":
+            continue
+        disposition = stream.get("disposition")
+        index = stream.get("index")
+        if (
+            isinstance(disposition, Mapping)
+            and disposition.get("attached_pic") in (1, True)
+            and type(index) is int and index >= 0
+        ):
+            indexes.append(index)
+    return tuple(indexes)
+
+
+def _normalize_cover_url(value: object) -> str:
+    if type(value) is not str or not value or len(value) > 4096:
+        raise ValueError("cover_url_invalid")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        raise ValueError("cover_url_invalid") from None
+    host = (parsed.hostname or "").casefold()
+    scheme = parsed.scheme.casefold()
+    valid_port = (
+        port is None
+        or (scheme == "http" and port == 80)
+        or (scheme == "https" and port == 443)
+    )
+    if (
+        scheme not in {"http", "https"}
+        or host not in NETEASE_COVER_HOSTS
+        or parsed.username is not None or parsed.password is not None
+        or not valid_port
+        or parsed.fragment
+        or not parsed.path.startswith("/")
+        or any(ord(character) < 32 or ord(character) == 127 for character in parsed.path + parsed.query)
+    ):
+        raise ValueError("cover_url_untrusted")
+    # The source API historically returns both http and https picUrl values. A
+    # trusted image hostname is upgraded; no redirect is followed by the fetcher.
+    return urlunsplit(("https", host, parsed.path, parsed.query, ""))
+
+
+def _public_cover_addresses(host: str) -> list[str]:
+    rows = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    if len(rows) > 8:
+        raise ValueError("cover_dns_too_many_addresses")
+    addresses: list[str] = []
+    for row in rows:
+        try:
+            address = ipaddress.ip_address(row[4][0])
+        except (ValueError, IndexError):
+            raise ValueError("cover_dns_invalid") from None
+        if not address.is_global:
+            raise ValueError("cover_dns_not_public")
+        text = str(address)
+        if text not in addresses:
+            addresses.append(text)
+    if not addresses:
+        raise ValueError("cover_dns_empty")
+    return addresses
+
+
+class _PinnedCoverConnection(http.client.HTTPSConnection):
+    """HTTPS connection pinned to a prevalidated public address."""
+
+    def __init__(self, host: str, address: str):
+        super().__init__(host, port=443, timeout=COVER_TIMEOUT, context=ssl.create_default_context())
+        self._pinned_address = address
+
+    def connect(self) -> None:
+        raw_socket = socket.create_connection((self._pinned_address, 443), self.timeout)
+        try:
+            self.sock = self._context.wrap_socket(raw_socket, server_hostname=self.host)
+        except Exception:
+            raw_socket.close()
+            raise
+
+
+def _sniff_cover_mime(data: bytes) -> str:
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return ""
+
+
+def _default_cover_fetch(url: str) -> object:
+    safe_url = _normalize_cover_url(url)
+    parsed = urlsplit(safe_url)
+    host = parsed.hostname or ""
+    path = quote(parsed.path or "/", safe="/%:@!$&'()*+,;=-._~")
+    if parsed.query:
+        path += "?" + quote(parsed.query, safe="%/?@!$&'()*+,;=:-._~")
+    last_error: Exception | None = None
+    for address in _public_cover_addresses(host):
+        connection = _PinnedCoverConnection(host, address)
+        try:
+            connection.request(
+                "GET", path,
+                headers={
+                    "Host": host,
+                    "Accept": "image/jpeg,image/png,image/webp",
+                    "Accept-Encoding": "identity",
+                    "Connection": "close",
+                    "User-Agent": "fnmusic-ext/cover-fetch",
+                },
+            )
+            response = connection.getresponse()
+            if response.status != 200:
+                raise ValueError("cover_http_status")
+            raw_length = response.getheader("Content-Length")
+            if raw_length is not None:
+                if not raw_length.isdigit() or int(raw_length) > MAX_COVER_BYTES:
+                    raise ValueError("cover_too_large")
+            if response.getheader("Content-Encoding", "identity").casefold() != "identity":
+                raise ValueError("cover_encoding_invalid")
+            data = response.read(MAX_COVER_BYTES + 1)
+            if not data or len(data) > MAX_COVER_BYTES:
+                raise ValueError("cover_too_large")
+            declared_mime = response.getheader("Content-Type", "").split(";", 1)[0].strip().casefold()
+            actual_mime = _sniff_cover_mime(data)
+            if actual_mime not in _COVER_MIME_EXTENSIONS or declared_mime != actual_mime:
+                raise ValueError("cover_mime_invalid")
+            return {"data": data, "mime": actual_mime}
+        except Exception as exc:
+            last_error = exc
+        finally:
+            connection.close()
+    raise ValueError(type(last_error).__name__ if last_error else "cover_fetch_failed")
+
+
+def _default_verify_cover(path: Path) -> None:
+    try:
+        data = path.read_bytes()
+        if not data or len(data) > MAX_COVER_BYTES:
+            raise ValueError("cover_too_large")
+        mime = _sniff_cover_mime(data)
+        if not mime:
+            raise ValueError("cover_mime_invalid")
+        _validate_cover_dimensions(*_cover_dimensions(data, mime))
+    except (OSError, ValueError):
+        raise ValueError("cover_decode_failed") from None
+    command = [
+        FFMPEG_BIN, "-v", "error", "-threads", "1", "-filter_threads", "1",
+        "-max_alloc", str(MAX_COVER_DECODE_ALLOC), "-xerror",
+        "-i", os.fspath(path), "-map", "0:v:0", "-frames:v", "1", "-f", "null", "-",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=COVER_DECODE_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise ValueError("cover_decode_failed") from None
+    if completed.returncode != 0:
+        raise ValueError("cover_decode_failed")
+
+
+def _fetch_cover_asset(url: str, deps: SaveDeps | None) -> _CoverAsset:
+    safe_url = _normalize_cover_url(url)
+    fetch = _field(deps, "cover_fetch", _default_cover_fetch)
+    value = fetch(safe_url)
+    if isinstance(value, Mapping):
+        data, mime = value.get("data"), value.get("mime")
+    elif isinstance(value, tuple) and len(value) == 2:
+        data, mime = value
+    else:
+        raise ValueError("cover_response_invalid")
+    if type(data) is not bytes or not data or len(data) > MAX_COVER_BYTES:
+        raise ValueError("cover_response_invalid")
+    if type(mime) is not str or mime.casefold() != _sniff_cover_mime(data):
+        raise ValueError("cover_mime_invalid")
+    normalized_mime = mime.casefold()
+    if normalized_mime not in _COVER_MIME_EXTENSIONS:
+        raise ValueError("cover_mime_invalid")
+    _validate_cover_dimensions(*_cover_dimensions(data, normalized_mime))
+    return _CoverAsset(data, normalized_mime)
+
+
+def _cover_dimensions(data: bytes, mime: str) -> tuple[int, int]:
+    """Read image dimensions from its container header before invoking a decoder."""
+    if mime == "image/png":
+        if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n" or data[12:16] != b"IHDR":
+            raise ValueError("cover_dimensions_invalid")
+        return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+
+    if mime == "image/jpeg":
+        if not data.startswith(b"\xff\xd8"):
+            raise ValueError("cover_dimensions_invalid")
+        offset = 2
+        sof_markers = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+        while offset < len(data):
+            if data[offset] != 0xFF:
+                raise ValueError("cover_dimensions_invalid")
+            while offset < len(data) and data[offset] == 0xFF:
+                offset += 1
+            if offset >= len(data):
+                break
+            marker = data[offset]
+            offset += 1
+            if marker in {0xD8, 0xD9} or 0xD0 <= marker <= 0xD7 or marker == 0x01:
+                continue
+            if offset + 2 > len(data):
+                break
+            segment_length = int.from_bytes(data[offset:offset + 2], "big")
+            if segment_length < 2 or offset + segment_length > len(data):
+                raise ValueError("cover_dimensions_invalid")
+            if marker in sof_markers:
+                if segment_length < 7:
+                    raise ValueError("cover_dimensions_invalid")
+                height = int.from_bytes(data[offset + 3:offset + 5], "big")
+                width = int.from_bytes(data[offset + 5:offset + 7], "big")
+                return width, height
+            if marker == 0xDA:  # dimensions must be present before the scan data
+                break
+            offset += segment_length
+        raise ValueError("cover_dimensions_invalid")
+
+    if mime == "image/webp":
+        if len(data) < 20 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+            raise ValueError("cover_dimensions_invalid")
+        declared_end = int.from_bytes(data[4:8], "little") + 8
+        if declared_end > len(data) or declared_end < 20:
+            raise ValueError("cover_dimensions_invalid")
+        offset = 12
+        while offset + 8 <= declared_end:
+            chunk_type = data[offset:offset + 4]
+            chunk_size = int.from_bytes(data[offset + 4:offset + 8], "little")
+            start = offset + 8
+            end = start + chunk_size
+            if end > declared_end:
+                raise ValueError("cover_dimensions_invalid")
+            chunk = data[start:end]
+            if chunk_type == b"VP8X" and len(chunk) >= 10:
+                width = 1 + int.from_bytes(chunk[4:7], "little")
+                height = 1 + int.from_bytes(chunk[7:10], "little")
+                return width, height
+            if chunk_type == b"VP8 " and len(chunk) >= 10 and chunk[3:6] == b"\x9d\x01\x2a":
+                width = int.from_bytes(chunk[6:8], "little") & 0x3FFF
+                height = int.from_bytes(chunk[8:10], "little") & 0x3FFF
+                return width, height
+            if chunk_type == b"VP8L" and len(chunk) >= 5 and chunk[0] == 0x2F:
+                b1, b2, b3, b4 = chunk[1:5]
+                width = 1 + b1 + ((b2 & 0x3F) << 8)
+                height = 1 + (b2 >> 6) + (b3 << 2) + ((b4 & 0x0F) << 10)
+                # The VP8L version occupies the top three bits. Bit 4 is the
+                # alpha_is_used flag and is valid for lossless RGBA images.
+                if b4 >> 5:
+                    raise ValueError("cover_dimensions_invalid")
+                return width, height
+            offset = end + (chunk_size & 1)
+        raise ValueError("cover_dimensions_invalid")
+
+    raise ValueError("cover_dimensions_invalid")
+
+
+def _validate_cover_dimensions(width: int, height: int) -> None:
+    if (
+        type(width) is not int or type(height) is not int
+        or width <= 0 or height <= 0
+        or width > MAX_COVER_WIDTH or height > MAX_COVER_HEIGHT
+        or width * height > MAX_COVER_PIXELS
+    ):
+        raise ValueError("cover_dimensions_unsafe")
+
+
+def _write_cover_file(workdir: Path, asset: _CoverAsset) -> Path:
+    extension = _COVER_MIME_EXTENSIONS[asset.mime]
+    path = workdir / ("source-cover" + extension)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as handle:
+            view = memoryview(asset.data)
+            while view:
+                written = handle.write(view)
+                if not written:
+                    raise OSError("cover_write_failed")
+                view = view[written:]
+            handle.flush()
+            os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return path
+
+
+def _publish_sidecar(store: object, basename: str, data: bytes) -> str:
+    stage = None
+    publication_started = False
+    try:
+        stage = store.begin_owned_stage(TARGET_ID)
+        if stage is None:
+            return "error"
+        for offset in range(0, len(data), core.MAX_CHUNK_BYTES):
+            store.append(stage, data[offset:offset + core.MAX_CHUNK_BYTES])
+        store.seal(stage)
+        publication_started = True
+        outcome = _store_outcome(store.publish_noreplace(stage, basename))
+        if outcome == "published":
+            store.release_owned_stage(stage)
+            stage = None
+            return "published"
+        if outcome == "conflict":
+            store.abort_owned_stage(stage)
+            stage = None
+            return "conflict"
+        return "unknown"
+    except Exception:
+        return "unknown" if publication_started else "error"
+    finally:
+        if stage is not None and not publication_started:
+            try:
+                store.abort_owned_stage(stage)
+            except Exception:
+                pass
 
 
 def _select_quality(
@@ -920,7 +1433,10 @@ def _default_ffprobe(path: Path) -> object:
 
 
 def _default_decode_check(path: Path) -> None:
-    command = [FFMPEG_BIN, "-v", "error", "-i", os.fspath(path), "-f", "null", "-"]
+    command = [
+        FFMPEG_BIN, "-v", "error", "-xerror", "-i", os.fspath(path),
+        "-map", "0:a", "-f", "null", "-",
+    ]
     try:
         completed = subprocess.run(
             command,
@@ -935,17 +1451,133 @@ def _default_decode_check(path: Path) -> None:
         raise _SaveFailure("invalid_audio")
 
 
+def _default_validate_tagged(
+    path: Path,
+    expected_format: str,
+    metadata: Mapping[str, str],
+    expected_cover: bool,
+) -> object:
+    """Verify the tagged artifact with real ffprobe/ffmpeg before publication."""
+    try:
+        result = _default_ffprobe(path)
+        if _probed_audio_format(result) != expected_format:
+            raise ValueError("tagged_format_mismatch")
+        if not isinstance(result, Mapping):
+            raise ValueError("tagged_probe_invalid")
+        streams = result.get("streams")
+        if not isinstance(streams, list):
+            raise ValueError("tagged_streams_invalid")
+        audio_streams = [
+            stream for stream in streams
+            if isinstance(stream, Mapping) and stream.get("codec_type") == "audio"
+        ]
+        expected_codec = "flac" if expected_format == "flac" else "mp3"
+        if not audio_streams or any(stream.get("codec_name") != expected_codec for stream in audio_streams):
+            raise ValueError("tagged_codec_mismatch")
+        _validate_tagged_metadata(result, metadata)
+        _default_decode_check(path)
+
+        cover_indexes = _attached_pic_stream_indexes(result)
+        if bool(cover_indexes) is not expected_cover:
+            raise ValueError("tagged_cover_missing_or_unexpected")
+        if expected_cover:
+            by_index = {
+                stream.get("index"): stream
+                for stream in streams
+                if isinstance(stream, Mapping) and type(stream.get("index")) is int
+            }
+            for index in cover_indexes:
+                stream = by_index.get(index)
+                if stream is None:
+                    raise ValueError("tagged_cover_stream_missing")
+                _validate_cover_dimensions(stream.get("width"), stream.get("height"))
+                _default_verify_tagged_cover(path, index)
+        return result
+    except Exception:
+        raise _SaveFailure("tag_failed") from None
+
+
+def _validate_tagged_metadata(probe_result: Mapping[str, object], metadata: Mapping[str, str]) -> None:
+    format_entry = probe_result.get("format")
+    if not isinstance(format_entry, Mapping):
+        raise ValueError("tagged_format_tags_missing")
+    tag_maps = [format_entry.get("tags")]
+    streams = probe_result.get("streams")
+    if isinstance(streams, list):
+        tag_maps.extend(
+            stream.get("tags")
+            for stream in streams
+            if isinstance(stream, Mapping) and stream.get("codec_type") == "audio"
+        )
+    tags: dict[str, str] = {}
+    for tag_map in tag_maps:
+        if not isinstance(tag_map, Mapping):
+            continue
+        for key, value in tag_map.items():
+            if type(key) is str and type(value) is str:
+                tags[key.casefold()] = value
+    aliases = {
+        "track": ("track", "tracknumber", "track number"),
+        "disc": ("disc", "discnumber", "disc number", "disk", "disknumber"),
+    }
+    for key, expected in metadata.items():
+        candidates = aliases.get(key.casefold(), (key.casefold(),))
+        if not any(tags.get(candidate) == expected for candidate in candidates):
+            raise ValueError("tagged_metadata_mismatch")
+
+
+def _default_verify_tagged_cover(path: Path, stream_index: int) -> None:
+    command = [
+        FFMPEG_BIN, "-v", "error", "-threads", "1", "-filter_threads", "1",
+        "-max_alloc", str(MAX_COVER_DECODE_ALLOC), "-xerror",
+        "-i", os.fspath(path), "-map", f"0:{stream_index}",
+        "-frames:v", "1", "-f", "null", "-",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=COVER_DECODE_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise ValueError("tagged_cover_decode_failed") from None
+    if completed.returncode != 0:
+        raise ValueError("tagged_cover_decode_failed")
+
+
 def _default_tag(source: Path, tagged: Path, metadata: Mapping[str, str]) -> None:
     command = [
         FFMPEG_BIN,
         "-y",
         "-v", "error",
         "-i", os.fspath(source),
-        "-map", "0:a",
-        "-c", "copy",
     ]
+    cover_path = getattr(metadata, "cover_path", None)
+    source_cover_indexes = getattr(metadata, "source_cover_indexes", ())
+    if isinstance(cover_path, Path):
+        command.extend(["-i", os.fspath(cover_path)])
+    command.extend([
+        "-map", "0:a",
+    ])
+    for stream_index in source_cover_indexes:
+        if type(stream_index) is int and stream_index >= 0:
+            command.extend(["-map", f"0:{stream_index}"])
+    if isinstance(cover_path, Path):
+        command.extend(["-map", "1:v:0"])
+    command.extend([
+        "-c", "copy",
+    ])
     for key, value in metadata.items():
         command.extend(["-metadata", f"{key}={value}"])
+    cover_stream_count = len(source_cover_indexes) + (1 if isinstance(cover_path, Path) else 0)
+    for stream_index in range(cover_stream_count):
+        command.extend([
+            f"-disposition:v:{stream_index}", "attached_pic",
+            f"-metadata:s:v:{stream_index}", "title=Album cover",
+            f"-metadata:s:v:{stream_index}", "comment=Cover (front)",
+        ])
     command.append(os.fspath(tagged))
     try:
         completed = subprocess.run(
