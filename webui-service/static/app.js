@@ -2134,12 +2134,26 @@ async function saveOneTrack(button) {
         unavailable: "音源未提供封面", unsupported: "封面格式不受 MP3 支持",
         error: "封面获取或嵌入失败",
       };
+      // 封面失败只展示固定原因，绝不回显 host/URL。
+      const coverErrorLabels = {
+        host_untrusted: "封面域名不在已验证列表（p1/p2），已跳过抓取",
+        address_untrusted: "封面地址未通过公网校验，已跳过抓取",
+        url_invalid: "封面地址格式无效，已跳过抓取",
+        http_error: "封面获取失败",
+        payload_invalid: "封面内容无效",
+        decode_failed: "封面解码失败",
+        embed_failed: "封面嵌入失败",
+      };
       const lyricLabels = {
         published: "歌词已保存为同名 LRC", unavailable: "音源未提供歌词",
         error: "歌词获取或保存失败", conflict: "同名 LRC 已存在，未覆盖",
         not_attempted: "歌词未处理", unknown: "歌词发布结果待核对",
       };
-      parts.push(coverLabels[data.cover_status] || "封面状态未知");
+      if (data.cover_status === "error") {
+        parts.push(coverErrorLabels[data.cover_error] || "封面获取或嵌入失败");
+      } else {
+        parts.push(coverLabels[data.cover_status] || "封面状态未知");
+      }
       parts.push(lyricLabels[data.lyric_status] || "歌词状态未知");
       parts.push(data.artist_status === "tagged" ? "歌手标签已写入" : "音源未提供歌手");
       const lyricist = data.lyricist_status === "tagged" && data.lyricist

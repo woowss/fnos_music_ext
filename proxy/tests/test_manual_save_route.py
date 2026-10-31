@@ -391,6 +391,7 @@ def test_success_publishes_tagged_bytes_and_hides_signed_url(tmp_path):
     assert data["composer"] == ""
     assert data["composer_status"] == "unavailable"
     assert data["cover_status"] == "unavailable"
+    assert data["cover_error"] == ""
     assert data["lyric_status"] == "unavailable"
     assert data["published_size"] == len(b"TAGGED:" + PAYLOAD)
     assert data["published_md5"] == hashlib.md5(b"TAGGED:" + PAYLOAD).hexdigest()
@@ -401,7 +402,7 @@ def test_success_publishes_tagged_bytes_and_hides_signed_url(tmp_path):
         "target_dir", "tagged", "cover_embedded", "published_size",
         "published_md5", "title_status", "artist_status", "album_status",
         "lyricist", "lyricist_status", "composer", "composer_status",
-        "cover_status", "lyric_status",
+        "cover_status", "cover_error", "lyric_status",
     }
     assert store.begin_target == "manual-save"
     assert b"".join(store.chunks) == b"TAGGED:" + PAYLOAD
@@ -483,7 +484,10 @@ def test_sidecar_conflict_does_not_change_audio_success_or_overwrite_existing_ly
 
 
 @pytest.mark.parametrize("stage", ["cover", "lyric"])
-def test_optional_metadata_failure_is_reported_without_discarding_audio(tmp_path, stage):
+def test_optional_metadata_failure_is_reported_without_discarding_audio(
+    tmp_path, stage, monkeypatch,
+):
+    monkeypatch.setattr(route.time, "sleep", lambda _seconds: None)
     info = _info_payload()
     info["data"]["al"]["picUrl"] = "https://p1.music.126.net/cover.jpg"
     deps, store, _workdir = _pipeline_deps(
@@ -507,6 +511,7 @@ def test_optional_metadata_failure_is_reported_without_discarding_audio(tmp_path
     assert result["data"]["status"] == "published"
     assert store.published_names[0].endswith(".flac")
     assert result["data"]["cover_status"] == ("error" if stage == "cover" else "embedded")
+    assert result["data"]["cover_error"] == ("decode_failed" if stage == "cover" else "")
     assert result["data"]["lyric_status"] == ("unavailable" if stage == "cover" else "error")
 
 
@@ -678,6 +683,7 @@ def test_small_compressed_png_with_oversized_dimensions_is_rejected_before_decod
     result = route.save_track(489970550, deps=deps)
     assert result["ok"] is True
     assert result["data"]["cover_status"] == "error"
+    assert result["data"]["cover_error"] == "payload_invalid"
     assert verify_calls == []
     assert store.published_names == ["歌手A_歌手B - 测试歌曲.flac"]
 
@@ -917,14 +923,18 @@ def unicodedata_control(character):
     return unicodedata.category(character) in {"Cc", "Cs"}
 
 
-def test_busy_single_flight_while_first_save_holds_the_engine(tmp_path):
+def test_busy_single_flight_while_first_save_holds_the_engine(tmp_path, monkeypatch):
+    monkeypatch.setattr(route.time, "sleep", lambda _seconds: None)
     started = threading.Event()
     release = threading.Event()
     results = []
+    info_calls = []
 
     def blocking_http(url_text):
         if url_text.endswith("/info"):
+            info_calls.append(1)
             started.set()
+            # Deterministic even though one info failure is retried once.
             release.wait(5)
             raise OSError("service down")
         raise AssertionError("unexpected url")
@@ -941,15 +951,24 @@ def test_busy_single_flight_while_first_save_holds_the_engine(tmp_path):
     assert second["ok"] is False
     assert second["code"] == "busy"
     assert results and results[0]["code"] == "service_unavailable"
+    assert len(info_calls) == route.INFO_MAX_ATTEMPTS
 
 
-def test_service_unavailable_redacts_transport_errors(tmp_path):
+def test_service_unavailable_redacts_transport_errors(tmp_path, monkeypatch):
+    monkeypatch.setattr(route.time, "sleep", lambda _seconds: None)
+    attempts = []
+
+    def failing_http(_url):
+        attempts.append(1)
+        raise OSError("secret-detail")
+
     deps, store, _workdir = _pipeline_deps(tmp_path)
-    deps = replace(deps, http_json=lambda _url: (_ for _ in ()).throw(OSError("secret-detail")))
+    deps = replace(deps, http_json=failing_http)
     result = route.save_track(489970550, deps=deps)
     assert result["code"] == "service_unavailable"
     assert "secret-detail" not in json.dumps(result)
     assert store.closed is False
+    assert len(attempts) == route.INFO_MAX_ATTEMPTS
 
 
 def test_no_quality_available_when_ladder_is_exhausted(tmp_path):

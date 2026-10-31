@@ -126,6 +126,17 @@ _MANUAL_SAVE_HTTP_STATUS = {
 # Same server-token shape as the engine: a delivered quality is only ever the
 # raw lower-case token the provider reported, never a translated label.
 _MANUAL_SAVE_QUALITY_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+# Fixed redacted cover-error classes; only meaningful while cover_status == error.
+_MANUAL_SAVE_COVER_ERRORS = frozenset({
+    "host_untrusted",
+    "url_invalid",
+    "address_untrusted",
+    "http_error",
+    "payload_invalid",
+    "decode_failed",
+    "embed_failed",
+    "unknown",
+})
 
 
 def socket_path_for(base: Path) -> Path:
@@ -527,6 +538,7 @@ def _sanitize_manual_save_data(data: object) -> dict:
     text_fields = (
         "title", "artist", "album", "quality_requested", "quality_actual",
         "quality_actual_status", "source_type", "format", "basename", "target_dir",
+        "cover_error",
     )
     sanitized = {
         name: (source.get(name) if type(source.get(name)) is str else "")
@@ -578,6 +590,12 @@ def _sanitize_manual_save_data(data: object) -> dict:
     for name, allowed in status_values.items():
         value = source.get(name)
         sanitized[name] = value if type(value) is str and value in allowed else "unavailable"
+    cover_error = sanitized["cover_error"]
+    if sanitized["cover_status"] != "error":
+        cover_error = ""
+    elif cover_error not in _MANUAL_SAVE_COVER_ERRORS:
+        cover_error = "unknown"
+    sanitized["cover_error"] = cover_error
     return sanitized
 
 

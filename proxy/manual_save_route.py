@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+import urllib.error
 import urllib.request
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -41,6 +42,18 @@ MAX_COVER_DECODE_ALLOC = 96 * 1024 * 1024
 MAX_TAGGED_EXTRA_BYTES = MAX_COVER_BYTES + (1 << 20)
 MAX_LYRIC_BYTES = 1 << 20
 API_TIMEOUT = 15.0
+# Metadata delivery (FNMEXT-METADATA-DELIVERY-20261101): the same musicbox
+# service was observed returning /lyric after 27-42 s, so lyric and info get
+# their own bounded retry budgets. The worst case stays under the gateway's
+# 1200 s save timeout: info <= 15 + 0.5 + 15 = 30.5 s, lyric <= 30 + 1 + 30 = 61 s.
+INFO_TIMEOUT = API_TIMEOUT
+INFO_MAX_ATTEMPTS = 2
+INFO_RETRY_DELAY = 0.5
+INFO_TOTAL_BUDGET = 31.0
+LYRIC_TIMEOUT = 30.0
+LYRIC_MAX_ATTEMPTS = 2
+LYRIC_RETRY_DELAY = 1.0
+LYRIC_TOTAL_BUDGET = 62.0
 COVER_TIMEOUT = 8.0
 COVER_DECODE_TIMEOUT = 10.0
 # The NetEase CDN intermittently resets long transfers, and curl --retry does
@@ -82,7 +95,40 @@ FFPROBE_BIN = "/usr/bin/ffprobe"
 CURL_BIN = "/usr/bin/curl"
 CURL_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 CURL_REFERER = "https://music.163.com/"
-NETEASE_COVER_HOSTS = frozenset({"p1.music.126.net"})
+NETEASE_COVER_HOSTS = frozenset({"p1.music.126.net", "p2.music.126.net"})
+# Fixed, redacted cover-error classes exposed as `cover_error`. Only the exact
+# allowlisted hosts above may be fetched; nothing here echoes a host/URL/IP.
+_COVER_ERRORS = frozenset({
+    "host_untrusted",
+    "url_invalid",
+    "address_untrusted",
+    "http_error",
+    "payload_invalid",
+    "decode_failed",
+    "embed_failed",
+    "unknown",
+})
+_COVER_ERROR_REASONS = {
+    "cover_url_untrusted": "host_untrusted",
+    "cover_url_invalid": "url_invalid",
+    "cover_dns_too_many_addresses": "address_untrusted",
+    "cover_dns_invalid": "address_untrusted",
+    "cover_dns_not_public": "address_untrusted",
+    "cover_dns_empty": "address_untrusted",
+    "cover_dns_resolve_failed": "address_untrusted",
+    "cover_fetch_http_error": "http_error",
+    "cover_fetch_payload_invalid": "payload_invalid",
+    "cover_fetch_unknown": "unknown",
+    "cover_http_status": "http_error",
+    "cover_response_invalid": "payload_invalid",
+    "cover_mime_invalid": "payload_invalid",
+    "cover_dimensions_invalid": "payload_invalid",
+    "cover_dimensions_unsafe": "payload_invalid",
+    "cover_too_large": "payload_invalid",
+    "cover_encoding_invalid": "payload_invalid",
+    "cover_decode_failed": "decode_failed",
+}
+
 _COVER_MIME_EXTENSIONS = {
     "image/jpeg": ".jpg",
     "image/png": ".png",
@@ -516,7 +562,7 @@ def save_track(song_id: object, *, deps: SaveDeps | None = None) -> dict:
 
 
 def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
-    http_json = _field(deps, "http_json", _default_http_json)
+    http_json = _field(deps, "http_json", _default_info_http_json)
     media_resolve = _field(deps, "media_resolve", None)
     download = _field(deps, "download", None)
     if download is None:
@@ -585,27 +631,35 @@ def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
         source_cover_indexes = _attached_pic_stream_indexes(probe_result)
         cover_asset = None
         cover_path = None
+        cover_error = ""
         if source_cover_indexes:
             cover_status = "preserved"
         elif track_metadata.cover_url:
             try:
                 cover_asset = _fetch_cover_asset(track_metadata.cover_url, deps)
+            except Exception as exc:
+                cover_asset = None
+                cover_status = "error"
+                cover_error = _cover_error_code(exc, stage="fetch")
+            else:
                 if actual_format == "mp3" and cover_asset.mime == "image/webp":
                     cover_status = "unsupported"
                 else:
-                    cover_path = _write_cover_file(workdir, cover_asset)
-                    _field(deps, "verify_cover", _default_verify_cover)(cover_path)
-                    cover_status = "embedded"
-            except Exception:
-                cover_asset = None
-                cover_path = None
-                cover_status = "error"
+                    try:
+                        cover_path = _write_cover_file(workdir, cover_asset)
+                        _field(deps, "verify_cover", _default_verify_cover)(cover_path)
+                        cover_status = "embedded"
+                    except Exception as exc:
+                        cover_asset = None
+                        cover_path = None
+                        cover_status = "error"
+                        cover_error = _cover_error_code(exc, stage="verify")
         else:
             cover_status = "unavailable"
 
         lyric_bytes = None
         try:
-            lyric_json = _field(deps, "lyric_json", _default_http_json)
+            lyric_json = _field(deps, "lyric_json", _default_lyric_http_json)
             lyric_bytes = _fetch_lyric_bytes(lyric_json, config.musicbox_url, song_id)
             lyric_status = "unavailable" if lyric_bytes is None else "not_attempted"
         except Exception:
@@ -647,10 +701,17 @@ def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
             raise _SaveFailure("tag_failed") from None
         cover_embedded = bool(_attached_pic_stream_indexes(tagged_probe))
         if expected_cover:
-            cover_status = "preserved" if source_cover_indexes else "embedded"
+            if cover_embedded:
+                cover_status = "preserved" if source_cover_indexes else "embedded"
+            else:
+                # A requested image that was not safely attached after tagging.
+                cover_status = "error"
+                cover_error = "embed_failed"
         elif cover_status in {"embedded", "preserved"}:
-            # A requested image that was not safely attached cannot be reported as present.
             cover_status = "error"
+            cover_error = "embed_failed"
+        if cover_status != "error":
+            cover_error = ""
 
         basename = build_basename(artist, title, actual_format)
 
@@ -670,6 +731,7 @@ def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
             md5=downloaded_md5,
             basename=basename,
             target_dir=config.target_dir,
+            cover_error=cover_error,
         )
         data.update({
             "title_status": "tagged",
@@ -680,6 +742,7 @@ def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
             "composer": track_metadata.composer,
             "composer_status": "tagged" if track_metadata.composer else "unavailable",
             "cover_status": cover_status,
+            "cover_error": cover_error,
             "lyric_status": lyric_status,
             "cover_embedded": cover_embedded,
         })
@@ -726,6 +789,7 @@ def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
         if outcome == "conflict":
             data["status"] = "conflict"
             data["cover_status"] = "not_published"
+            data["cover_error"] = ""
             data["cover_embedded"] = False
             data["lyric_status"] = "not_attempted"
             return _result(False, "conflict", data)
@@ -740,12 +804,69 @@ def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
             shutil.rmtree(workdir, ignore_errors=True)
 
 
+_RETRYABLE_HTTP_STATUSES = frozenset({408, 429})
+
+
+def _is_retryable_metadata_error(exc: BaseException) -> bool:
+    """True only for transient transport/HTTP failures (never payload errors)."""
+    if isinstance(exc, _SaveFailure):
+        return False
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in _RETRYABLE_HTTP_STATUSES or 500 <= exc.code <= 599
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    if isinstance(exc, OSError):
+        return True
+    return False
+
+
+def _retry_transient(
+    operation: Callable[[], object],
+    *,
+    max_attempts: int,
+    retry_delay: float,
+    total_budget: float,
+    sleep: Callable[[float], None] | None = None,
+    monotonic: Callable[[], float] | None = None,
+) -> object:
+    """Bounded retry for one metadata HTTP call; never retries payload errors.
+
+    ``sleep``/``monotonic`` default to the module-level ``time`` attributes at
+    call time, so tests can monkeypatch ``route.time.sleep`` without waiting.
+    """
+    sleep_fn = time.sleep if sleep is None else sleep
+    clock = time.monotonic if monotonic is None else monotonic
+    deadline = clock() + total_budget
+    last_error: BaseException | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return operation()
+        except Exception as exc:
+            if not _is_retryable_metadata_error(exc):
+                raise
+            last_error = exc
+        if attempt >= max_attempts:
+            break
+        remaining = deadline - clock()
+        if remaining <= 0:
+            break
+        sleep_fn(min(retry_delay, remaining))
+    if last_error is None:
+        raise _SaveFailure("service_unavailable")
+    raise last_error
+
+
 def _fetch_song_info(
     http_json: Callable[[str], object], musicbox_url: str, song_id: int
 ) -> _TrackMetadata:
     url = f"{musicbox_url.rstrip('/')}/api/v1/song/{song_id}/info"
     try:
-        payload = http_json(url)
+        payload = _retry_transient(
+            lambda: http_json(url),
+            max_attempts=INFO_MAX_ATTEMPTS,
+            retry_delay=INFO_RETRY_DELAY,
+            total_budget=INFO_TOTAL_BUDGET,
+        )
     except Exception:
         raise _SaveFailure("service_unavailable") from None
     if not isinstance(payload, Mapping) or payload.get("ok") is not True:
@@ -808,7 +929,12 @@ def _fetch_lyric_bytes(
     http_json: Callable[[str], object], musicbox_url: str, song_id: int
 ) -> bytes | None:
     url = f"{musicbox_url.rstrip('/')}/api/v1/song/{song_id}/lyric"
-    payload = http_json(url)
+    payload = _retry_transient(
+        lambda: http_json(url),
+        max_attempts=LYRIC_MAX_ATTEMPTS,
+        retry_delay=LYRIC_RETRY_DELAY,
+        total_budget=LYRIC_TOTAL_BUDGET,
+    )
     if not isinstance(payload, Mapping) or payload.get("ok") is not True:
         raise ValueError("lyric_unavailable")
     data = payload.get("data")
@@ -857,6 +983,8 @@ def _attached_pic_stream_indexes(probe_result: object) -> tuple[int, ...]:
 def _normalize_cover_url(value: object) -> str:
     if type(value) is not str or not value or len(value) > 4096:
         raise ValueError("cover_url_invalid")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError("cover_url_invalid")
     try:
         parsed = urlsplit(value)
         port = parsed.port
@@ -871,13 +999,13 @@ def _normalize_cover_url(value: object) -> str:
     )
     if (
         scheme not in {"http", "https"}
-        or host not in NETEASE_COVER_HOSTS
         or parsed.username is not None or parsed.password is not None
         or not valid_port
         or parsed.fragment
         or not parsed.path.startswith("/")
-        or any(ord(character) < 32 or ord(character) == 127 for character in parsed.path + parsed.query)
     ):
+        raise ValueError("cover_url_invalid")
+    if host not in NETEASE_COVER_HOSTS:
         raise ValueError("cover_url_untrusted")
     # The source API historically returns both http and https picUrl values. A
     # trusted image hostname is upgraded; no redirect is followed by the fetcher.
@@ -885,7 +1013,10 @@ def _normalize_cover_url(value: object) -> str:
 
 
 def _public_cover_addresses(host: str) -> list[str]:
-    rows = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    try:
+        rows = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    except OSError:
+        raise ValueError("cover_dns_resolve_failed") from None
     if len(rows) > 8:
         raise ValueError("cover_dns_too_many_addresses")
     addresses: list[str] = []
@@ -937,7 +1068,7 @@ def _default_cover_fetch(url: str) -> object:
     path = quote(parsed.path or "/", safe="/%:@!$&'()*+,;=-._~")
     if parsed.query:
         path += "?" + quote(parsed.query, safe="%/?@!$&'()*+,;=:-._~")
-    last_error: Exception | None = None
+    failure_class = "unknown"
     for address in _public_cover_addresses(host):
         connection = _PinnedCoverConnection(host, address)
         try:
@@ -969,10 +1100,43 @@ def _default_cover_fetch(url: str) -> object:
                 raise ValueError("cover_mime_invalid")
             return {"data": data, "mime": actual_mime}
         except Exception as exc:
-            last_error = exc
+            # Only a fixed class token survives; never type(last_error).__name__,
+            # a hostname, an IP, or a URL fragment.
+            failure_class = _cover_fetch_failure_class(exc)
         finally:
             connection.close()
-    raise ValueError(type(last_error).__name__ if last_error else "cover_fetch_failed")
+    raise ValueError("cover_fetch_" + failure_class)
+
+
+def _cover_fetch_failure_class(exc: BaseException) -> str:
+    """Classify one per-address cover fetch failure into a redacted class token."""
+    if isinstance(exc, ValueError):
+        reason = str(exc)
+        if reason == "cover_http_status":
+            return "http_error"
+        if reason in {"cover_too_large", "cover_encoding_invalid", "cover_mime_invalid"}:
+            return "payload_invalid"
+    if isinstance(
+        exc,
+        (OSError, ssl.SSLError, http.client.HTTPException, TimeoutError),
+    ):
+        return "http_error"
+    return "unknown"
+
+
+def _cover_error_code(exc: BaseException, *, stage: str = "fetch") -> str:
+    """Map one cover failure to the fixed observable `cover_error` token."""
+    if isinstance(exc, ValueError):
+        token = _COVER_ERROR_REASONS.get(str(exc))
+        if token is not None:
+            return token
+    if stage == "verify":
+        if isinstance(exc, (OSError, ValueError, subprocess.SubprocessError)):
+            return "decode_failed"
+        return "unknown"
+    if isinstance(exc, (OSError, ssl.SSLError, http.client.HTTPException, TimeoutError)):
+        return "http_error"
+    return "unknown"
 
 
 def _default_verify_cover(path: Path) -> None:
@@ -1357,6 +1521,7 @@ def _success_data(
     md5: str,
     basename: str,
     target_dir: str,
+    cover_error: str,
 ) -> dict:
     return {
         "status": status_value,
@@ -1374,6 +1539,7 @@ def _success_data(
         "md5": md5,
         "basename": basename,
         "target_dir": target_dir,
+        "cover_error": cover_error,
         "tagged": True,
         "cover_embedded": False,
     }
@@ -1444,9 +1610,9 @@ def _default_make_tempdir() -> Path:
     return path
 
 
-def _default_http_json(url: str) -> object:
+def _default_http_json(url: str, *, timeout: float = API_TIMEOUT) -> object:
     request = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
-    with urllib.request.urlopen(request, timeout=API_TIMEOUT) as response:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
         status_code = getattr(response, "status", 200)
         if status_code != 200:
             raise OSError("http_status")
@@ -1454,6 +1620,16 @@ def _default_http_json(url: str) -> object:
     if len(payload) > MAX_JSON_BYTES:
         raise ValueError("json_too_large")
     return json.loads(payload.decode("utf-8"))
+
+
+def _default_lyric_http_json(url: str) -> object:
+    """Lyric reads get a 30 s budget; the observed service can take 27 s+."""
+    return _default_http_json(url, timeout=LYRIC_TIMEOUT)
+
+
+def _default_info_http_json(url: str) -> object:
+    """Info reads use the explicit INFO_TIMEOUT budget (same 15 s as API_TIMEOUT)."""
+    return _default_http_json(url, timeout=INFO_TIMEOUT)
 
 
 def _curl_config_quote(value: str) -> str:

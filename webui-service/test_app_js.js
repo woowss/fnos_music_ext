@@ -1819,6 +1819,32 @@ test("手动保存：阶梯回退时标注回退", async () => {
   assert.ok(message.includes("回退"));
 });
 
+test("手动保存：封面域名未验证时显示明确原因", async () => {
+  const { message } = await savePublishedTrack({
+    cover_status: "error", cover_error: "host_untrusted",
+  });
+  assert.ok(message.includes("封面域名不在已验证列表（p1/p2），已跳过抓取"));
+  assert.ok(!message.includes("p2.music.126.net"));
+  assert.ok(!message.includes("http"));
+});
+
+test("手动保存：封面错误原因未知时保持通用文案", async () => {
+  for (const coverError of ["unknown", "bogus", undefined]) {
+    const { message } = await savePublishedTrack({
+      cover_status: "error", cover_error: coverError,
+    });
+    assert.ok(message.includes("封面获取或嵌入失败"));
+  }
+});
+
+test("手动保存：封面成功时不显示失败原因", async () => {
+  const { message } = await savePublishedTrack({
+    cover_status: "embedded", cover_error: "",
+  });
+  assert.ok(message.includes("封面已嵌入"));
+  assert.ok(!message.includes("封面获取或嵌入失败"));
+});
+
 /* ------------------------------------------------ 运行 --------------------- */
 (async () => {
   let failed = 0;

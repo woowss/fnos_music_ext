@@ -58,6 +58,7 @@ def _published_result():
             "md5": "a" * 32,
             "basename": "歌手A - 测试歌曲.flac",
             "target_dir": "/vol1/music",
+            "cover_error": "",
             "tagged": True,
             "cover_embedded": False,
             "title_status": "tagged",
@@ -350,7 +351,7 @@ def test_track_success_returns_sanitized_engine_result():
         "target_dir", "tagged", "cover_embedded", "published_size",
         "published_md5", "title_status", "artist_status", "album_status",
         "lyricist", "lyricist_status", "composer", "composer_status",
-        "cover_status", "lyric_status",
+        "cover_status", "cover_error", "lyric_status",
     }
     assert set(payload["data"]) == expected_fields
     assert payload["data"]["status"] == "published"
@@ -359,6 +360,7 @@ def test_track_success_returns_sanitized_engine_result():
     assert payload["data"]["quality_actual"] == "jymaster"
     assert payload["data"]["quality_actual_status"] == "reported"
     assert payload["data"]["quality_fallback"] is False
+    assert payload["data"]["cover_error"] == ""
     assert payload["data"]["basename"] == "歌手A - 测试歌曲.flac"
     assert payload["data"]["published_size"] == 34
     assert payload["data"]["published_md5"] == "b" * 32
@@ -441,6 +443,31 @@ def test_sanitize_quality_status_consistency(
     assert sanitized["quality_actual_status"] == expected_status
     assert sanitized["quality_actual"] == expected_actual
     assert sanitized["quality_fallback"] is expected_fallback
+
+
+@pytest.mark.parametrize(
+    ("raw_status", "raw_error", "expected"),
+    [
+        pytest.param("error", "host_untrusted", "host_untrusted", id="error-valid"),
+        pytest.param("error", "payload_invalid", "payload_invalid", id="error-payload"),
+        pytest.param("error", None, "unknown", id="error-missing"),
+        pytest.param("error", "", "unknown", id="error-empty"),
+        pytest.param("error", "bogus", "unknown", id="error-illegal"),
+        pytest.param("error", 5, "unknown", id="error-non-str"),
+        pytest.param("published", "http_error", "", id="published-drops-error"),
+        pytest.param("unavailable", None, "", id="unavailable-empty"),
+        pytest.param("not_published", "embed_failed", "", id="not-published-empty"),
+        pytest.param("bogus", "host_untrusted", "", id="illegal-status-empty"),
+    ],
+)
+def test_sanitize_cover_error_consistency(raw_status, raw_error, expected):
+    data = {"cover_status": raw_status}
+    if raw_error is not None:
+        data["cover_error"] = raw_error
+    sanitized = gw._sanitize_manual_save_data(data)
+    assert sanitized["cover_error"] == expected
+    if sanitized["cover_status"] != "error":
+        assert sanitized["cover_error"] == ""
 
 
 def test_track_disabled_engine_short_circuits_before_save():
