@@ -2108,8 +2108,25 @@ async function saveOneTrack(button) {
     });
     if (body && body.ok === true && body.code === "ok") {
       const data = body.data || {};
+      // 音质只展示服务端上报的原始 token：不翻译档位名，也不用请求档顶替未知档。
+      const qualityParts = [];
+      if (data.quality_actual_status === "reported" && data.quality_actual) {
+        qualityParts.push("实际档位：" + data.quality_actual);
+        if (data.quality_fallback === true || data.quality_actual !== data.quality_requested) {
+          const requested = typeof data.quality_requested === "string" ? data.quality_requested : "";
+          if (requested) qualityParts.push("请求档位：" + requested);
+          qualityParts.push("回退");
+        }
+      } else if (data.quality_actual_status === "unknown") {
+        qualityParts.push("档位未知");
+      } else if (typeof data.quality_actual === "string" && data.quality_actual) {
+        // 旧引擎没有 quality_actual_status：保持原有展示，不推断档位状态。
+        qualityParts.push(data.quality_actual);
+      } else {
+        qualityParts.push("档位未知");
+      }
       const parts = [
-        data.quality_actual, data.format, formatSaveSize(data.size),
+        ...qualityParts, data.format, formatSaveSize(data.size),
         data.basename, data.target_dir,
       ].filter((part) => typeof part === "string" && part);
       const coverLabels = {

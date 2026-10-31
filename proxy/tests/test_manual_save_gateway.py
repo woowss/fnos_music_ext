@@ -50,6 +50,8 @@ def _published_result():
             "album": "专辑",
             "quality_requested": "jymaster",
             "quality_actual": "jymaster",
+            "quality_actual_status": "reported",
+            "quality_fallback": False,
             "source_type": "flac",
             "format": "flac",
             "size": 30,
@@ -343,7 +345,8 @@ def test_track_success_returns_sanitized_engine_result():
     assert payload["code"] == "ok"
     expected_fields = {
         "status", "song_id", "title", "artist", "album", "quality_requested",
-        "quality_actual", "source_type", "format", "size", "md5", "basename",
+        "quality_actual", "quality_actual_status", "quality_fallback",
+        "source_type", "format", "size", "md5", "basename",
         "target_dir", "tagged", "cover_embedded", "published_size",
         "published_md5", "title_status", "artist_status", "album_status",
         "lyricist", "lyricist_status", "composer", "composer_status",
@@ -352,6 +355,10 @@ def test_track_success_returns_sanitized_engine_result():
     assert set(payload["data"]) == expected_fields
     assert payload["data"]["status"] == "published"
     assert payload["data"]["song_id"] == SONG_ID
+    assert payload["data"]["quality_requested"] == "jymaster"
+    assert payload["data"]["quality_actual"] == "jymaster"
+    assert payload["data"]["quality_actual_status"] == "reported"
+    assert payload["data"]["quality_fallback"] is False
     assert payload["data"]["basename"] == "歌手A - 测试歌曲.flac"
     assert payload["data"]["published_size"] == 34
     assert payload["data"]["published_md5"] == "b" * 32
@@ -377,7 +384,9 @@ def test_track_accepts_extra_json_fields():
 @pytest.mark.parametrize(
     ("engine_code", "expected_status"),
     [("busy", 409), ("conflict", 409), ("service_unavailable", 503),
-     ("publish_failed", 500), ("invalid_audio", 502)],
+     ("publish_failed", 500), ("invalid_audio", 502),
+     ("quality_unverified", 502), ("quality_identity_mismatch", 502),
+     ("trial_only", 502)],
 )
 def test_track_maps_engine_codes_to_fixed_http_status(engine_code, expected_status):
     save_result = {
@@ -392,6 +401,46 @@ def test_track_maps_engine_codes_to_fixed_http_status(engine_code, expected_stat
     _assert_shape(payload)
     assert payload["ok"] is False
     assert payload["code"] == engine_code
+
+
+def test_new_quality_failure_codes_use_fixed_messages():
+    assert gw._manual_save_message("quality_unverified") == "音质响应无法核验"
+    assert gw._manual_save_message("quality_identity_mismatch") == "无法确认音质响应所属曲目"
+    assert gw._manual_save_message("trial_only") == "仅取得试听片段，未保存"
+    for code in ("quality_unverified", "quality_identity_mismatch", "trial_only"):
+        message = gw._manual_save_message(code)
+        assert message == gw._MANUAL_SAVE_GATEWAY_MESSAGES[code]
+        assert "http" not in message and "/" not in message and "token" not in message
+
+
+@pytest.mark.parametrize(
+    ("raw_status", "raw_actual", "raw_fallback",
+     "expected_status", "expected_actual", "expected_fallback"),
+    [
+        pytest.param("bogus", "jymaster", True, "unknown", "", True, id="illegal-status"),
+        pytest.param(None, "jymaster", "yes", "unknown", "", False, id="missing-status"),
+        pytest.param("reported", "", True, "unknown", "", True, id="reported-empty-actual"),
+        pytest.param("reported", "Not A Token", True, "unknown", "", True,
+                     id="reported-illegal-token"),
+        pytest.param("reported", "lossless", True, "reported", "lossless", True,
+                     id="reported-legal-token"),
+        pytest.param("unknown", "lossless", False, "unknown", "", False,
+                     id="unknown-drops-actual"),
+    ],
+)
+def test_sanitize_quality_status_consistency(
+    raw_status, raw_actual, raw_fallback,
+    expected_status, expected_actual, expected_fallback,
+):
+    sanitized = gw._sanitize_manual_save_data({
+        "quality_requested": "jymaster",
+        "quality_actual": raw_actual,
+        "quality_actual_status": raw_status,
+        "quality_fallback": raw_fallback,
+    })
+    assert sanitized["quality_actual_status"] == expected_status
+    assert sanitized["quality_actual"] == expected_actual
+    assert sanitized["quality_fallback"] is expected_fallback
 
 
 def test_track_disabled_engine_short_circuits_before_save():

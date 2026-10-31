@@ -57,6 +57,14 @@ COVER_DECODE_TIMEOUT = 10.0
 DOWNLOAD_TIMEOUT = 180.0
 DOWNLOAD_SUBPROCESS_TIMEOUT = 580.0
 DOWNLOAD_MAX_ATTEMPTS = 4
+# Delivery guard (FNMEXT-DELIVERY-GUARD part 2): a signed media URL is fetched
+# only after every hop passed URL policy, address policy, and a bounded probe.
+# The probe phase has its own budget; the transfer phase gets a fresh one.
+DOWNLOAD_MAX_REDIRECTS = 3
+DOWNLOAD_PROBE_TIMEOUT = 15.0
+DOWNLOAD_MAX_MEDIA_PROBE_ATTEMPTS = 4
+DOWNLOAD_MAX_MEDIA_ADDRESSES = 32
+DOWNLOAD_MAX_MEDIA_URL_CHARS = 4096
 PROBE_TIMEOUT = 30.0
 DECODE_TIMEOUT = 300.0
 TAG_TIMEOUT = 120.0
@@ -84,6 +92,9 @@ UNKNOWN_ARTIST = "未知歌手"
 ARTIST_SEPARATOR = "/"
 MD5_RE = re.compile(r"[0-9a-fA-F]{32}")
 DIGITS_RE = re.compile(r"[0-9]{1,10}")
+# A delivered quality is reported as a lowercase server token; anything else is
+# "unknown", never translated or inferred from type/bitrate/sample-rate.
+QUALITY_LEVEL_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 SEARCH_LIMIT = 20
 MAX_SEARCH_KEYWORD_CHARS = 120
 _FILENAME_FORBIDDEN = frozenset("/\\:")
@@ -101,6 +112,10 @@ _MESSAGES = {
     "busy": "已有保存任务进行中",
     "service_unavailable": "音乐服务不可用",
     "no_quality_available": "没有可用的音质",
+    "quality_unverified": "音质响应无法核验",
+    "quality_identity_mismatch": "无法确认音质响应所属曲目",
+    "trial_only": "仅取得试听片段，未保存",
+    "download_target_untrusted": "下载目标未通过安全校验",
     "download_failed": "下载失败",
     "integrity_mismatch": "文件校验不一致",
     "invalid_audio": "音频文件无效",
@@ -146,6 +161,7 @@ class SaveDeps:
     verify_cover: Callable[[Path], None] | None = None
     cover_fetch: Callable[[str], object] | None = None
     validate_tagged: Callable[[Path, str, Mapping[str, str], bool], object] | None = None
+    media_resolve: Callable[[str, int], object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +195,30 @@ class _TagMetadata(dict[str, str]):
 class _CoverAsset:
     data: bytes
     mime: str
+
+
+@dataclass(frozen=True, slots=True)
+class _QualityVerdict:
+    """One quality-ladder response classified without any network or file access."""
+
+    state: str
+    failure_code: str = ""
+    data: Mapping | None = None
+    media_url: str = ""
+    actual: str = ""
+    actual_status: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class _QualitySelection:
+    """The first verified full-track answer from the quality ladder."""
+
+    requested: str
+    data: Mapping
+    media_url: str
+    actual: str
+    actual_status: str
+    fallback: bool
 
 
 def _field(deps: SaveDeps | None, name: str, default):
@@ -477,7 +517,11 @@ def save_track(song_id: object, *, deps: SaveDeps | None = None) -> dict:
 
 def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
     http_json = _field(deps, "http_json", _default_http_json)
-    download = _field(deps, "download", _default_download)
+    media_resolve = _field(deps, "media_resolve", None)
+    download = _field(deps, "download", None)
+    if download is None:
+        def download(media_url: str, destination: Path) -> object:
+            return _default_download(media_url, destination, resolve=media_resolve)
     probe = _field(deps, "probe", _default_ffprobe)
     decode_check = _field(deps, "decode_check", _default_decode_check)
     tag = _field(deps, "tag", _default_tag)
@@ -490,9 +534,9 @@ def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
     album = track_metadata.album
     track_number = track_metadata.track_number
     disc_number = track_metadata.disc_number
-    quality_requested, quality_data, media_url = _select_quality(
-        http_json, config.musicbox_url, song_id
-    )
+    quality = _select_quality(http_json, config.musicbox_url, song_id)
+    quality_data = quality.data
+    media_url = quality.media_url
     api_type = _text(quality_data.get("type")).strip().casefold()
     source_type = api_type if api_type in {"flac", "mp3"} else ""
 
@@ -609,7 +653,6 @@ def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
             cover_status = "error"
 
         basename = build_basename(artist, title, actual_format)
-        quality_actual = _text(quality_data.get("level"), quality_requested) or quality_requested
 
         data = _success_data(
             status_value="published",
@@ -617,8 +660,10 @@ def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
             title=title,
             artist=artist,
             album=album,
-            quality_requested=quality_requested,
-            quality_actual=quality_actual,
+            quality_requested=quality.requested,
+            quality_actual=quality.actual,
+            quality_actual_status=quality.actual_status,
+            quality_fallback=quality.fallback,
             source_type=source_type,
             actual_format=actual_format,
             size=downloaded_size,
@@ -1119,25 +1164,119 @@ def _publish_sidecar(store: object, basename: str, data: bytes) -> str:
                 pass
 
 
+_QUALITY_UNAVAILABLE = "unavailable"
+_QUALITY_TRIAL = "trial"
+_QUALITY_AVAILABLE = "available"
+_QUALITY_ERROR = "error"
+
+
+def _quality_error(code: str) -> _QualityVerdict:
+    return _QualityVerdict(state=_QUALITY_ERROR, failure_code=code)
+
+
+def _quality_identity_matches(data: Mapping, song_id: int) -> bool:
+    """``data.id`` must identify the requested song; an optional alias must agree."""
+    identity = _positive_int(data.get("id"))
+    if identity is None or identity != song_id:
+        return False
+    if "songId" in data:
+        alias = _positive_int(data.get("songId"))
+        if alias is None or alias != identity or alias != song_id:
+            return False
+    return True
+
+
+def _reported_quality_level(value: object) -> tuple[str, str]:
+    """Return ``(token, status)``; only a legal server token is claimed as reported."""
+    if type(value) is not str:
+        return "", "unknown"
+    token = value.strip().casefold()
+    if not token or QUALITY_LEVEL_TOKEN_RE.fullmatch(token) is None:
+        return "", "unknown"
+    return token, "reported"
+
+
+def _evaluate_quality_response(
+    payload: object, song_id: int, tier: str
+) -> _QualityVerdict:
+    """Classify one ``/song/<id>/url`` response; pure, no I/O.
+
+    ``tier`` is the ladder token that produced ``payload`` (kept for callers and
+    tests; the verdict itself depends only on the response). The ladder may only
+    fall through on *definitive* evidence: a 404 without a URL, or an explicit
+    non-empty ``freeTrialInfo`` trial marker. Anything that cannot be verified
+    fails closed instead of silently downgrading. A reported ``level`` is never a
+    failure, even when it is lower than the requested tier.
+    """
+    if not isinstance(payload, Mapping) or payload.get("ok") is not True:
+        return _quality_error("quality_unverified")
+    data = payload.get("data")
+    if not isinstance(data, Mapping):
+        return _quality_error("quality_unverified")
+    code = data.get("code")
+    if type(code) is not int or code not in (200, 404):
+        return _quality_error("quality_unverified")
+    if not _quality_identity_matches(data, song_id):
+        return _quality_error("quality_identity_mismatch")
+    media_url = data.get("url")
+    if code == 404:
+        if media_url is None or (type(media_url) is str and not media_url):
+            return _QualityVerdict(state=_QUALITY_UNAVAILABLE)
+        return _quality_error("quality_unverified")
+    if type(media_url) is not str or not media_url.startswith(("http://", "https://")):
+        return _quality_error("quality_unverified")
+    if "freeTrialInfo" not in data:
+        # A missing key is not evidence of a full track; only an explicit null is.
+        return _quality_error("quality_unverified")
+    trial = data.get("freeTrialInfo")
+    if trial is None:
+        actual, actual_status = _reported_quality_level(data.get("level"))
+        return _QualityVerdict(
+            state=_QUALITY_AVAILABLE,
+            data=data,
+            media_url=media_url,
+            actual=actual,
+            actual_status=actual_status,
+        )
+    if isinstance(trial, Mapping) and trial:
+        return _QualityVerdict(state=_QUALITY_TRIAL)
+    return _quality_error("quality_unverified")
+
+
 def _select_quality(
     http_json: Callable[[str], object], musicbox_url: str, song_id: int
-) -> tuple[str, Mapping, str]:
+) -> _QualitySelection:
     base = musicbox_url.rstrip("/")
-    for quality in QUALITY_ORDER:
+    trial_seen = False
+    for index, quality in enumerate(QUALITY_ORDER):
         url = f"{base}/api/v1/song/{song_id}/url?quality={quality}"
         try:
             payload = http_json(url)
+        except (OSError, TimeoutError):
+            raise _SaveFailure("service_unavailable") from None
         except Exception:
+            raise _SaveFailure("quality_unverified") from None
+        verdict = _evaluate_quality_response(payload, song_id, quality)
+        if verdict.state == _QUALITY_ERROR:
+            raise _SaveFailure(verdict.failure_code)
+        if verdict.state == _QUALITY_TRIAL:
+            trial_seen = True
             continue
-        if not isinstance(payload, Mapping) or payload.get("ok") is not True:
+        if verdict.state == _QUALITY_UNAVAILABLE:
             continue
-        data = payload.get("data")
-        if not isinstance(data, Mapping):
-            continue
-        media_url = data.get("url")
-        if type(media_url) is not str or not media_url.startswith(("http://", "https://")):
-            continue
-        return quality, data, media_url
+        fallback = index > 0 or (
+            verdict.actual_status == "reported" and verdict.actual != quality
+        )
+        return _QualitySelection(
+            requested=quality,
+            data=verdict.data if verdict.data is not None else {},
+            media_url=verdict.media_url,
+            actual=verdict.actual,
+            actual_status=verdict.actual_status,
+            fallback=fallback,
+        )
+    if trial_seen:
+        raise _SaveFailure("trial_only")
     raise _SaveFailure("no_quality_available")
 
 
@@ -1210,6 +1349,8 @@ def _success_data(
     album: str,
     quality_requested: str,
     quality_actual: str,
+    quality_actual_status: str,
+    quality_fallback: bool,
     source_type: str,
     actual_format: str,
     size: int,
@@ -1225,6 +1366,8 @@ def _success_data(
         "album": album,
         "quality_requested": quality_requested,
         "quality_actual": quality_actual,
+        "quality_actual_status": quality_actual_status,
+        "quality_fallback": quality_fallback,
         "source_type": source_type,
         "format": actual_format,
         "size": size,
@@ -1321,42 +1464,437 @@ def _curl_config_quote(value: str) -> str:
     return chr(34) + escaped + chr(34)
 
 
-def _default_download(media_url: str, destination: Path) -> object:
-    """Download one signed URL with curl; the URL travels only on curl's stdin.
+_MEDIA_URL_SCHEMES = frozenset({"http", "https"})
+_MEDIA_URL_DEFAULT_PORTS = {"http": 80, "https": 443}
+_MEDIA_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+_MEDIA_SUCCESS_STATUSES = frozenset({200, 206})
+_MEDIA_HOST_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+_MEDIA_HOST_MAX_CHARS = 253
+_MEDIA_UNTRUSTED_V4_NETWORKS = (
+    ipaddress.IPv4Network("100.64.0.0/10"),
+    ipaddress.IPv4Network("198.18.0.0/15"),
+)
+_MEDIA_UNTRUSTED_V6_NETWORKS = (
+    ipaddress.IPv6Network("::ffff:0:0/96"),
+    ipaddress.IPv6Network("64:ff9b::/96"),
+)
+
+
+def _normalize_media_url(media_url: object) -> str:
+    """Validate and canonicalize one media URL; every redirect hop repeats this.
+
+    Framing bytes (NUL/CR/LF) map to ``download_failed`` because they would break
+    the curl-config frame; every target-policy violation maps to
+    ``download_target_untrusted`` and is never retried on another address. The
+    query string is preserved verbatim (never decoded or re-encoded).
+    """
+    if type(media_url) is not str:
+        raise _SaveFailure("download_failed")
+    if any(character in media_url for character in (chr(0), chr(13), chr(10))):
+        raise _SaveFailure("download_failed")
+    if not 0 < len(media_url) <= DOWNLOAD_MAX_MEDIA_URL_CHARS:
+        raise _SaveFailure("download_failed")
+    for character in media_url:
+        code = ord(character)
+        if character in (" ", chr(92)) or code < 0x20 or code == 0x7F or code > 0x7E:
+            raise _SaveFailure("download_target_untrusted")
+    try:
+        parts = urlsplit(media_url)
+    except ValueError:
+        raise _SaveFailure("download_target_untrusted") from None
+    scheme = parts.scheme.casefold()
+    if scheme not in _MEDIA_URL_SCHEMES:
+        raise _SaveFailure("download_failed")
+    if "@" in parts.netloc or "#" in media_url:
+        raise _SaveFailure("download_target_untrusted")
+    host = parts.hostname
+    if not host or parts.netloc.startswith("["):
+        raise _SaveFailure("download_target_untrusted")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        raise _SaveFailure("download_target_untrusted")
+    if not host.isascii() or host.endswith(".") or len(host) > _MEDIA_HOST_MAX_CHARS:
+        raise _SaveFailure("download_target_untrusted")
+    host = host.casefold()
+    labels = host.split(".")
+    if any(_MEDIA_HOST_LABEL_RE.fullmatch(label) is None for label in labels):
+        raise _SaveFailure("download_target_untrusted")
+    try:
+        port = parts.port
+    except ValueError:
+        raise _SaveFailure("download_target_untrusted") from None
+    if port is not None and port != _MEDIA_URL_DEFAULT_PORTS[scheme]:
+        raise _SaveFailure("download_target_untrusted")
+    if not parts.path.startswith("/"):
+        raise _SaveFailure("download_target_untrusted")
+    normalized = scheme + "://" + host + parts.path
+    if parts.query:
+        normalized += "?" + parts.query
+    return normalized
+
+
+def _media_address_text(entry: object) -> str | None:
+    """Extract one numeric address from a getaddrinfo entry (or a bare string)."""
+    if type(entry) is str:
+        return entry
+    if isinstance(entry, (list, tuple)):
+        if len(entry) == 5:
+            sockaddr = entry[4]
+            if isinstance(sockaddr, (list, tuple)) and sockaddr:
+                first = sockaddr[0]
+                return first if type(first) is str else None
+            return None
+        if 2 <= len(entry) <= 4:
+            first = entry[0]
+            return first if type(first) is str else None
+    return None
+
+
+def _media_address_is_public(address: str) -> bool:
+    """Every resolved address must be a global, non-special-purpose unicast IP."""
+    if not address or "%" in address or not address.isascii():
+        return False
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    if not parsed.is_global:
+        return False
+    if (
+        parsed.is_private
+        or parsed.is_loopback
+        or parsed.is_link_local
+        or parsed.is_multicast
+        or parsed.is_reserved
+        or parsed.is_unspecified
+    ):
+        return False
+    untrusted = (
+        _MEDIA_UNTRUSTED_V4_NETWORKS
+        if parsed.version == 4
+        else _MEDIA_UNTRUSTED_V6_NETWORKS
+    )
+    return not any(parsed in network for network in untrusted)
+
+
+def _resolve_media_addresses(host: str, port: int, resolve) -> list[str]:
+    """Resolve one hop and enforce the address policy on the whole answer."""
+    try:
+        if resolve is None:
+            entries = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        else:
+            entries = resolve(host, port)
+        entries = list(entries)
+    except Exception:
+        raise _SaveFailure("download_failed") from None
+    addresses: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        address = _media_address_text(entry)
+        if address is None:
+            raise _SaveFailure("download_target_untrusted")
+        if address in seen:
+            continue
+        seen.add(address)
+        addresses.append(address)
+    if not 1 <= len(addresses) <= DOWNLOAD_MAX_MEDIA_ADDRESSES:
+        raise _SaveFailure("download_target_untrusted")
+    if not all(_media_address_is_public(address) for address in addresses):
+        raise _SaveFailure("download_target_untrusted")
+    return addresses
+
+
+def _curl_resolve_value(host: str, port: int, address: str) -> str:
+    """Pin exactly one numeric address for curl ``--resolve``; IPv6 stays bracketed."""
+    try:
+        version = ipaddress.ip_address(address).version
+    except ValueError:
+        version = 0
+    rendered = "[" + address + "]" if version == 6 else address
+    return f"{host}:{port}:{rendered}"
+
+
+def _curl_output_text(value: object) -> str:
+    if type(value) is str:
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", "replace")
+    return ""
+
+
+def _last_curl_output_line(value: object) -> str:
+    for line in reversed(_curl_output_text(value).splitlines()):
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
+
+
+def _parse_probe_output(value: object) -> tuple[int, str] | None:
+    line = _last_curl_output_line(value)
+    if not line:
+        return None
+    status_text, _, redirect = line.partition(" ")
+    try:
+        status = int(status_text)
+    except ValueError:
+        return None
+    return status, redirect.strip()
+
+
+def _parse_transfer_status(value: object) -> int | None:
+    line = _last_curl_output_line(value)
+    if not line:
+        return None
+    try:
+        return int(line.split(" ", 1)[0])
+    except ValueError:
+        return None
+
+
+def _run_curl(config_lines: list[str], timeout_seconds: float):
+    """Run one curl invocation; the URL only ever travels through stdin."""
+    try:
+        return subprocess.run(
+            [CURL_BIN, "-K", "-"],
+            input=chr(10).join(config_lines) + chr(10),
+            text=True,
+            timeout=timeout_seconds,
+            capture_output=True,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _media_probe_config_lines(
+    url: str,
+    host: str,
+    port: int,
+    address: str,
+    *,
+    max_time_seconds: int,
+    range_fallback: bool,
+) -> list[str]:
+    lines = [
+        "url = " + _curl_config_quote(url),
+        'output = "/dev/null"',
+        "user-agent = " + _curl_config_quote(CURL_USER_AGENT),
+        "referer = " + _curl_config_quote(CURL_REFERER),
+        "silent",
+        "show-error",
+        "max-redirs = 0",
+        "max-time = " + str(max_time_seconds),
+        "resolve = " + _curl_config_quote(_curl_resolve_value(host, port, address)),
+        'proto = "=http,https"',
+        'write-out = "%{http_code} %{redirect_url}"',
+    ]
+    lines.append('range = "0-0"' if range_fallback else "head")
+    return lines
+
+
+def _probe_max_time(deadline: float) -> int:
+    remaining = deadline - time.monotonic()
+    if remaining < 1.0:
+        raise _SaveFailure("download_failed")
+    return max(1, int(min(DOWNLOAD_PROBE_TIMEOUT, remaining)))
+
+
+def _probe_media_address(
+    url: str,
+    host: str,
+    port: int,
+    address: str,
+    *,
+    deadline: float,
+) -> tuple[int, str] | None:
+    """Probe one address: HEAD first, one range GET on an unusable HEAD status."""
+    max_time_seconds = _probe_max_time(deadline)
+    completed = _run_curl(
+        _media_probe_config_lines(
+            url, host, port, address,
+            max_time_seconds=max_time_seconds,
+            range_fallback=False,
+        ),
+        max_time_seconds + 10.0,
+    )
+    parsed = None
+    if completed is not None and completed.returncode == 0:
+        parsed = _parse_probe_output(completed.stdout)
+    if parsed is None:
+        return None
+    status, redirect = parsed
+    if status in _MEDIA_SUCCESS_STATUSES or status in _MEDIA_REDIRECT_STATUSES:
+        return status, redirect
+    # A HEAD refusal (403/405/501/204...) is not evidence against the URL itself:
+    # retry the same address once as a bounded range GET.
+    max_time_seconds = _probe_max_time(deadline)
+    completed = _run_curl(
+        _media_probe_config_lines(
+            url, host, port, address,
+            max_time_seconds=max_time_seconds,
+            range_fallback=True,
+        ),
+        max_time_seconds + 10.0,
+    )
+    if completed is None or completed.returncode != 0:
+        return None
+    parsed = _parse_probe_output(completed.stdout)
+    if parsed is None:
+        return None
+    status, redirect = parsed
+    if status in _MEDIA_SUCCESS_STATUSES or status in _MEDIA_REDIRECT_STATUSES:
+        return status, redirect
+    return None
+
+
+def _is_absolute_media_url(value: str) -> bool:
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return False
+    return parts.scheme.casefold() in _MEDIA_URL_SCHEMES and bool(parts.netloc)
+
+
+@dataclass(frozen=True, slots=True)
+class _MediaProbeHit:
+    address: str
+    redirect_url: str
+
+
+@dataclass(frozen=True, slots=True)
+class _MediaTarget:
+    url: str
+    host: str
+    port: int
+    address: str
+
+
+def _probe_media_hop(
+    url: str,
+    host: str,
+    port: int,
+    addresses: list[str],
+    *,
+    deadline: float,
+) -> _MediaProbeHit:
+    """Probe one hop address by address in DNS order, within the bounded budget."""
+    for address in addresses[:DOWNLOAD_MAX_MEDIA_PROBE_ATTEMPTS]:
+        result = _probe_media_address(url, host, port, address, deadline=deadline)
+        if result is None:
+            continue
+        status, redirect = result
+        if status in _MEDIA_SUCCESS_STATUSES:
+            return _MediaProbeHit(address=address, redirect_url="")
+        if redirect and _is_absolute_media_url(redirect):
+            return _MediaProbeHit(address=address, redirect_url=redirect)
+        # A 3xx without an absolute target is a probe failure for this address.
+    raise _SaveFailure("download_failed")
+
+
+def _follow_media_redirects(
+    media_url: str,
+    resolve: Callable[[str, int], object] | None = None,
+    *,
+    deadline: float | None = None,
+) -> _MediaTarget:
+    """Follow at most DOWNLOAD_MAX_REDIRECTS validated hops and pin one address."""
+    url = _normalize_media_url(media_url)
+    if deadline is None:
+        deadline = time.monotonic() + DOWNLOAD_SUBPROCESS_TIMEOUT
+    seen = {url}
+    redirects = 0
+    while True:
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        port = parts.port
+        if port is None:
+            port = _MEDIA_URL_DEFAULT_PORTS[parts.scheme]
+        addresses = _resolve_media_addresses(host, port, resolve)
+        hit = _probe_media_hop(url, host, port, addresses, deadline=deadline)
+        if not hit.redirect_url:
+            return _MediaTarget(
+                url=url, host=host, port=port, address=hit.address,
+            )
+        redirects += 1
+        if redirects > DOWNLOAD_MAX_REDIRECTS:
+            raise _SaveFailure("download_failed")
+        next_url = _normalize_media_url(hit.redirect_url)
+        if parts.scheme == "https" and next_url.startswith("http://"):
+            raise _SaveFailure("download_target_untrusted")
+        if next_url in seen:
+            raise _SaveFailure("download_failed")
+        seen.add(next_url)
+        url = next_url
+
+
+def _media_transfer_config_lines(
+    target: _MediaTarget,
+    destination_path: str,
+    *,
+    max_time_seconds: int,
+) -> list[str]:
+    return [
+        "url = " + _curl_config_quote(target.url),
+        "output = " + _curl_config_quote(destination_path),
+        "user-agent = " + _curl_config_quote(CURL_USER_AGENT),
+        "referer = " + _curl_config_quote(CURL_REFERER),
+        "fail",
+        "silent",
+        "show-error",
+        "max-redirs = 0",
+        "max-filesize = " + str(MAX_BYTES),
+        'continue-at = "-"',
+        "connect-timeout = 15",
+        "max-time = " + str(max_time_seconds),
+        "resolve = " + _curl_config_quote(
+            _curl_resolve_value(target.host, target.port, target.address)
+        ),
+        'proto = "=http,https"',
+        'write-out = "%{http_code}"',
+    ]
+
+
+def _discard_download_output(destination: Path) -> None:
+    try:
+        destination.unlink()
+    except OSError:
+        pass
+
+
+def _default_download(
+    media_url: str,
+    destination: Path,
+    *,
+    resolve: Callable[[str, int], object] | None = None,
+) -> object:
+    """Download one signed media URL with curl after the delivery guard approved it.
 
     Python urllib is throttled/aborted by the NetEase CDN fingerprint on the NAS,
     so the transfer is delegated to curl with a browser-like UA/Referer. The URL
     and destination are passed through `curl -K -` stdin config so the signed URL
     never appears in argv (/proc/<pid>/cmdline), logs, exceptions or results.
 
-    curl --retry does not resume inside one invocation (continue-at only applies
-    when the output file already exists at start), so attempts are driven here:
-    up to DOWNLOAD_MAX_ATTEMPTS runs share a DOWNLOAD_SUBPROCESS_TIMEOUT budget,
-    and every attempt keeps continue-at = "-" so a later attempt resumes the
-    partial file left by an earlier failed one.
+    The delivery guard runs first: every redirect hop is URL-policy checked,
+    DNS-resolved and probed with a single pinned ``--resolve`` address; the final
+    transfer then reuses exactly that address (D-36: the transfer never switches
+    addresses). Probe and transfer have separate budgets, so probing cannot eat
+    into the transfer budget. curl --retry does not resume inside one invocation,
+    so up to DOWNLOAD_MAX_ATTEMPTS Python-level attempts share the transfer
+    budget and keep continue-at = "-" to resume the partial file between them.
     """
     destination = Path(destination)
-    if type(media_url) is not str or not media_url.startswith(("http://", "https://")):
-        raise _SaveFailure("download_failed")
     destination_path = os.fspath(destination)
     if type(destination_path) is not str or not destination.is_absolute():
         raise _SaveFailure("download_failed")
-    common_config_lines = [
-        "url = " + _curl_config_quote(media_url),
-        "output = " + _curl_config_quote(destination_path),
-        "user-agent = " + _curl_config_quote(CURL_USER_AGENT),
-        "referer = " + _curl_config_quote(CURL_REFERER),
-        "location",
-        "fail",
-        "silent",
-        "show-error",
-    ]
-    tail_config_lines = [
-        "max-filesize = " + str(MAX_BYTES),
-        'continue-at = "-"',
-    ]
+    probe_deadline = time.monotonic() + DOWNLOAD_SUBPROCESS_TIMEOUT
+    target = _follow_media_redirects(media_url, resolve, deadline=probe_deadline)
+    # The transfer budget starts only after probing: probing never consumes it.
     deadline = time.monotonic() + DOWNLOAD_SUBPROCESS_TIMEOUT
-    completed_run = None
+    completed_status = None
     attempts = 0
     while attempts < DOWNLOAD_MAX_ATTEMPTS:
         remaining = deadline - time.monotonic()
@@ -1365,26 +1903,24 @@ def _default_download(media_url: str, destination: Path) -> object:
         attempts += 1
         attempt_timeout = min(DOWNLOAD_TIMEOUT, remaining)
         max_time_seconds = max(1, int(attempt_timeout))
-        config_lines = (
-            common_config_lines
-            + ["max-time = " + str(max_time_seconds)]
-            + tail_config_lines
+        completed = _run_curl(
+            _media_transfer_config_lines(
+                target, destination_path, max_time_seconds=max_time_seconds,
+            ),
+            attempt_timeout + 10.0,
         )
-        try:
-            completed = subprocess.run(
-                [CURL_BIN, "-K", "-"],
-                input=chr(10).join(config_lines) + chr(10),
-                text=True,
-                timeout=attempt_timeout + 10.0,
-                capture_output=True,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
+        if completed is None or completed.returncode != 0:
+            # Keep the partial file: the next attempt resumes it via continue-at.
             continue
-        if completed.returncode == 0:
-            completed_run = completed
+        status = _parse_transfer_status(completed.stdout)
+        if status in _MEDIA_SUCCESS_STATUSES:
+            completed_status = status
             break
-    if completed_run is None:
+        _discard_download_output(destination)
+        if status is not None and 300 <= status < 400:
+            raise _SaveFailure("download_target_untrusted")
+        raise _SaveFailure("download_failed")
+    if completed_status is None:
         raise _SaveFailure("download_failed")
     try:
         size = destination.stat().st_size

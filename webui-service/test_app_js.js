@@ -1762,6 +1762,63 @@ test("手动保存：显示封面/歌词/词曲状态并明确标注附加项部
   assert.strictEqual(stateEl.textContent, "已保存");
 });
 
+async function savePublishedTrack(data) {
+  enqueue("/app/fnmusic-ext/api/manual-save/status", {
+    ok: true, data: { enabled: true, target_dir: "/library" },
+  });
+  await global.loadSaveStatus();
+  enqueue("/app/fnmusic-ext/api/manual-save/track", {
+    ok: true, code: "ok", data: {
+      status: "published", format: "flac", size: 1024,
+      basename: "歌手 - 歌曲.flac", target_dir: "/library",
+      cover_status: "unavailable", lyric_status: "unavailable",
+      artist_status: "tagged", lyricist: "", lyricist_status: "unavailable",
+      composer: "", composer_status: "unavailable", ...data,
+    },
+  });
+  const button = stubEl();
+  button.dataset.songId = "42";
+  const stateEl = stubEl();
+  button.closest = () => ({ querySelector: () => stateEl });
+  await global.saveOneTrack(button);
+  return { message: els.get("#save-result").textContent, stateEl };
+}
+
+test("手动保存：显示服务端上报的实际档位并标注回退与请求档", async () => {
+  // 2026-11-01 真机：请求 jymaster，服务端上报 lossless —— 成功路径。
+  const { message } = await savePublishedTrack({
+    quality_requested: "jymaster", quality_actual: "lossless",
+    quality_actual_status: "reported", quality_fallback: true,
+  });
+  assert.ok(message.includes("实际档位：lossless"));
+  assert.ok(message.includes("请求档位：jymaster"));
+  assert.ok(message.includes("回退"));
+  for (const banned of ["超清母带", "母带", "无损", "高品质"]) {
+    assert.ok(!message.includes(banned), `不应出现营销档位名 ${banned}`);
+  }
+});
+
+test("手动保存：档位未知时显式标注未知且不回填请求档", async () => {
+  const { message } = await savePublishedTrack({
+    quality_requested: "jymaster", quality_actual: "",
+    quality_actual_status: "unknown", quality_fallback: false,
+  });
+  assert.ok(message.includes("档位未知"));
+  assert.ok(!message.includes("jymaster"));
+  assert.ok(!message.includes("请求档位"));
+});
+
+test("手动保存：阶梯回退时标注回退", async () => {
+  // selected_index > 0 时即使上报档与请求档同名，也必须标注回退。
+  const { message } = await savePublishedTrack({
+    quality_requested: "hires", quality_actual: "hires",
+    quality_actual_status: "reported", quality_fallback: true,
+  });
+  assert.ok(message.includes("实际档位：hires"));
+  assert.ok(message.includes("请求档位：hires"));
+  assert.ok(message.includes("回退"));
+});
+
 /* ------------------------------------------------ 运行 --------------------- */
 (async () => {
   let failed = 0;

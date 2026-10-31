@@ -7,6 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 import shutil
+import socket
 import stat
 import subprocess
 import threading
@@ -72,13 +73,23 @@ def _info_payload(name="测试歌曲", artists=("歌手A", "歌手B"), album="�
     }
 
 
+_OMIT_FIELD = object()
+
+
 def _url_payload(*, url=SIGNED_URL, media_type="flac", level="jymaster",
-                 size=len(PAYLOAD), md5=PAYLOAD_MD5, ok=True):
-    return {
-        "ok": ok,
-        "data": {"url": url, "type": media_type, "level": level,
-                 "size": size, "md5": md5},
+                 size=len(PAYLOAD), md5=PAYLOAD_MD5, ok=True,
+                 song_id=489970550, code=200, free_trial=None,
+                 include_song_id=False):
+    """Synthetic /song/<id>/url answer matching the 2026-11-01 device evidence."""
+    data = {
+        "url": url, "type": media_type, "level": level,
+        "size": size, "md5": md5, "id": song_id, "code": code,
     }
+    if free_trial is not _OMIT_FIELD:
+        data["freeTrialInfo"] = free_trial
+    if include_song_id:
+        data["songId"] = song_id
+    return {"ok": ok, "data": data}
 
 
 def _png_header(width=64, height=64):
@@ -362,6 +373,8 @@ def test_success_publishes_tagged_bytes_and_hides_signed_url(tmp_path):
     assert data["album"] == "测试专辑"
     assert data["quality_requested"] == "jymaster"
     assert data["quality_actual"] == "jymaster"
+    assert data["quality_actual_status"] == "reported"
+    assert data["quality_fallback"] is False
     assert data["source_type"] == "flac"
     assert data["format"] == "flac"
     assert data["size"] == len(PAYLOAD)
@@ -383,7 +396,8 @@ def test_success_publishes_tagged_bytes_and_hides_signed_url(tmp_path):
     assert data["published_md5"] == hashlib.md5(b"TAGGED:" + PAYLOAD).hexdigest()
     assert set(data) == {
         "status", "song_id", "title", "artist", "album", "quality_requested",
-        "quality_actual", "source_type", "format", "size", "md5", "basename",
+        "quality_actual", "quality_actual_status", "quality_fallback",
+        "source_type", "format", "size", "md5", "basename",
         "target_dir", "tagged", "cover_embedded", "published_size",
         "published_md5", "title_status", "artist_status", "album_status",
         "lyricist", "lyricist_status", "composer", "composer_status",
@@ -820,7 +834,7 @@ def test_quality_ladder_learns_first_usable_answer(tmp_path):
         quality = url_text.rsplit("=", 1)[1]
         attempted.append(quality)
         if quality in {"jymaster", "hires"}:
-            return {"ok": True, "data": {"url": "", "level": quality}}
+            return _url_payload(url=None, code=404, level=quality)
         return _url_payload(level="lossless")
 
     deps, _store, _workdir = _pipeline_deps(tmp_path)
@@ -828,8 +842,54 @@ def test_quality_ladder_learns_first_usable_answer(tmp_path):
     result = route.save_track(489970550, deps=deps)
     assert result["ok"] is True
     assert attempted == ["jymaster", "hires", "lossless"]
-    assert result["data"]["quality_requested"] == "lossless"
-    assert result["data"]["quality_actual"] == "lossless"
+    data = result["data"]
+    assert data["quality_requested"] == "lossless"
+    assert data["quality_actual"] == "lossless"
+    assert data["quality_actual_status"] == "reported"
+    assert data["quality_fallback"] is True
+
+
+def test_save_accepts_provider_reported_lower_level(tmp_path):
+    """2026-11-01 device case: requesting jymaster verifiably delivers lossless."""
+    downloads = []
+
+    def ladder_http(url_text):
+        if url_text.endswith("/info"):
+            return _info_payload()
+        return _url_payload(level="lossless")
+
+    def download(media_url, destination):
+        downloads.append(media_url)
+        destination.write_bytes(PAYLOAD)
+        return {"size": len(PAYLOAD), "md5": PAYLOAD_MD5}
+
+    deps, _store, _workdir = _pipeline_deps(tmp_path, download=download)
+    deps = replace(deps, http_json=ladder_http)
+    result = route.save_track(489970550, deps=deps)
+    assert result["ok"] is True
+    data = result["data"]
+    assert data["quality_requested"] == "jymaster"
+    assert data["quality_actual"] == "lossless"
+    assert data["quality_actual_status"] == "reported"
+    assert data["quality_fallback"] is True
+    assert downloads == [SIGNED_URL]
+
+
+def test_save_reports_unknown_actual_without_level(tmp_path):
+    def ladder_http(url_text):
+        if url_text.endswith("/info"):
+            return _info_payload()
+        return _url_payload(level="")
+
+    deps, _store, _workdir = _pipeline_deps(tmp_path)
+    deps = replace(deps, http_json=ladder_http)
+    result = route.save_track(489970550, deps=deps)
+    assert result["ok"] is True
+    data = result["data"]
+    assert data["quality_requested"] == "jymaster"
+    assert data["quality_actual"] == ""
+    assert data["quality_actual_status"] == "unknown"
+    assert data["quality_fallback"] is False
 
 
 def test_basename_sanitizes_forbidden_characters_and_caps_length(tmp_path):
@@ -895,9 +955,11 @@ def test_service_unavailable_redacts_transport_errors(tmp_path):
 def test_no_quality_available_when_ladder_is_exhausted(tmp_path):
     calls = []
 
-    def no_url(_url_text):
-        calls.append(1)
-        return {"ok": False, "message": "nope"}
+    def no_url(url_text):
+        quality = url_text.rsplit("=", 1)[1]
+        calls.append(quality)
+        # A 404 without a URL is the only definitive "this tier is unavailable".
+        return _url_payload(url=None, code=404, level=quality)
 
     deps, store, _workdir = _pipeline_deps(tmp_path)
     deps = replace(deps, http_json=lambda url_text: (
@@ -905,7 +967,7 @@ def test_no_quality_available_when_ladder_is_exhausted(tmp_path):
     ))
     result = route.save_track(489970550, deps=deps)
     assert result["code"] == "no_quality_available"
-    assert len(calls) == len(route.QUALITY_ORDER)
+    assert calls == list(route.QUALITY_ORDER)
     assert store.closed is False
 
 
@@ -1029,72 +1091,183 @@ def _expected_curl_quote(value):
     return chr(34) + escaped + chr(34)
 
 
-def _curl_run_writing(destination, *, payload=CURL_TEST_PAYLOAD, returncode=0,
-                      calls=None):
-    def run(argv, **kwargs):
-        if calls is not None:
-            calls["argv"] = list(argv)
-            calls["stdin"] = kwargs.get("input")
-            calls["kwargs"] = kwargs
-        if returncode == 0 and payload is not None:
-            destination.write_bytes(payload)
-        return SimpleNamespace(returncode=returncode, stdout=b"", stderr=b"")
+PUBLIC_MEDIA_IPV4 = "93.184.216.34"
+PUBLIC_MEDIA_IPV4_ALT = "151.101.1.69"
+PUBLIC_MEDIA_IPV6 = "2606:2800:220:1:248:1893:25c8:1946"
+PUBLIC_MEDIA_ADDRESSES = ("1.1.1.1", "8.8.8.8", "8.8.4.4", "9.9.9.9")
 
-    return run
+
+def _media_addrinfo(*addresses, port=443):
+    entries = []
+    for address in addresses:
+        if ":" in address:
+            entries.append(
+                (socket.AF_INET6, socket.SOCK_STREAM, 6, "", (address, port, 0, 0))
+            )
+        else:
+            entries.append((socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, port)))
+    return entries
+
+
+def _media_resolver(*addresses, port=443):
+    resolved = addresses or (PUBLIC_MEDIA_IPV4,)
+
+    def resolve(_host, _port):
+        return list(_media_addrinfo(*resolved, port=port))
+
+    return resolve
+
+
+def _probe_ok(status=200, redirect=""):
+    return SimpleNamespace(returncode=0, stdout=f"{status} {redirect}", stderr="")
+
+
+def _curl_rc(returncode=56):
+    return SimpleNamespace(returncode=returncode, stdout="", stderr="reset")
+
+
+def _transfer_ok(destination, *, payload=CURL_TEST_PAYLOAD, status=200):
+    def respond():
+        destination.write_bytes(payload)
+        return SimpleNamespace(returncode=0, stdout=str(status), stderr="")
+
+    return respond
+
+
+def _transfer_no_write(status=200):
+    return SimpleNamespace(returncode=0, stdout=str(status), stderr="")
+
+
+def _transfer_rc(returncode=56, *, destination=None, partial=None):
+    def respond():
+        if destination is not None and partial is not None:
+            destination.write_bytes(partial)
+        return SimpleNamespace(returncode=returncode, stdout="", stderr="reset")
+
+    return respond
+
+
+class _CurlStub:
+    """Two-phase curl stub: probe calls (output=/dev/null) vs transfer calls."""
+
+    def __init__(self, *, probe=(), transfer=()):
+        self.probe_results = list(probe)
+        self.transfer_results = list(transfer)
+        self.probe_calls = []
+        self.transfer_calls = []
+
+    def __call__(self, argv, **kwargs):
+        assert list(argv) == [route.CURL_BIN, "-K", "-"]
+        config = kwargs.get("input", "")
+        call = {"argv": list(argv), "config": config, "kwargs": kwargs}
+        if 'output = "/dev/null"' in config:
+            self.probe_calls.append(call)
+            results = self.probe_results
+        else:
+            self.transfer_calls.append(call)
+            results = self.transfer_results
+        if not results:
+            raise AssertionError("unexpected curl call")
+        result = results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        if callable(result):
+            return result()
+        return result
+
+    @staticmethod
+    def config_lines(call):
+        return call["config"].splitlines()
 
 
 def test_default_download_passes_url_via_curl_stdin_never_argv(tmp_path):
     destination = tmp_path / "source.bin"
-    calls = {}
-    with mock.patch.object(
-        route.subprocess, "run",
-        side_effect=_curl_run_writing(destination, calls=calls),
-    ):
-        result = route._default_download(SIGNED_URL, destination)
+    stub = _CurlStub(
+        probe=[_probe_ok(200)],
+        transfer=[_transfer_ok(destination, payload=CURL_TEST_PAYLOAD)],
+    )
+    with mock.patch.object(route.subprocess, "run", side_effect=stub):
+        result = route._default_download(
+            SIGNED_URL, destination, resolve=_media_resolver(PUBLIC_MEDIA_IPV4),
+        )
     assert result == {"size": len(CURL_TEST_PAYLOAD), "md5": CURL_TEST_MD5}
-    assert calls["argv"] == [route.CURL_BIN, "-K", "-"]
-    for argument in calls["argv"]:
-        assert SIGNED_URL not in argument
-        assert "TOPSECRETTAIL" not in argument
-    stdin = calls["stdin"]
-    assert 'url = "' + SIGNED_URL + '"' in stdin
-    assert "output = " + _expected_curl_quote(str(destination)) in stdin
-    assert "user-agent = " + _expected_curl_quote(route.CURL_USER_AGENT) in stdin
-    assert "referer = " + _expected_curl_quote(route.CURL_REFERER) in stdin
-    config_lines = stdin.splitlines()
-    for flag in ("location", "fail", "silent", "show-error"):
-        assert flag in config_lines
+    assert len(stub.probe_calls) == 1
+    assert len(stub.transfer_calls) == 1
+    for call in stub.probe_calls + stub.transfer_calls:
+        assert call["argv"] == [route.CURL_BIN, "-K", "-"]
+        for argument in call["argv"]:
+            assert SIGNED_URL not in argument
+            assert "TOPSECRETTAIL" not in argument
+        assert call["kwargs"]["text"] is True
+        assert call["kwargs"]["capture_output"] is True
+        assert call["config"].endswith(chr(10))
+
+    probe_lines = _CurlStub.config_lines(stub.probe_calls[0])
+    assert 'url = "' + SIGNED_URL + '"' in probe_lines
+    assert 'output = "/dev/null"' in probe_lines
+    for flag in ("silent", "show-error", "head"):
+        assert flag in probe_lines
+    assert "user-agent = " + _expected_curl_quote(route.CURL_USER_AGENT) in probe_lines
+    assert "referer = " + _expected_curl_quote(route.CURL_REFERER) in probe_lines
+    assert "max-redirs = 0" in probe_lines
+    assert "max-time = " + str(int(route.DOWNLOAD_PROBE_TIMEOUT)) in probe_lines
+    assert "resolve = " + _expected_curl_quote(
+        "signed.example.com:443:" + PUBLIC_MEDIA_IPV4) in probe_lines
+    assert 'proto = "=http,https"' in probe_lines
+    assert 'write-out = "%{http_code} %{redirect_url}"' in probe_lines
+    for forbidden in ("location", "fail", 'continue-at = "-"'):
+        assert forbidden not in probe_lines
+    assert not any(line.startswith("max-filesize =") for line in probe_lines)
+
+    transfer_lines = _CurlStub.config_lines(stub.transfer_calls[0])
+    assert 'url = "' + SIGNED_URL + '"' in transfer_lines
+    assert "output = " + _expected_curl_quote(str(destination)) in transfer_lines
+    for flag in ("fail", "silent", "show-error"):
+        assert flag in transfer_lines
+    assert "location" not in transfer_lines
+    assert "max-redirs = 0" in transfer_lines
+    assert f"max-filesize = {route.MAX_BYTES}" in transfer_lines
+    assert 'continue-at = "-"' in transfer_lines
+    assert "connect-timeout = 15" in transfer_lines
+    assert f"max-time = {int(route.DOWNLOAD_TIMEOUT)}" in transfer_lines
+    assert "resolve = " + _expected_curl_quote(
+        "signed.example.com:443:" + PUBLIC_MEDIA_IPV4) in transfer_lines
+    assert 'proto = "=http,https"' in transfer_lines
+    assert 'write-out = "%{http_code}"' in transfer_lines
     assert route.DOWNLOAD_TIMEOUT == 180.0
     assert route.DOWNLOAD_SUBPROCESS_TIMEOUT == 580.0
     assert route.DOWNLOAD_MAX_ATTEMPTS == 4
-    assert f"max-time = {int(route.DOWNLOAD_TIMEOUT)}" in config_lines
-    assert f"max-filesize = {route.MAX_BYTES}" in config_lines
-    assert 'continue-at = "-"' in config_lines
+    assert route.DOWNLOAD_MAX_REDIRECTS == 3
+    assert route.DOWNLOAD_PROBE_TIMEOUT == 15.0
+    assert route.DOWNLOAD_MAX_MEDIA_PROBE_ATTEMPTS == 4
+    assert route.DOWNLOAD_MAX_MEDIA_ADDRESSES == 32
+    assert route.DOWNLOAD_MAX_MEDIA_URL_CHARS == 4096
+    assert stub.probe_calls[0]["kwargs"]["timeout"] == route.DOWNLOAD_PROBE_TIMEOUT + 10.0
+    assert stub.transfer_calls[0]["kwargs"]["timeout"] == route.DOWNLOAD_TIMEOUT + 10.0
     assert not any(
         line.startswith(("retry =", "retry-delay", "retry-all-errors"))
-        for line in config_lines
+        for line in transfer_lines
     )
-    kwargs = calls["kwargs"]
-    assert kwargs["text"] is True
-    assert kwargs["capture_output"] is True
-    assert kwargs["timeout"] == route.DOWNLOAD_TIMEOUT + 10.0
-    assert stdin.endswith(chr(10))
 
 
 def test_default_download_escapes_quotes_in_curl_config(tmp_path):
     destination = tmp_path / "source.bin"
     url = 'https://signed.example.com/a"b?token=TOPSECRETTAIL'
-    calls = {}
-    with mock.patch.object(
-        route.subprocess, "run",
-        side_effect=_curl_run_writing(destination, calls=calls),
-    ):
-        route._default_download(url, destination)
+    stub = _CurlStub(
+        probe=[_probe_ok(200)],
+        transfer=[_transfer_ok(destination, payload=CURL_TEST_PAYLOAD)],
+    )
+    with mock.patch.object(route.subprocess, "run", side_effect=stub):
+        result = route._default_download(
+            url, destination, resolve=_media_resolver(PUBLIC_MEDIA_IPV4),
+        )
+    assert result == {"size": len(CURL_TEST_PAYLOAD), "md5": CURL_TEST_MD5}
     escaped = (
         'url = "https://signed.example.com/a' + chr(92) + '"b?token=TOPSECRETTAIL"'
     )
-    assert escaped in calls["stdin"]
-    assert chr(10) not in calls["stdin"].split("url = ", 1)[1].splitlines()[0]
+    assert escaped in stub.probe_calls[0]["config"]
+    assert escaped in stub.transfer_calls[0]["config"]
+    assert chr(10) not in stub.probe_calls[0]["config"].split("url = ", 1)[1].splitlines()[0]
 
 
 @pytest.mark.parametrize(
@@ -1113,7 +1286,10 @@ def test_default_download_rejects_invalid_url_or_framing_before_curl(tmp_path, b
         route.subprocess, "run", side_effect=AssertionError("curl must not run"),
     ):
         with pytest.raises(route._SaveFailure) as caught:
-            route._default_download(bad_url, destination)
+            route._default_download(
+                bad_url, destination,
+                resolve=lambda *_args: pytest.fail("dns must not run"),
+            )
     assert caught.value.code == "download_failed"
     assert "TOPSECRETTAIL" not in str(caught.value)
 
@@ -1123,67 +1299,80 @@ def test_default_download_requires_absolute_destination(tmp_path):
         route.subprocess, "run", side_effect=AssertionError("curl must not run"),
     ):
         with pytest.raises(route._SaveFailure) as caught:
-            route._default_download(SIGNED_URL, route.Path("relative-source.bin"))
+            route._default_download(
+                SIGNED_URL, route.Path("relative-source.bin"),
+                resolve=lambda *_args: pytest.fail("dns must not run"),
+            )
     assert caught.value.code == "download_failed"
 
 
 def test_default_download_nonzero_curl_exit_is_download_failed(tmp_path):
     destination = tmp_path / "source.bin"
-
-    def failing_run(_argv, **_kwargs):
-        destination.write_bytes(b"partial bytes")
-        return SimpleNamespace(returncode=22, stdout=b"", stderr=b"curl: secret-detail")
-
-    with mock.patch.object(route.subprocess, "run", side_effect=failing_run):
+    stub = _CurlStub(probe=[_curl_rc(22)] * route.DOWNLOAD_MAX_MEDIA_PROBE_ATTEMPTS)
+    with mock.patch.object(route.subprocess, "run", side_effect=stub):
         with pytest.raises(route._SaveFailure) as caught:
-            route._default_download(SIGNED_URL, destination)
+            route._default_download(
+                SIGNED_URL, destination,
+                resolve=_media_resolver(*PUBLIC_MEDIA_ADDRESSES),
+            )
     assert caught.value.code == "download_failed"
     assert "secret-detail" not in str(caught.value)
+    assert len(stub.probe_calls) == route.DOWNLOAD_MAX_MEDIA_PROBE_ATTEMPTS
+    assert stub.transfer_calls == []
 
 
 def test_default_download_timeout_is_download_failed(tmp_path):
     destination = tmp_path / "source.bin"
 
-    def timing_out_run(argv, **_kwargs):
-        raise route.subprocess.TimeoutExpired(cmd=argv, timeout=310.0)
+    def timing_out_run(argv, **kwargs):
+        raise route.subprocess.TimeoutExpired(cmd=argv, timeout=kwargs["timeout"])
 
     with mock.patch.object(route.subprocess, "run", side_effect=timing_out_run):
         with pytest.raises(route._SaveFailure) as caught:
-            route._default_download(SIGNED_URL, destination)
+            route._default_download(
+                SIGNED_URL, destination, resolve=_media_resolver(PUBLIC_MEDIA_IPV4),
+            )
     assert caught.value.code == "download_failed"
 
 
 def test_default_download_missing_output_file_is_download_failed(tmp_path):
     destination = tmp_path / "source.bin"
-    with mock.patch.object(
-        route.subprocess, "run",
-        side_effect=_curl_run_writing(destination, payload=None),
-    ):
+    stub = _CurlStub(probe=[_probe_ok(200)], transfer=[_transfer_no_write(200)])
+    with mock.patch.object(route.subprocess, "run", side_effect=stub):
         with pytest.raises(route._SaveFailure) as caught:
-            route._default_download(SIGNED_URL, destination)
+            route._default_download(
+                SIGNED_URL, destination, resolve=_media_resolver(PUBLIC_MEDIA_IPV4),
+            )
     assert caught.value.code == "download_failed"
+    assert len(stub.transfer_calls) == 1
 
 
 def test_default_download_zero_byte_file_is_download_failed(tmp_path):
     destination = tmp_path / "source.bin"
-    with mock.patch.object(
-        route.subprocess, "run",
-        side_effect=_curl_run_writing(destination, payload=b""),
-    ):
+    stub = _CurlStub(
+        probe=[_probe_ok(200)],
+        transfer=[_transfer_ok(destination, payload=b"")],
+    )
+    with mock.patch.object(route.subprocess, "run", side_effect=stub):
         with pytest.raises(route._SaveFailure) as caught:
-            route._default_download(SIGNED_URL, destination)
+            route._default_download(
+                SIGNED_URL, destination, resolve=_media_resolver(PUBLIC_MEDIA_IPV4),
+            )
     assert caught.value.code == "download_failed"
 
 
 def test_default_download_oversize_file_is_download_failed(tmp_path, monkeypatch):
     destination = tmp_path / "source.bin"
     monkeypatch.setattr(route, "MAX_BYTES", 4)
-    with mock.patch.object(
-        route.subprocess, "run",
-        side_effect=_curl_run_writing(destination, payload=b"12345"),
-    ):
+    stub = _CurlStub(
+        probe=[_probe_ok(200)],
+        transfer=[_transfer_ok(destination, payload=b"12345")],
+    )
+    with mock.patch.object(route.subprocess, "run", side_effect=stub):
         with pytest.raises(route._SaveFailure) as caught:
-            route._default_download(SIGNED_URL, destination)
+            route._default_download(
+                SIGNED_URL, destination, resolve=_media_resolver(PUBLIC_MEDIA_IPV4),
+            )
     assert caught.value.code == "download_failed"
 
 
@@ -1328,81 +1517,113 @@ def test_search_tracks_all_invalid_items_yield_empty_ok_list():
 
 def test_default_download_resumes_partial_transfer_on_second_attempt(tmp_path):
     destination = tmp_path / "source.bin"
-    attempts = []
-
-    def run(_argv, **kwargs):
-        attempts.append(kwargs["input"])
-        if len(attempts) == 1:
-            destination.write_bytes(CURL_TEST_PAYLOAD[:5])
-            return SimpleNamespace(returncode=56, stdout=b"", stderr=b"reset")
-        destination.write_bytes(CURL_TEST_PAYLOAD)
-        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
-
-    with mock.patch.object(route.subprocess, "run", side_effect=run):
-        result = route._default_download(SIGNED_URL, destination)
-
-    assert len(attempts) == 2
+    stub = _CurlStub(
+        probe=[_probe_ok(200)],
+        transfer=[
+            _transfer_rc(56, destination=destination,
+                         partial=CURL_TEST_PAYLOAD[:5]),
+            _transfer_ok(destination, payload=CURL_TEST_PAYLOAD),
+        ],
+    )
+    with mock.patch.object(route.subprocess, "run", side_effect=stub):
+        result = route._default_download(
+            SIGNED_URL, destination, resolve=_media_resolver(PUBLIC_MEDIA_IPV4),
+        )
+    assert len(stub.probe_calls) == 1
+    assert len(stub.transfer_calls) == 2
     assert result == {"size": len(CURL_TEST_PAYLOAD), "md5": CURL_TEST_MD5}
-    assert 'continue-at = "-"' in attempts[0].splitlines()
-    assert 'continue-at = "-"' in attempts[1].splitlines()
-    assert "retry = 3" not in attempts[1]
+    for call in stub.transfer_calls:
+        assert 'continue-at = "-"' in _CurlStub.config_lines(call)
+    assert "retry = 3" not in stub.transfer_calls[1]["config"]
     assert destination.read_bytes() == CURL_TEST_PAYLOAD
 
 
 def test_default_download_stops_retrying_after_timeout_then_success(tmp_path):
     destination = tmp_path / "source.bin"
-    attempts = []
-
-    def run(argv, **kwargs):
-        attempts.append(kwargs)
-        if len(attempts) == 1:
-            raise route.subprocess.TimeoutExpired(cmd=argv, timeout=kwargs["timeout"])
-        destination.write_bytes(CURL_TEST_PAYLOAD)
-        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
-
-    with mock.patch.object(route.subprocess, "run", side_effect=run):
-        result = route._default_download(SIGNED_URL, destination)
-
-    assert len(attempts) == 2
+    stub = _CurlStub(
+        probe=[_probe_ok(200)],
+        transfer=[
+            route.subprocess.TimeoutExpired(
+                cmd=[route.CURL_BIN, "-K", "-"], timeout=1.0),
+            _transfer_ok(destination, payload=CURL_TEST_PAYLOAD),
+        ],
+    )
+    with mock.patch.object(route.subprocess, "run", side_effect=stub):
+        result = route._default_download(
+            SIGNED_URL, destination, resolve=_media_resolver(PUBLIC_MEDIA_IPV4),
+        )
+    assert len(stub.transfer_calls) == 2
     assert result == {"size": len(CURL_TEST_PAYLOAD), "md5": CURL_TEST_MD5}
-    assert attempts[1]["timeout"] == route.DOWNLOAD_TIMEOUT + 10.0
+    assert stub.transfer_calls[1]["kwargs"]["timeout"] == route.DOWNLOAD_TIMEOUT + 10.0
 
 
 def test_default_download_bounds_attempts_when_no_progress(tmp_path):
     destination = tmp_path / "source.bin"
-    attempts = []
-
-    def run(_argv, **kwargs):
-        attempts.append(kwargs["input"])
-        destination.write_bytes(CURL_TEST_PAYLOAD[:5])
-        return SimpleNamespace(returncode=56, stdout=b"", stderr=b"reset")
-
-    with mock.patch.object(route.subprocess, "run", side_effect=run):
+    stub = _CurlStub(
+        probe=[_probe_ok(200)],
+        transfer=[
+            _transfer_rc(56, destination=destination, partial=CURL_TEST_PAYLOAD[:5])
+            for _ in range(route.DOWNLOAD_MAX_ATTEMPTS)
+        ],
+    )
+    with mock.patch.object(route.subprocess, "run", side_effect=stub):
         with pytest.raises(route._SaveFailure) as caught:
-            route._default_download(SIGNED_URL, destination)
-
+            route._default_download(
+                SIGNED_URL, destination, resolve=_media_resolver(PUBLIC_MEDIA_IPV4),
+            )
     assert caught.value.code == "download_failed"
-    assert len(attempts) == route.DOWNLOAD_MAX_ATTEMPTS
-    assert all('continue-at = "-"' in config for config in attempts)
+    assert len(stub.transfer_calls) == route.DOWNLOAD_MAX_ATTEMPTS
+    for call in stub.transfer_calls:
+        assert 'continue-at = "-"' in _CurlStub.config_lines(call)
 
 
 def test_default_download_stops_when_total_budget_is_exhausted(tmp_path, monkeypatch):
     destination = tmp_path / "source.bin"
-    attempts = []
     clock = {"now": 1000.0}
     monkeypatch.setattr(route.time, "monotonic", lambda: clock["now"])
 
-    def run(_argv, **kwargs):
-        attempts.append(kwargs["input"])
+    def exhaust_transfer():
         clock["now"] += route.DOWNLOAD_SUBPROCESS_TIMEOUT
-        return SimpleNamespace(returncode=56, stdout=b"", stderr=b"reset")
+        return SimpleNamespace(returncode=56, stdout="", stderr="reset")
 
-    with mock.patch.object(route.subprocess, "run", side_effect=run):
+    stub = _CurlStub(probe=[_probe_ok(200)], transfer=[exhaust_transfer])
+    with mock.patch.object(route.subprocess, "run", side_effect=stub):
         with pytest.raises(route._SaveFailure) as caught:
-            route._default_download(SIGNED_URL, destination)
-
+            route._default_download(
+                SIGNED_URL, destination, resolve=_media_resolver(PUBLIC_MEDIA_IPV4),
+            )
     assert caught.value.code == "download_failed"
-    assert len(attempts) == 1
+    assert len(stub.transfer_calls) == 1
+
+
+def test_default_download_probe_time_does_not_consume_transfer_budget(tmp_path, monkeypatch):
+    destination = tmp_path / "source.bin"
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(route.time, "monotonic", lambda: clock["now"])
+
+    def slow_failed_probe():
+        clock["now"] += 250.0
+        return SimpleNamespace(returncode=56, stdout="", stderr="reset")
+
+    stub = _CurlStub(
+        probe=[slow_failed_probe, slow_failed_probe, _probe_ok(200)],
+        transfer=[
+            _transfer_rc(56, destination=destination,
+                         partial=CURL_TEST_PAYLOAD[:5]),
+            _transfer_ok(destination, payload=CURL_TEST_PAYLOAD),
+        ],
+    )
+    with mock.patch.object(route.subprocess, "run", side_effect=stub):
+        result = route._default_download(
+            SIGNED_URL, destination,
+            resolve=_media_resolver(*PUBLIC_MEDIA_ADDRESSES[:3]),
+        )
+    assert result == {"size": len(CURL_TEST_PAYLOAD), "md5": CURL_TEST_MD5}
+    assert len(stub.probe_calls) == 3
+    # Probing already spent 500 s of its own budget; the first transfer attempt
+    # still gets the full per-attempt window rather than a probe-reduced one.
+    first_transfer = _CurlStub.config_lines(stub.transfer_calls[0])
+    assert f"max-time = {int(route.DOWNLOAD_TIMEOUT)}" in first_transfer
 
 
 def test_is_configured_path_rejects_real_nul_lf_cr():

@@ -96,6 +96,10 @@ _MANUAL_SAVE_GATEWAY_MESSAGES = {
     "invalid_song_id": "song_id 必须是正整数",
     "disabled": "手动保存未启用",
     "timeout": "保存超时",
+    "quality_unverified": "音质响应无法核验",
+    "quality_identity_mismatch": "无法确认音质响应所属曲目",
+    "trial_only": "仅取得试听片段，未保存",
+    "download_target_untrusted": "下载目标未通过安全校验",
     "internal": "内部错误",
 }
 _MANUAL_SAVE_HTTP_STATUS = {
@@ -110,11 +114,18 @@ _MANUAL_SAVE_HTTP_STATUS = {
     "internal": 500,
     "config_invalid": 500,
     "no_quality_available": 502,
+    "quality_unverified": 502,
+    "quality_identity_mismatch": 502,
+    "trial_only": 502,
+    "download_target_untrusted": 502,
     "download_failed": 502,
     "integrity_mismatch": 502,
     "invalid_audio": 502,
     "tag_failed": 500,
 }
+# Same server-token shape as the engine: a delivered quality is only ever the
+# raw lower-case token the provider reported, never a translated label.
+_MANUAL_SAVE_QUALITY_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 
 
 def socket_path_for(base: Path) -> Path:
@@ -515,12 +526,25 @@ def _sanitize_manual_save_data(data: object) -> dict:
     source = data if isinstance(data, dict) else {}
     text_fields = (
         "title", "artist", "album", "quality_requested", "quality_actual",
-        "source_type", "format", "basename", "target_dir",
+        "quality_actual_status", "source_type", "format", "basename", "target_dir",
     )
     sanitized = {
         name: (source.get(name) if type(source.get(name)) is str else "")
         for name in text_fields
     }
+    quality_actual_status = sanitized["quality_actual_status"]
+    if quality_actual_status not in ("reported", "unknown"):
+        quality_actual_status = "unknown"
+    if (
+        quality_actual_status == "reported"
+        and _MANUAL_SAVE_QUALITY_TOKEN_RE.fullmatch(sanitized["quality_actual"]) is None
+    ):
+        # "reported" without a legal server token is not a verified label.
+        quality_actual_status = "unknown"
+    if quality_actual_status == "unknown":
+        sanitized["quality_actual"] = ""
+    sanitized["quality_actual_status"] = quality_actual_status
+    sanitized["quality_fallback"] = source.get("quality_fallback") is True
     status_value = source.get("status")
     sanitized["status"] = status_value if status_value in ("published", "conflict") else ""
     sanitized["song_id"] = _manual_save_int(source.get("song_id"))
