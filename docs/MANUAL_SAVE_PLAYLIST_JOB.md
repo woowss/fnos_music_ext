@@ -1075,8 +1075,8 @@ fnmusic-manual-save-playlist code=<固定码> job=<job_id> position=<int> state=
 | `proxy/tests/test_manual_save_playlist_gateway.py` | §9.2 网关契约测试 |
 | `musicbox-service/netease_playlist_snapshot.py` | 新调用方：两次独立观测 + `snapshot_from_responses`/`compare_snapshots` + payload 组装；**不修改** `playlist_manifest.py` |
 | `proxy/tests/test_musicbox_playlist_snapshot.py` | 新调用方纯函数测试（注入响应对象，不联网；参照 `proxy/tests/test_musicbox_playlist_manifest.py:383-390` 的按路径加载方式） |
-| `tools/netease_playlist_observe.py` | §4.7 只读观察脚本（**未来由用户授权后单独运行**；本 architect 阶段不运行、不创建运行时副作用） |
-| `docs/MANUAL_SAVE_PLAYLIST_SOURCE_EVIDENCE.md` | §4.7 观察记录（artifact 冻结值、两次指纹、副作用观察、不证明项） |
+| `tools/netease_playlist_observe.py` | §4.7 只读观察脚本（**已交付（离线），仅在用户授权后运行**；默认 dry-run 自检，`--confirm-observe` 才读取网络） |
+| `docs/MANUAL_SAVE_PLAYLIST_SOURCE_EVIDENCE.md` | §4.7 观察记录模板（**已交付模板**；执行后填数才成为证据） |
 
 ### 12.2 修改文件
 
@@ -1114,7 +1114,7 @@ fnmusic-manual-save-playlist code=<固定码> job=<job_id> position=<int> state=
 | P0 | 本合同的独立审查（reviewer 绑定哈希 PASS） | 本文；**P0 PASS 是所有后续阶段的严格前置**。本轮实际执行偏差：P1/P2/P4 在 P0 结论出来前已并发落地，后以"绑定哈希 diff 审查 + P0 发现项回改"补救（见 §14），此偏差不重复 |
 | P1 | 账本 reason 扩展 + `offline_tests` 更新（纯离线） | Q1 批准（§11） |
 | P2 | `netease_playlist_snapshot.py` + 纯函数测试 + `member-snapshot` 端点（flag 默认关）+ `requirements.txt` 钉版本 | 无 NAS 写入 |
-| P3 | **§4.7 只读观察测试**（部署 producer、开只读 flag、跑 `tools/netease_playlist_observe.py`、写证据文档） | **用户授权 + 维护窗口**；artifact 证据齐备；`FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED=false` |
+| P3 | **§4.7 只读观察测试**（部署 producer、开只读 flag、跑 `tools/netease_playlist_observe.py`、写证据文档） | **用户授权 + 维护窗口**；artifact 证据齐备；`FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED=false`。**离线准备已完成**（脚本 + 证据模板 + 10 例自检）；剩余：授权、维护窗口、一次性只读执行 |
 | P4 | `proxy/manual_save_playlist_jobs.py` 适配层 + 单元/集成测试（fake producer payload） | 可与 P2/P3 并行编写；接线需 P3 PASS |
 | P5 | 网关 6 端点 + 契约测试 | P3 PASS + P1 完成 + **P4 适配层完成**（P5 import 它；P4 自身只需单测，不依赖 P3） |
 | P6 | 前端卡片 + node 测试 | P5 完成 |
@@ -1246,7 +1246,7 @@ fnmusic-manual-save-playlist code=<固定码> job=<job_id> position=<int> state=
   8. advance 的**五类** run status（`completed`/`commit_unknown`/`no_work`/`stale_completion`/`completion_unknown`）HTTP 映射——P4 的 `_advance_report` 对 `no_work`/`stale_completion` 的 disposition 仍为 `None`，须按 §3.6 表补 `continue`/`freeze`；
   9. gateway 契约测试文件 `proxy/tests/test_manual_save_playlist_gateway.py`；
   10. 部署侧导出键（见下）。
-- **P3 只读观察**：⏳ 待用户授权 + 维护窗口。
+- **P3 只读观察**：⏳ 待用户授权 + 维护窗口。**离线准备已完成**：`tools/netease_playlist_observe.py`（默认 dry-run；`--confirm-observe` 才读网络；只 stat Cookie、只统计禁止日志路径次数、报告纯哈希/计数/耗时；保存侧开关为真时在任何读取前拒绝）+ `offline_tests/test_netease_playlist_observe.py`（10 例自检，实跑 10 passed）+ `docs/MANUAL_SAVE_PLAYLIST_SOURCE_EVIDENCE.md`（模板）。执行方式：容器 `/tmp` 临时目录 + 只读导入，**不部署、不改 `.env`、不重启**。
 - **P7 真实整歌单验收**：⏳ 待用户同意写库 + 选定测试歌单。
 - **环境变量落盘限制（本轮实测）**：`.env.example` 在 DSH 工具层属于凭据围栏路径（`.env*`），任何文件工具读写均被拒绝，因此本轮的 `.env.example` 增补未被执行。**必须由操作者在外部编辑器补入**，或在 P5 用不含凭据的示例文档替代。
   需补的三个键（按 `.env.example` 既有注释风格）：
