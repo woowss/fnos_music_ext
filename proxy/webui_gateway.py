@@ -18,6 +18,14 @@
   供管理台「保存到 NAS」页使用（同样要求管理员声明与 x-fnmusic-save: 1）。
 - /api/maintenance：仅转发已确认的清理/任务查询到固定私有 Unix socket，
   不持有业务状态，也不把未知维护请求交给普通 WebUI。
+
+可信入口（G0-FNMEXT-TRUSTED-INGRESS）分六层，任何一层都不得替代另一层：
+L1 socket 权限（默认 0600/0660，启动时重断言）→ L2 内核 peer uid 允许名单
+（accept 后立即校验，失败不读字节/不起线程）→ L3 已读 head 的严格解析
+（重复或畸形 identity 头、Content-Length/Transfer-Encoding 冲突、超限 →
+400 固定码）→ L4 手动保存的单条规范 admin 声明 + userid 声明 → L5 既有
+CSRF/enabled/body 上限 → L6 副作用。环境变量 FNMUSIC_GATEWAY_PEER_ALLOW /
+FNMUSIC_GATEWAY_SOCKET_MODE 非法时拒绝启动（exit 2），不得静默退化。
 """
 from __future__ import annotations
 
@@ -32,6 +40,7 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from urllib.parse import unquote
 from pathlib import Path
 
@@ -49,6 +58,14 @@ PID_FILE = Path("/run/fnmusic-ext/webui-gateway.pid")
 # 洛雪源校验要几十秒才有响应；沿用 5 秒会让桌面网关中途拆连接，nginx 回 502。
 CONNECT_TIMEOUT = 5
 RELAY_TIMEOUT = 180
+
+# Trusted-channel policy (G0-FNMEXT-TRUSTED-INGRESS). Both variables are read
+# once per startup; an invalid value refuses startup instead of degrading the
+# socket to a world-writable mode. See docs/G0_TRUSTED_INGRESS.md.
+GATEWAY_PEER_ALLOW_ENV = "FNMUSIC_GATEWAY_PEER_ALLOW"
+GATEWAY_SOCKET_MODE_ENV = "FNMUSIC_GATEWAY_SOCKET_MODE"
+CHANNEL_REJECT_LOG_INTERVAL = 60.0
+_CHANNEL_REJECT_LOG_PREFIX = "fnmusic-webui-gateway channel-rejected"
 
 HOST_FILE_PATHS = ("/app/fnmusic-ext/api/host-file", "/api/host-file")
 HOST_FILE_MAX_BODY = 1 << 20          # 请求体上限 1MB（只装一个路径字符串）
@@ -79,6 +96,10 @@ MANUAL_SAVE_MAX_QUERY = 2048
 MANUAL_SAVE_MAX_KEYWORD_CHARS = 120
 MANUAL_SAVE_CSRF_HEADER = "x-fnmusic-save"
 MANUAL_SAVE_CSRF_VALUE = "1"
+# L4 authorization switch: require a syntactically valid X-Trim-Userid claim
+# in addition to the canonical admin claim. Kept as a module constant so a
+# future evidence round can change the requirement in one place.
+MANUAL_SAVE_REQUIRE_USER_ID = True
 # The engine's worst case (musicbox API + the 580 s download attempt budget +
 # probe + full decode + tag) can exceed 600 s. The gateway must not return 504
 # before the engine has spent its own fail-closed budget, so keep this above it.
@@ -136,6 +157,35 @@ _MANUAL_SAVE_COVER_ERRORS = frozenset({
     "decode_failed",
     "embed_failed",
     "unknown",
+})
+
+# L3 boundary: fixed rejection classes for an ambiguous request head. Only the
+# stable class name is logged or returned; header names/values are never echoed.
+HEAD_REJECT_FRAMING = "invalid_framing"
+HEAD_REJECT_IDENTITY = "invalid_identity_claim"
+_HEAD_REJECT_MESSAGES = {
+    HEAD_REJECT_FRAMING: "请求框架无效",
+    HEAD_REJECT_IDENTITY: "身份声明无效",
+}
+# parse_untrusted_identity() reason codes that describe framing or general head
+# validity; every other parsing code is an identity-claim problem.
+_HEAD_FRAMING_REASON_CODES = frozenset({
+    "INVALID_HEADER_INPUT",
+    "INVALID_HEADER_NAME",
+    "INVALID_HEADER_VALUE",
+    "TOO_MANY_HEADERS",
+    "HEADER_BYTES_LIMIT",
+    "DUPLICATE_CONTENT_LENGTH",
+    "INVALID_CONTENT_LENGTH",
+    "DUPLICATE_TRANSFER_ENCODING",
+    "CONTENT_LENGTH_TRANSFER_ENCODING_CONFLICT",
+})
+# Peer-credential failures are logged as one of two documented classes only.
+_PEER_CREDENTIAL_UNSUPPORTED_CODES = frozenset({
+    "UNSUPPORTED_PLATFORM",
+    "UNSUPPORTED_SOCKET_FAMILY",
+    "UNSUPPORTED_SOCKET_TYPE",
+    "PEER_CREDENTIALS_UNSUPPORTED",
 })
 
 
@@ -199,6 +249,79 @@ def _read_request_head(client: socket.socket) -> "tuple[bytes, dict[str, str]] |
     return head + b"\r\n\r\n" + rest, headers
 
 
+def _header_pairs_from_raw_head(head_raw: bytes) -> "list[tuple[bytes, bytes]] | None":
+    """Split an already-read head into raw (name, value) pairs for strict parsing.
+
+    A missing head terminator, a header line without a colon, or an empty
+    request line yields ``None``. Values keep their original OWS so the shared
+    parser, not this splitter, owns every trimming rule.
+    """
+    header, separator, _body = head_raw.partition(b"\r\n\r\n")
+    if not separator:
+        return None
+    lines = header.split(b"\r\n")
+    if not lines or not lines[0]:
+        return None
+    pairs: list[tuple[bytes, bytes]] = []
+    for line in lines[1:]:
+        name, colon, value = line.partition(b":")
+        if not colon:
+            return None
+        pairs.append((name, value))
+    return pairs
+
+
+def _identity_claims_from_raw_head(head_raw: bytes):
+    """Parse the strict identity/framing claims of an already-read head.
+
+    Returns ``None`` when the head is not a well-formed strict request head;
+    a successful result is still only an untrusted claim set.
+    """
+    pairs = _header_pairs_from_raw_head(head_raw)
+    if pairs is None:
+        return None
+    try:
+        return gateway_identity.parse_untrusted_identity(pairs)
+    except gateway_identity.HeaderClaimsError:
+        return None
+
+
+def _validate_head(head_raw: bytes) -> "str | None":
+    """L3 boundary check for the already-read request head.
+
+    Returns a fixed rejection class (``invalid_framing`` or
+    ``invalid_identity_claim``) and never inspects the body. It runs on the
+    forwarded path before ``create_connection``: local privileged handlers are
+    dispatched earlier and own their documented strict-parse responses, but
+    they reject every ambiguous head they share with this check before any
+    body, engine, filesystem, or upstream work.
+    """
+    pairs = _header_pairs_from_raw_head(head_raw)
+    if pairs is None:
+        return HEAD_REJECT_FRAMING
+    try:
+        gateway_identity.parse_untrusted_identity(pairs)
+    except gateway_identity.HeaderClaimsError as exc:
+        if exc.reason_code in _HEAD_FRAMING_REASON_CODES:
+            return HEAD_REJECT_FRAMING
+        return HEAD_REJECT_IDENTITY
+    return None
+
+
+def _reject_head(client: socket.socket, code: str) -> None:
+    """Send the fixed 400 for a rejected head and close the connection."""
+    try:
+        client.sendall(_json_response(400, {
+            "ok": False,
+            "code": code,
+            "message": _HEAD_REJECT_MESSAGES[code],
+        }))
+    except OSError:
+        pass
+    finally:
+        _close_quietly(client)
+
+
 def _read_full_body(client: socket.socket, headers: dict[str, str], head_raw: bytes,
                     max_body: int = HOST_FILE_MAX_BODY) -> "bytes | None":
     """按 Content-Length 收齐 POST 体（小请求：仅路径字符串）。"""
@@ -242,23 +365,8 @@ def _admin_claim_from_raw_head(head_raw: bytes) -> bool:
     authorization decision. This only removes duplicate/malformed-header
     order ambiguity before these two privileged gateway handlers act.
     """
-    header, separator, _body = head_raw.partition(b"\r\n\r\n")
-    if not separator:
-        return False
-    lines = header.split(b"\r\n")
-    if not lines:
-        return False
-    pairs: list[tuple[bytes, bytes]] = []
-    for line in lines[1:]:
-        name, colon, value = line.partition(b":")
-        if not colon:
-            return False
-        pairs.append((name, value))
-    try:
-        claims = gateway_identity.parse_untrusted_identity(pairs)
-    except gateway_identity.HeaderClaimsError:
-        return False
-    return claims.admin_claim is True
+    claims = _identity_claims_from_raw_head(head_raw)
+    return claims is not None and claims.admin_claim is True
 
 
 def handle_host_file(client: socket.socket, headers: dict[str, str], head_raw: bytes) -> None:
@@ -471,9 +579,24 @@ def _parse_manual_save_head(head_raw: bytes, *, method: str,
 
 
 def _manual_save_authorized(head_raw: bytes, headers: dict[str, str]) -> bool:
+    """L4: CSRF header + canonical admin claim (+ user-id claim when required).
+
+    The admin and user-id values remain gateway-injected claims, never an
+    authentication proof; this only enforces one canonical claim of each kind
+    and the explicit user-id presence switch below.
+    """
     if headers.get(MANUAL_SAVE_CSRF_HEADER) != MANUAL_SAVE_CSRF_VALUE:
         return False
-    return _admin_claim_from_raw_head(head_raw)
+    claims = _identity_claims_from_raw_head(head_raw)
+    if claims is None or claims.admin_claim is not True:
+        return False
+    if not MANUAL_SAVE_REQUIRE_USER_ID:
+        return True
+    try:
+        gateway_identity.require_user_id(claims)
+    except gateway_identity.TrustedChannelError:
+        return False
+    return True
 
 
 def _read_manual_save_body(client: socket.socket, headers: dict[str, str],
@@ -900,8 +1023,107 @@ def handle_manual_save_search(client: socket.socket, head_raw: bytes, *,
         _close_quietly(client)
 
 
+def _channel_policy(environ: "Mapping[str, str] | None" = None) -> "tuple[frozenset[int], int]":
+    """Resolve (peer uid allow-list, socket mode) from the startup environment.
+
+    Raises ``gateway_identity.TrustedChannelError`` with a fixed code for any
+    invalid value; callers must refuse startup instead of falling back to a
+    permissive mode.
+    """
+    source = os.environ if environ is None else environ
+    allow_uids = gateway_identity.parse_peer_allow_list(
+        source.get(GATEWAY_PEER_ALLOW_ENV))
+    socket_mode = gateway_identity.parse_socket_mode(
+        source.get(GATEWAY_SOCKET_MODE_ENV), allow_uids)
+    return allow_uids, socket_mode
+
+
+def _policy_or_exit(environ: "Mapping[str, str] | None" = None) -> "tuple[frozenset[int], int]":
+    """Return the channel policy, or print the fixed code and exit with 2."""
+    try:
+        return _channel_policy(environ)
+    except gateway_identity.TrustedChannelError as exc:
+        try:
+            print(
+                f"{_CHANNEL_REJECT_LOG_PREFIX} startup-refused code={exc.code}",
+                file=sys.stderr,
+                flush=True,
+            )
+        except Exception:  # noqa: BLE001 — a broken stderr must still refuse startup
+            pass
+        raise SystemExit(2) from None
+
+
+# Fixed-code, throttled rejection log: at most one line per code per interval,
+# and only the integer pid/uid that the kernel reported. No header value, URL,
+# cookie, or exception text is ever formatted into this stream.
+_channel_reject_log_state: dict[str, float] = {}
+_channel_reject_log_lock = threading.Lock()
+
+
+def _log_channel_rejection(code: str,
+                           peer: "gateway_identity.PeerCredentialsMetadata | None" = None) -> None:
+    """Record one fixed channel-rejection code without leaking peer input."""
+    try:
+        now = time.monotonic()
+        with _channel_reject_log_lock:
+            previous = _channel_reject_log_state.get(code)
+            if previous is not None and now - previous < CHANNEL_REJECT_LOG_INTERVAL:
+                return
+            _channel_reject_log_state[code] = now
+        fields = [f"code={code}"]
+        if peer is not None:
+            fields.append(f"pid={int(peer.pid)}")
+            fields.append(f"uid={int(peer.uid)}")
+        print(f"{_CHANNEL_REJECT_LOG_PREFIX} " + " ".join(fields),
+              file=sys.stderr, flush=True)
+    except Exception:  # noqa: BLE001 — logging must never change service behavior
+        pass
+
+
+def _peer_credential_rejection_code(reason_code: str) -> str:
+    """Map a peer-credential failure to one documented fixed log class."""
+    if reason_code in _PEER_CREDENTIAL_UNSUPPORTED_CODES:
+        return "peer_credentials_unsupported"
+    return "peer_credentials_invalid"
+
+
+def _admit_peer(client: socket.socket, allow_uids: frozenset[int]) -> bool:
+    """L2 admission at accept time: kernel peer metadata before any read.
+
+    Must run before a worker thread exists: on rejection the connection is
+    closed without reading a byte, without a thread, and without an upstream
+    connection.
+    """
+    try:
+        peer = gateway_identity.read_peer_credentials(client)
+    except gateway_identity.PeerCredentialsError as exc:
+        _log_channel_rejection(_peer_credential_rejection_code(exc.reason_code))
+        _close_quietly(client)
+        return False
+    try:
+        gateway_identity.evaluate_channel(peer, allow_uids)
+    except gateway_identity.TrustedChannelError as exc:
+        _log_channel_rejection(exc.code, peer)
+        _close_quietly(client)
+        return False
+    return True
+
+
 def serve(sock_path: Path, upstream: tuple[str, int] = UPSTREAM,
-          observer: "gateway_observation.GatewayObserver | None" = None) -> None:
+          observer: "gateway_observation.GatewayObserver | None" = None, *,
+          policy: "tuple[frozenset[int], int] | None" = None,
+          _stop_event: "threading.Event | None" = None,
+          _max_accepts: int | None = None) -> None:
+    """Accept desktop-gateway connections under the trusted-ingress policy.
+
+    ``policy`` and the leading-underscore parameters are test-only injection
+    points with production defaults: when ``policy`` is None the startup
+    environment is resolved exactly as ``main()`` does, and ``_stop_event`` /
+    ``_max_accepts`` let a finite test drive the accept loop without changing
+    the default infinite service loop.
+    """
+    allow_uids, socket_mode = _policy_or_exit() if policy is None else policy
     server = None
     try:
         sock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -911,7 +1133,8 @@ def serve(sock_path: Path, upstream: tuple[str, int] = UPSTREAM,
             pass
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server.bind(str(sock_path))
-        os.chmod(sock_path, 0o666)
+        # Re-assert the policy mode on every start; never inherit a stale 0666.
+        os.chmod(sock_path, socket_mode)
         server.listen(64)
         if observer is not None:
             try:
@@ -919,8 +1142,16 @@ def serve(sock_path: Path, upstream: tuple[str, int] = UPSTREAM,
             except Exception:
                 # Observation must never change the gateway's service behavior.
                 pass
+        accepts = 0
         while True:
+            if _stop_event is not None and _stop_event.is_set():
+                break
             client, _addr = server.accept()
+            accepts += 1
+            if not _admit_peer(client, allow_uids):
+                if _max_accepts is not None and accepts >= _max_accepts:
+                    break
+                continue
             if observer is None:
                 thread = threading.Thread(target=_handle, args=(client, upstream), daemon=True)
             else:
@@ -928,6 +1159,8 @@ def serve(sock_path: Path, upstream: tuple[str, int] = UPSTREAM,
                     target=_handle, args=(client, upstream, observer), daemon=True,
                 )
             thread.start()
+            if _max_accepts is not None and accepts >= _max_accepts:
+                break
     finally:
         if observer is not None:
             try:
@@ -1090,6 +1323,15 @@ def _handle(client: socket.socket, upstream: tuple[str, int],
     if _is_fs_check_request(head_raw):
         handle_fs_check(client, headers, head_raw)
         return
+    # L3 boundary for the forwarded path: an ambiguous identity/framing head is
+    # rejected here, before any upstream connection exists, and the body is
+    # never read. Local privileged handlers above keep their own strict parse
+    # (they reject the same heads with their documented fixed responses before
+    # any body/engine/filesystem work).
+    rejection = _validate_head(head_raw)
+    if rejection is not None:
+        _reject_head(client, rejection)
+        return
     try:
         remote = socket.create_connection(upstream, timeout=CONNECT_TIMEOUT)
         remote.settimeout(RELAY_TIMEOUT)
@@ -1224,6 +1466,9 @@ def main(argv: list[str] | None = None) -> int:
     parsed = _parse_main_args(argv)
     if parsed is None:
         return 2
+    # Refuse an invalid channel policy before any process/socket side effect.
+    # serve() resolves the same environment again for its own startup path.
+    _policy_or_exit()
     base, options = parsed
     observer = None
     if options is not None:

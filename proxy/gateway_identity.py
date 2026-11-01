@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+import re
 import socket
 import struct
 import sys
@@ -244,3 +245,112 @@ def read_peer_credentials(sock: object) -> PeerCredentialsMetadata:
         raise PeerCredentialsError("INVALID_PEER_GID")
 
     return PeerCredentialsMetadata(pid=pid, uid=uid, gid=gid)
+
+
+# ------------------------------------------------------------ channel policy --
+#
+# Fail-closed policy values for the trusted ingress channel. These constants
+# describe the policy the gateway applies; they do not authenticate anything.
+# The official fnOS desktop gateway is a root process, so the allow-list
+# defaults to uid 0 only, and a root-only list defaults to mode 0600. A shared
+# list defaults to 0660 because the group can never be wider than the explicit
+# uid allow-list. 0666/0777 are rejected by construction.
+
+DEFAULT_PEER_UIDS = frozenset({0})
+MAX_PEER_ALLOW_ENTRIES = 8
+DEFAULT_SOCKET_MODE_ROOT_ONLY = 0o600
+DEFAULT_SOCKET_MODE_SHARED = 0o660
+
+_MAX_PEER_UID = 4294967295
+_PEER_UID_RE = re.compile(r"[0-9]{1,10}")
+_SOCKET_MODE_TOKENS = {
+    "0600": DEFAULT_SOCKET_MODE_ROOT_ONLY,
+    "600": DEFAULT_SOCKET_MODE_ROOT_ONLY,
+    "0660": DEFAULT_SOCKET_MODE_SHARED,
+    "660": DEFAULT_SOCKET_MODE_SHARED,
+}
+
+
+class TrustedChannelError(ValueError):
+    """A stable, input-redacted trusted-channel policy error.
+
+    ``code`` is one of the fixed policy/authorization strings below and never
+    contains an input value: ``peer_allow_invalid`` / ``socket_mode_invalid`` /
+    ``peer_uid_not_allowed`` / ``user_id_claim_missing``.
+
+    A failed peer-credential read is not one of these codes: it raises
+    ``PeerCredentialsError``, which the caller reports in the two documented
+    log classes ``peer_credentials_unsupported`` / ``peer_credentials_invalid``.
+    """
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
+def parse_peer_allow_list(raw: object) -> frozenset[int]:
+    """Parse a peer uid allow-list from its text configuration value.
+
+    ``None`` means the variable is unset and falls back to root-only. The value
+    must be a comma-separated list of plain ASCII decimal uids (no sign, no
+    whitespace, no empty item); duplicates are ignored and the remaining count
+    must be 1..8. Every rejection is ``peer_allow_invalid``.
+    """
+    if raw is None:
+        return DEFAULT_PEER_UIDS
+    if type(raw) is not str:
+        raise TrustedChannelError("peer_allow_invalid")
+    entries: set[int] = set()
+    for item in raw.split(","):
+        if _PEER_UID_RE.fullmatch(item) is None:
+            raise TrustedChannelError("peer_allow_invalid")
+        value = int(item, 10)
+        if value > _MAX_PEER_UID:
+            raise TrustedChannelError("peer_allow_invalid")
+        entries.add(value)
+    if not 1 <= len(entries) <= MAX_PEER_ALLOW_ENTRIES:
+        raise TrustedChannelError("peer_allow_invalid")
+    return frozenset(entries)
+
+
+def parse_socket_mode(raw: object, allow_uids: frozenset[int]) -> int:
+    """Resolve the socket permission bits for the selected allow-list.
+
+    ``None`` derives the mode from the allow-list (0600 for root-only, 0660
+    otherwise). Explicit values are limited to 0600/0660 spellings so a
+    world-writable mode can never be configured through the environment.
+    """
+    if raw is None:
+        return (
+            DEFAULT_SOCKET_MODE_ROOT_ONLY
+            if allow_uids == DEFAULT_PEER_UIDS
+            else DEFAULT_SOCKET_MODE_SHARED
+        )
+    if type(raw) is not str:
+        raise TrustedChannelError("socket_mode_invalid")
+    mode = _SOCKET_MODE_TOKENS.get(raw)
+    if mode is None:
+        raise TrustedChannelError("socket_mode_invalid")
+    return mode
+
+
+def evaluate_channel(
+    peer: PeerCredentialsMetadata,
+    allow_uids: frozenset[int],
+) -> None:
+    """L2 decision: the kernel-reported peer uid must be explicitly allowed.
+
+    This is a policy check over kernel metadata, never an authentication
+    inference: a missing uid in the allow-list is the only rejection.
+    """
+    if peer.uid not in allow_uids:
+        raise TrustedChannelError("peer_uid_not_allowed")
+
+
+def require_user_id(claims: UntrustedIdentityClaims) -> None:
+    """L4 prerequisite: a syntactically valid user-id claim must be present.
+
+    The claim is still untrusted; this only rejects the absence of the claim.
+    """
+    if claims.user_id_claim is None:
+        raise TrustedChannelError("user_id_claim_missing")

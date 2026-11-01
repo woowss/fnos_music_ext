@@ -189,6 +189,9 @@ def _child_environment(tmp_path: Path) -> dict[str, str]:
         "PYTHONUNBUFFERED": "1",
         "FNMUSIC_HOME": str(isolated_home / "fnmusic"),
         "FNMUSIC_LOG_DIR": str(tmp_path / "logs"),
+        # The gateway's L2 admission compares the kernel-reported peer uid with
+        # this allow-list; the test parent and child share one uid.
+        "FNMUSIC_GATEWAY_PEER_ALLOW": str(os.geteuid()),
     })
     return env
 

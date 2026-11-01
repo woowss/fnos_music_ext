@@ -472,3 +472,99 @@ def test_peer_credentials_unavailable_platform_constant_fails_closed(monkeypatch
 
     assert code == "PEER_CREDENTIALS_UNSUPPORTED"
     assert sock.calls == []
+
+
+# ------------------------------------------------ trusted channel policy (G0) --
+
+
+def _trusted_code(call):
+    with pytest.raises(gi.TrustedChannelError) as raised:
+        call()
+    return raised.value.code, str(raised.value)
+
+
+def test_trusted_channel_constants_are_fail_closed():
+    assert gi.DEFAULT_PEER_UIDS == frozenset({0})
+    assert gi.MAX_PEER_ALLOW_ENTRIES == 8
+    assert gi.DEFAULT_SOCKET_MODE_ROOT_ONLY == 0o600
+    assert gi.DEFAULT_SOCKET_MODE_SHARED == 0o660
+    assert gi.TrustedChannelError("peer_allow_invalid").code == "peer_allow_invalid"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, frozenset({0})),
+        ("0", frozenset({0})),
+        ("0,33", frozenset({0, 33})),
+        ("33,0,33", frozenset({0, 33})),
+        ("4294967295", frozenset({4294967295})),
+    ],
+)
+def test_parse_peer_allow_list_accepts_strict_decimal_uids(raw, expected):
+    assert gi.parse_peer_allow_list(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "", " ", "0 ", " 0", " 0 , 33 ", "0,,1", ",0", "0,",
+        "-1", "+1", "abc", "0x0", "1.0", "4294967296", "00000000000",
+        "\uff10", "\t0", "0\t", "0;1", "0 1", b"0", 0, [], {},
+    ],
+)
+def test_parse_peer_allow_list_rejects_non_strict_values(raw):
+    code, message = _trusted_code(lambda: gi.parse_peer_allow_list(raw))
+    assert code == "peer_allow_invalid"
+    assert message == "peer_allow_invalid"
+
+
+def test_parse_peer_allow_list_rejects_more_than_eight_unique_entries():
+    eight = ",".join(str(index) for index in range(8))
+    assert gi.parse_peer_allow_list(eight) == frozenset(range(8))
+    nine = ",".join(str(index) for index in range(9))
+    code, _ = _trusted_code(lambda: gi.parse_peer_allow_list(nine))
+    assert code == "peer_allow_invalid"
+
+
+def test_parse_socket_mode_defaults_follow_the_allow_list():
+    assert gi.parse_socket_mode(None, frozenset({0})) == 0o600
+    assert gi.parse_socket_mode(None, gi.DEFAULT_PEER_UIDS) == 0o600
+    assert gi.parse_socket_mode(None, frozenset({0, 33})) == 0o660
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("0600", 0o600), ("600", 0o600), ("0660", 0o660), ("660", 0o660)],
+)
+def test_parse_socket_mode_accepts_only_the_documented_spellings(raw, expected):
+    assert gi.parse_socket_mode(raw, frozenset({0, 33})) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["0666", "666", "0777", "777", "6000", "abc", "", " 600", b"600", 600],
+)
+def test_parse_socket_mode_rejects_world_writable_or_malformed_values(raw):
+    code, message = _trusted_code(
+        lambda: gi.parse_socket_mode(raw, frozenset({0})))
+    assert code == "socket_mode_invalid"
+    assert message == "socket_mode_invalid"
+
+
+def test_evaluate_channel_allows_listed_uid_and_rejects_unlisted_uid():
+    peer = gi.PeerCredentialsMetadata(pid=7, uid=0, gid=0)
+    assert gi.evaluate_channel(peer, frozenset({0})) is None
+    assert gi.evaluate_channel(peer, frozenset({0, 33})) is None
+    code, message = _trusted_code(lambda: gi.evaluate_channel(peer, frozenset({33})))
+    assert code == "peer_uid_not_allowed"
+    assert message == "peer_uid_not_allowed"
+
+
+def test_require_user_id_accepts_present_claim_and_rejects_missing_claim():
+    present = gi.UntrustedIdentityClaims(b"1000", True, None)
+    assert gi.require_user_id(present) is None
+    missing = gi.UntrustedIdentityClaims(None, True, None)
+    code, message = _trusted_code(lambda: gi.require_user_id(missing))
+    assert code == "user_id_claim_missing"
+    assert message == "user_id_claim_missing"

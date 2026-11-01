@@ -136,12 +136,14 @@ class FakeClient:
         self.closed = True
 
 
-def _raw(method, target, *, admin=True, csrf=True, csrf_value="1",
+def _raw(method, target, *, admin=True, csrf=True, csrf_value="1", userid="1000",
          extra_headers=(), body=b"", version="HTTP/1.1", content_length=None,
          omit_content_length=False):
     lines = [f"{method} {target} {version}"]
     if admin:
         lines.append("X-Trim-Isadmin: true")
+    if userid is not None:
+        lines.append(f"X-Trim-Userid: {userid}")
     if csrf:
         lines.append(f"x-fnmusic-save: {csrf_value}")
     lines.append("Host: localhost")
@@ -774,3 +776,101 @@ def test_track_requires_admin_and_csrf_before_engine(target, admin, csrf, csrf_v
     assert payload["data"] == {}
     assert engine.save_calls == []
     assert client.closed is True
+
+
+# ------------------------------------------------ L4 user-id claim (G0) ---
+
+
+def test_l4_user_id_requirement_is_an_explicit_constant():
+    assert gw.MANUAL_SAVE_REQUIRE_USER_ID is True
+
+
+def test_status_requires_user_id_claim_before_engine():
+    raw = _raw("GET", gw.MANUAL_SAVE_STATUS_PATHS[0], userid=None)
+    client = FakeClient(raw)
+    engine = FakeEngine()
+    gw.handle_manual_save_status(client, raw, engine=engine)
+    status, payload = _response(client)
+    assert status == 403
+    assert payload["code"] == "forbidden"
+    assert payload["data"] == {}
+    assert engine.status_calls == 0
+    assert client.closed is True
+
+
+def test_track_requires_user_id_claim_before_engine():
+    raw = _track_raw(userid=None)
+    client = FakeClient(raw)
+    engine = FakeEngine()
+    gw.handle_manual_save_track(client, raw, engine=engine)
+    status, payload = _response(client)
+    assert status == 403
+    assert payload["code"] == "forbidden"
+    assert engine.save_calls == []
+    assert client.closed is True
+
+
+def test_search_requires_user_id_claim_before_engine():
+    raw = _search_raw("keyword=abc", userid=None)
+    client = FakeClient(raw)
+    engine = FakeSearchEngine()
+    gw.handle_manual_save_search(client, raw, engine=engine)
+    status, payload = _response(client)
+    assert status == 403
+    assert payload["code"] == "forbidden"
+    assert engine.search_calls == []
+
+
+def test_missing_user_id_passes_only_when_the_switch_is_off(monkeypatch):
+    raw = _raw("GET", gw.MANUAL_SAVE_STATUS_PATHS[0], userid=None)
+    client = FakeClient(raw)
+    gw.handle_manual_save_status(client, raw, engine=FakeEngine())
+    assert _response(client)[0] == 403
+
+    monkeypatch.setattr(gw, "MANUAL_SAVE_REQUIRE_USER_ID", False)
+    raw = _raw("GET", gw.MANUAL_SAVE_STATUS_PATHS[0], userid=None)
+    client = FakeClient(raw)
+    gw.handle_manual_save_status(client, raw, engine=FakeEngine())
+    assert _response(client)[0] == 200
+
+
+@pytest.mark.parametrize("target", gw.MANUAL_SAVE_TRACK_PATHS)
+def test_duplicate_user_id_header_is_rejected_before_engine(target):
+    body = json.dumps({"song_id": SONG_ID}).encode("utf-8")
+    raw = _raw(
+        "POST", target, body=body,
+        extra_headers=(("X-Trim-Userid", "1001"),),
+    )
+    client = FakeClient(raw)
+    engine = FakeEngine()
+    gw.handle_manual_save_track(client, raw, engine=engine)
+    status, payload = _response(client)
+    assert status == 400
+    assert payload["code"] == "invalid_request"
+    assert engine.save_calls == []
+    assert client.closed is True
+
+
+def test_admin_claim_name_is_case_insensitive_and_ows_is_trimmed():
+    raw = _raw("GET", gw.MANUAL_SAVE_STATUS_PATHS[0]).replace(
+        b"X-Trim-Isadmin: true", b"X-TRIM-ISADMIN:  true ")
+    client = FakeClient(raw)
+    engine = FakeEngine()
+    gw.handle_manual_save_status(client, raw, engine=engine)
+    status, payload = _response(client)
+    assert status == 200
+    assert payload["ok"] is True
+    assert engine.status_calls == 1
+
+
+@pytest.mark.parametrize("value", [b"True", b"1"])
+def test_admin_claim_still_requires_the_canonical_lower_case_value(value):
+    raw = _raw("GET", gw.MANUAL_SAVE_STATUS_PATHS[0]).replace(
+        b"X-Trim-Isadmin: true", b"X-Trim-Isadmin: " + value)
+    client = FakeClient(raw)
+    engine = FakeEngine()
+    gw.handle_manual_save_status(client, raw, engine=engine)
+    status, payload = _response(client)
+    assert status == 403
+    assert payload["code"] == "forbidden"
+    assert engine.status_calls == 0

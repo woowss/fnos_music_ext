@@ -1746,6 +1746,19 @@ async def api_fs_check():
     raise HTTPException(status_code=501, detail="直连模式不支持目录权限校验，请在飞牛桌面内打开管理台")
 
 
+@app.api_route("/api/manual-save", methods=["GET", "POST"])
+@app.api_route("/api/manual-save/{target:path}", methods=["GET", "POST"])
+async def api_manual_save_placeholder(target: str = ""):
+    """手动保存占位端点（直连 8774 场景）。
+
+    特权端点在宿主网关：桌面链路中 /api/manual-save/* 由宿主机侧
+    webui_gateway（root，经统一网关 socket）拦截应答，不会到达这里。
+    WebUI 不是信任边界，也不持有手动保存引擎；任何能直连到这里的请求
+    都不可信，一律回 501，不得降级为可执行路径。
+    """
+    raise HTTPException(status_code=501, detail="直连模式不支持手动保存，请在飞牛桌面内打开管理台")
+
+
 @app.post("/api/maintenance/cleanup")
 @app.get("/api/maintenance/cleanup/{job_id}")
 async def api_maintenance_cleanup(job_id: str = ""):

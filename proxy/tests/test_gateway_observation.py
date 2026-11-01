@@ -870,14 +870,15 @@ def test_observer_exception_does_not_change_forwarded_head_bytes(monkeypatch):
     assert threads[0][1][2] == raw
 
 
-def test_default_handle_does_not_read_peer_or_parse_identity(monkeypatch):
+def test_default_handle_does_not_read_peer_and_keeps_strict_head_boundary(monkeypatch):
     raw = b"GET /ordinary HTTP/1.1\r\nX-Trim-IsAdmin: true\r\n\r\n"
     client = SimpleNamespace(settimeout=lambda _timeout: None, close=lambda: None)
     remote = SimpleNamespace(settimeout=lambda _timeout: None, close=lambda: None)
+    forwarded = []
 
     class FakeThread:
         def __init__(self, *, target, args, daemon):
-            pass
+            forwarded.append(args)
 
         def start(self):
             pass
@@ -885,10 +886,25 @@ def test_default_handle_does_not_read_peer_or_parse_identity(monkeypatch):
         def join(self):
             pass
 
+    parsed = []
+    real_parse = gw.gateway_identity.parse_untrusted_identity
+
+    def tracked_parse(pairs):
+        parsed.append(pairs)
+        return real_parse(pairs)
+
     monkeypatch.setattr(gw, "_read_request_head", lambda _client: (raw, {}))
     monkeypatch.setattr(gw.socket, "create_connection", lambda *_a, **_k: remote)
     monkeypatch.setattr(gw.threading, "Thread", FakeThread)
-    monkeypatch.setattr(go._identity, "read_peer_credentials", lambda *_a: pytest.fail("off mode peer read"))
-    monkeypatch.setattr(go._identity, "parse_untrusted_identity", lambda *_a: pytest.fail("off mode parse"))
+    monkeypatch.setattr(gw.gateway_identity, "parse_untrusted_identity", tracked_parse)
+    monkeypatch.setattr(go._identity, "read_peer_credentials",
+                        lambda *_a: pytest.fail("off mode peer read"))
 
     gw._handle(client, ("unused", 0))
+
+    # L2 admission lives at accept time (serve), never in the per-request
+    # handler; the L3 boundary is the only identity parse and it must leave the
+    # forwarded head bytes untouched.
+    assert len(parsed) == 1
+    assert forwarded[0][0] is client and forwarded[0][1] is remote
+    assert forwarded[0][2] == raw
