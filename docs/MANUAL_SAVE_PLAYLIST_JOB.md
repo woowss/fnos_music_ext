@@ -155,6 +155,8 @@
 | 账本可用 | DB 路径配置非法/不可写 → 500 `config_invalid`（与 §3.9.1 一致；不新增 403 版本），不得创建空 DB 后继续 |
 | 幂等 | 创建按 `(actor_scope, idempotency_key)` + 规范 manifest 字节幂等（`docs/OFFLINE_SAVE_JOBS.md:13-22`）；查询/取消天然幂等；推进**不是**幂等操作但**每个位置至多执行一次**（§7.4） |
 
+**开关取值来源（P5 实现）**：`fnmusic-ext.service` 没有 `EnvironmentFile=`，所以网关优先从 `<repo>/.env` 读取两个已复核的键（`FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED`、`FNMUSIC_MANUAL_SAVE_JOBS_DB`），进程环境只补缺键；**只保留这两个键**，不把 `.env` 其余内容留在内存。文件缺失/不可读 → 视为全部未设置（fail-closed）。这是已审 route 模块 `read_env_file()` 的既有先例，属部署便利而非新增信任边界。
+
 ### 3.1 路径与常量命名建议
 
 在 `proxy/webui_gateway.py` 现有常量区（`:81-108`）追加：
@@ -319,6 +321,7 @@ MANUAL_SAVE_PLAYLIST_LOCK = threading.Lock()  # 模块级，单曲端点与推�
 ```
 
 - `positions` 顺序 = manifest 位置顺序，长度 ≤ 1000；`source_id` 为十进制字符串或 `null`（账本允许 `null`，`docs/OFFLINE_SAVE_JOBS.md:31`）。
+- **附加字段 `reason_message`**（P5 实现，本轮加入）：每个位置行另带一个**固定中文**文案，由 §6.3 的 reason 文案表生成、不做插值；未知 reason 回落固定兜底文案。它服务 UI 直接渲染，不改变上面的字段语义。
 - **不得包含**：任何本地路径、签名 URL、Cookie、token、执行器原始返回（§8）。
 - `JobSummary` 见 §3.7.1。
 
@@ -405,7 +408,7 @@ MANUAL_SAVE_PLAYLIST_LOCK = threading.Lock()  # 模块级，单曲端点与推�
 | `disabled` | 403 | 手动保存未启用 | 既有（`:117`） |
 | `playlist_disabled` | 403 | 整歌单保存未启用 | 仅整歌单开关关闭；与总开关 `disabled` 区分（两者都为 403，均无副作用） |
 | `not_logged_in` | 403 | 网易云账号未登录 | musicbox `not_logged_in` |
-| `config_invalid` | 500 | 手动保存配置无效 | 新（DB 路径/音乐服务 URL） |
+| `config_invalid` | 500 | 手动保存配置无效（与 route 码表逐字一致，§6.3 防漂移） | 新（DB 路径/音乐服务 URL） |
 | `playlist_unavailable` | 502 | 音乐服务不可用 | musicbox 读取失败/连不上 |
 | `playlist_unsupported` | 409 | 该歌单不支持可验证快照 | musicbox `unsupported` |
 | `playlist_too_large` | 409 | 歌单成员超过 1000 个 | §4.4 |

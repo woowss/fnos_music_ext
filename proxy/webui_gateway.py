@@ -16,6 +16,10 @@
   要求管理员声明与 x-fnmusic-save: 1，同一时刻只跑一个保存任务。
 - GET  /app/fnmusic-ext/api/manual-save/search——按关键词搜索网易云曲目，
   供管理台「保存到 NAS」页使用（同样要求管理员声明与 x-fnmusic-save: 1）。
+- /app/fnmusic-ext/api/manual-save/playlist/{playlists,snapshot,jobs,job,
+  advance,cancel}——管理页整歌单保存：固定路径 + 查询/请求体参数，同一套
+  严格 head/L4/开关校验；账本在 gateway 侧，推进每次只跑一首，执行锁与
+  单曲端点串行（见 docs/MANUAL_SAVE_PLAYLIST_JOB.md）。
 - /api/maintenance：仅转发已确认的清理/任务查询到固定私有 Unix socket，
   不持有业务状态，也不把未知维护请求交给普通 WebUI。
 
@@ -41,14 +45,16 @@ import threading
 import time
 import uuid
 from collections.abc import Mapping
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 from pathlib import Path
 
 if __package__:
-    from . import gateway_identity, gateway_observation, manual_save_route
+    from . import gateway_identity, gateway_observation, manual_save_playlist_jobs
+    from . import manual_save_route
 else:  # direct execution from the proxy source directory
     import gateway_identity
     import gateway_observation
+    import manual_save_playlist_jobs
     import manual_save_route
 
 UPSTREAM = ("127.0.0.1", 8774)
@@ -116,6 +122,7 @@ _MANUAL_SAVE_GATEWAY_MESSAGES = {
     "invalid_keyword": "搜索关键词必须是 1-120 字符",
     "invalid_song_id": "song_id 必须是正整数",
     "disabled": "手动保存未启用",
+    "busy": "已有保存任务进行中",
     "timeout": "保存超时",
     "quality_unverified": "音质响应无法核验",
     "quality_identity_mismatch": "无法确认音质响应所属曲目",
@@ -158,6 +165,194 @@ _MANUAL_SAVE_COVER_ERRORS = frozenset({
     "embed_failed",
     "unknown",
 })
+
+# ---------------------------------------------------------------------------
+# Playlist save endpoints (contract FNMEXT-MANUAL-SAVE-PLAYLIST-JOB-20261101-01 §3)
+# ---------------------------------------------------------------------------
+# Fixed paths with query/body parameters (deliberately no /jobs/{id} template):
+# the reviewed strict head parser matches exact targets only, so keeping the
+# job id in a query/body parameter reuses it without relaxing any rule (§3.1).
+MANUAL_SAVE_PLAYLIST_PLAYLISTS_PATHS = (
+    "/app/fnmusic-ext/api/manual-save/playlist/playlists",
+    "/api/manual-save/playlist/playlists",
+)
+MANUAL_SAVE_PLAYLIST_SNAPSHOT_PATHS = (
+    "/app/fnmusic-ext/api/manual-save/playlist/snapshot",
+    "/api/manual-save/playlist/snapshot",
+)
+MANUAL_SAVE_PLAYLIST_JOBS_PATHS = (
+    "/app/fnmusic-ext/api/manual-save/playlist/jobs",
+    "/api/manual-save/playlist/jobs",
+)
+MANUAL_SAVE_PLAYLIST_JOB_PATHS = (
+    "/app/fnmusic-ext/api/manual-save/playlist/job",
+    "/api/manual-save/playlist/job",
+)
+MANUAL_SAVE_PLAYLIST_ADVANCE_PATHS = (
+    "/app/fnmusic-ext/api/manual-save/playlist/advance",
+    "/api/manual-save/playlist/advance",
+)
+MANUAL_SAVE_PLAYLIST_CANCEL_PATHS = (
+    "/app/fnmusic-ext/api/manual-save/playlist/cancel",
+    "/api/manual-save/playlist/cancel",
+)
+# One advance is one track; §7.3 forbids any budget above the single-track one.
+MANUAL_SAVE_PLAYLIST_TIMEOUT = MANUAL_SAVE_TIMEOUT
+# Bounded read budget for the producer/list calls (§8.3 item 2).
+MANUAL_SAVE_PLAYLIST_READ_TIMEOUT = 120.0
+# Query/cancel are ledger-only; they get a short worker budget.
+MANUAL_SAVE_PLAYLIST_QUERY_TIMEOUT = 30.0
+MANUAL_SAVE_PLAYLIST_MAX_POSITIONS = 1000
+MANUAL_SAVE_PLAYLIST_MAX_PLAYLIST_ID = 0xFFFFFFFF
+MANUAL_SAVE_PLAYLIST_MAX_LIST_ROWS = 100
+MANUAL_SAVE_PLAYLIST_MAX_NAME_CHARS = 256
+MANUAL_SAVE_PLAYLIST_MAX_JSON_BYTES = 1 << 20
+MANUAL_SAVE_PLAYLIST_MAX_BASE_URL_CHARS = 2048
+MANUAL_SAVE_PLAYLIST_JOB_ID_RE = re.compile(r"^[0-9a-f]{48}$")
+MANUAL_SAVE_PLAYLIST_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
+MANUAL_SAVE_PLAYLIST_IDEMPOTENCY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+MANUAL_SAVE_PLAYLIST_DECIMAL_RE = re.compile(r"^[1-9][0-9]{0,9}$")
+MANUAL_SAVE_PLAYLIST_REASON_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+MANUAL_SAVE_PLAYLIST_SOURCE_ID_RE = re.compile(r"^[0-9]{1,128}$")
+MANUAL_SAVE_PLAYLIST_MANIFEST_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+MANUAL_SAVE_PLAYLIST_ENABLED_KEY = "FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED"
+MANUAL_SAVE_JOBS_DB_KEY = "FNMUSIC_MANUAL_SAVE_JOBS_DB"
+# §4.1 fixed artifact provenance (producer-side assertion; the gateway only
+# checks the producer's reported version/flag, never the wheel digest).
+MANUAL_SAVE_PLAYLIST_ARTIFACT_PROVIDER = "netease"
+MANUAL_SAVE_PLAYLIST_ARTIFACT_PACKAGE = "NetEase-MusicBox"
+MANUAL_SAVE_PLAYLIST_ARTIFACT_VERSION = "0.5.3"
+MANUAL_SAVE_PLAYLIST_MANIFEST_SCHEMA_VERSION = 1
+# §7.1 gateway-wide execution lock: the single-track endpoint and the playlist
+# advance endpoint serialize on this exact object (acquired before any ledger
+# claim or engine call, released in the worker's finally). Acquisition order is
+# always gateway lock -> ledger/engine, never the reverse.
+MANUAL_SAVE_PLAYLIST_LOCK = threading.Lock()
+# §3.9.2 whitelist of producer error codes that may be echoed; anything else is
+# dropped to "" (never echoed as free text).
+MANUAL_SAVE_PLAYLIST_SOURCE_ERROR_CODES = frozenset({
+    "SOURCE_READ_FAILED",
+    "PLAYLIST_ID_MISMATCH",
+    "POSITION_LIMIT_EXCEEDED",
+    "SOURCE_LIMIT_REACHED",
+    "TRACK_COUNT_MISMATCH",
+    "INVALID_TRACK_ID",
+    "SOURCE_SCHEMA_CHANGED",
+    "ACCOUNT_CHANGED",
+    "PLAYLIST_CHANGED",
+    "SOURCE_VERSION_CHANGED",
+    "TRACK_SEQUENCE_CHANGED",
+    "UNSUPPORTED_SOURCE",
+    "SOURCE_CHANGED_OR_RECHECK_FAILED",
+})
+# §6.2 position states (closed set; unknown persisted state renders as unknown).
+MANUAL_SAVE_PLAYLIST_POSITION_STATES = frozenset({
+    "queued",
+    "running",
+    "published",
+    "published_cleanup_pending",
+    "conflict",
+    "cancelled",
+    "rejected",
+    "failed",
+    "commit_unknown",
+})
+# §6.1 job states (closed set; unknown persisted state renders as unknown).
+MANUAL_SAVE_PLAYLIST_TASK_STATES = frozenset({
+    "queued",
+    "running",
+    "cancelling",
+    "cancelled",
+    "partial",
+    "completed_with_issues",
+    "completed_bytes_reported",
+    "reconciliation_required",
+})
+_MANUAL_SAVE_PLAYLIST_REASON_FALLBACK = "未保存（原因未登记）"
+# §6.2 position reason -> fixed Chinese text. Texts mirror the route message
+# table verbatim; this table is the only renderer and never interpolates input.
+_MANUAL_SAVE_PLAYLIST_REASON_MESSAGES = {
+    "bytes_published": "已发布",
+    "destination_conflict": "目标已存在同名文件，未覆盖",
+    "cancelled_before_publish": "已取消（未执行）",
+    "commit_unknown": "执行结果未知，需要人工对账",
+    "stage_unavailable": "暂存不可用",
+    "staging_failed": "暂存不可用",
+    "cancel_check_failed": "取消检查失败（按已取消处理）",
+    "disabled": "手动保存未启用",
+    # §6.2 requires every overlapping text to match the route table verbatim;
+    # the route (authoritative existing code) says "手动保存配置无效" for this
+    # code, so the route text wins over the §6.2 table cell transcription.
+    "config_invalid": "手动保存配置无效",
+    "busy": "已有保存任务进行中",
+    "service_unavailable": "音乐服务不可用",
+    "no_quality_available": "没有可用的音质",
+    "quality_unverified": "音质响应无法核验",
+    "quality_identity_mismatch": "无法确认音质响应所属曲目",
+    "trial_only": "仅取得试听片段，未保存",
+    "download_target_untrusted": "下载目标未通过安全校验",
+    "download_failed": "下载失败",
+    "integrity_mismatch": "文件校验不一致",
+    "invalid_audio": "音频文件无效",
+    "tag_failed": "写入标签失败",
+    "invalid_target": "输入无效，未执行",
+}
+# §3.9.1 fixed code -> fixed, non-interpolated Chinese message. An unregistered
+# code is never passed through: both helpers fall back to ``internal``.
+_MANUAL_SAVE_PLAYLIST_MESSAGES = {
+    "ok": "",
+    "invalid_request": "请求无效",
+    "invalid_playlist_id": "歌单 ID 必须是正整数",
+    "invalid_fingerprint": "快照指纹无效",
+    "invalid_idempotency_key": "幂等键无效",
+    "not_found": "任务不存在",
+    "forbidden": "仅管理员可执行手动保存",
+    "disabled": "手动保存未启用",
+    "playlist_disabled": "整歌单保存未启用",
+    "not_logged_in": "网易云账号未登录",
+    "config_invalid": "手动保存配置无效",
+    "playlist_unavailable": "音乐服务不可用",
+    "playlist_unsupported": "该歌单不支持可验证快照",
+    "playlist_too_large": "歌单成员超过 1000 个",
+    "manifest_incomplete": "歌单成员清单不完整",
+    "source_changed": "歌单在确认后发生变化，请重新读取",
+    "source_artifact_mismatch": "音乐服务版本与固定证据不一致",
+    "idempotency_conflict": "幂等键已用于不同清单",
+    "capacity_exceeded": "任务账本容量已满",
+    "ledger_unavailable": "任务账本不可用",
+    "busy": "已有保存任务进行中",
+    "completion_unknown": "任务结果写入失败，需人工核对",
+    "stale_completion": "迟到的执行结果未覆盖记录",
+    "timeout": "保存超时",
+    "internal": "内部错误",
+}
+_MANUAL_SAVE_PLAYLIST_HTTP_STATUS = {
+    "ok": 200,
+    "invalid_request": 400,
+    "invalid_playlist_id": 400,
+    "invalid_fingerprint": 400,
+    "invalid_idempotency_key": 400,
+    "not_found": 404,
+    "forbidden": 403,
+    "disabled": 403,
+    "playlist_disabled": 403,
+    "not_logged_in": 403,
+    "config_invalid": 500,
+    "playlist_unavailable": 502,
+    "playlist_unsupported": 409,
+    "playlist_too_large": 409,
+    "manifest_incomplete": 409,
+    "source_changed": 409,
+    "source_artifact_mismatch": 500,
+    "idempotency_conflict": 409,
+    "capacity_exceeded": 409,
+    "ledger_unavailable": 503,
+    "busy": 409,
+    "completion_unknown": 500,
+    "stale_completion": 409,
+    "timeout": 504,
+    "internal": 500,
+}
 
 # L3 boundary: fixed rejection classes for an ambiguous request head. Only the
 # stable class name is logged or returned; header names/values are never echoed.
@@ -747,13 +942,27 @@ def _manual_save_http_status(code: str, ok: bool) -> int:
 
 
 def _run_manual_save(engine, song_id: int, timeout: float):
+    """Run one track save in a worker thread under the gateway execution lock.
+
+    Contract §7.1: the single-track worker must acquire the same module-level
+    ``MANUAL_SAVE_PLAYLIST_LOCK`` as the playlist advance endpoint (non-blocking,
+    before any engine call). A lost race returns ``busy`` (409) without calling
+    the engine, so the playlist endpoint can never claim a position while a
+    single-track save is in flight.
+    """
     holder: dict[str, object] = {}
 
     def worker() -> None:
+        if not MANUAL_SAVE_PLAYLIST_LOCK.acquire(blocking=False):
+            holder["value"] = _manual_save_error("busy")
+            return
         try:
-            holder["value"] = engine.save_track(song_id)
-        except BaseException:  # noqa: BLE001 — worker errors become fixed JSON
-            holder["value"] = _manual_save_error("internal")
+            try:
+                holder["value"] = engine.save_track(song_id)
+            except BaseException:  # noqa: BLE001 — worker errors become fixed JSON
+                holder["value"] = _manual_save_error("internal")
+        finally:
+            MANUAL_SAVE_PLAYLIST_LOCK.release()
 
     thread = threading.Thread(target=worker, name="fnmusic-manual-save", daemon=True)
     thread.start()
@@ -1021,6 +1230,1262 @@ def handle_manual_save_search(client: socket.socket, head_raw: bytes, *,
         pass
     finally:
         _close_quietly(client)
+
+
+# ---------------------------------------------------------------------------
+# Playlist save helpers (contract §3, §4.3.1, §7.1)
+# ---------------------------------------------------------------------------
+
+MANUAL_SAVE_PLAYLIST_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+# Producer/transport/logic exception code -> reviewed endpoint code (§3.9.1).
+# Anything absent from this table and from the HTTP status table collapses to
+# ``internal``; no exception text or unknown code is ever echoed (§3.9.1).
+_MANUAL_SAVE_PLAYLIST_EXCEPTION_CODE_ALIASES = {
+    "producer_not_loopback": "config_invalid",
+    "producer_config_invalid": "config_invalid",
+    "producer_timeout": "timeout",
+    "producer_unreachable": "playlist_unavailable",
+    "producer_http_status": "playlist_unavailable",
+    "producer_response_too_large": "playlist_unavailable",
+    "producer_malformed_response": "playlist_unavailable",
+    "producer_unexpected_url": "playlist_unavailable",
+    "manifest_disabled": "config_invalid",
+    # A gateway-built manifest that the ledger rejects is a programming error:
+    # the 500 path never exposes the validation detail (§3.4 step 9).
+    "invalid_request": "internal",
+    "invalid_actor": "forbidden",
+}
+
+
+class _ManualSavePlaylistDeps:
+    """Resolved playlist services; injected in tests, built from .env in prod."""
+
+    __slots__ = ("service", "producer", "enabled")
+
+    def __init__(self, service=None, producer=None, enabled=True):
+        self.service = service
+        self.producer = producer
+        self.enabled = enabled is True
+
+
+def _manual_save_playlist_message(code: object) -> str:
+    if type(code) is str and code in _MANUAL_SAVE_PLAYLIST_MESSAGES:
+        return _MANUAL_SAVE_PLAYLIST_MESSAGES[code]
+    return _MANUAL_SAVE_PLAYLIST_MESSAGES["internal"]
+
+
+def _manual_save_playlist_reason_message(reason: object) -> str:
+    """Fixed Chinese text for one persisted ledger reason (§6.2)."""
+    if reason is None:
+        return ""
+    if type(reason) is str and reason in _MANUAL_SAVE_PLAYLIST_REASON_MESSAGES:
+        return _MANUAL_SAVE_PLAYLIST_REASON_MESSAGES[reason]
+    return _MANUAL_SAVE_PLAYLIST_REASON_FALLBACK
+
+
+def _manual_save_playlist_error(code: str, data: "dict | None" = None) -> dict:
+    return {
+        "ok": False,
+        "code": code,
+        "message": _manual_save_playlist_message(code),
+        "data": {} if data is None else data,
+    }
+
+
+def _manual_save_playlist_result(data: dict) -> dict:
+    return {"ok": True, "code": "ok", "message": "", "data": data}
+
+
+def _manual_save_playlist_http_status(code: str, ok: bool) -> int:
+    if ok:
+        return 200
+    return _MANUAL_SAVE_PLAYLIST_HTTP_STATUS.get(code, 500)
+
+
+def _send_manual_save_playlist(client: socket.socket, status: int, payload: dict) -> None:
+    try:
+        client.sendall(_json_response(status, payload))
+    except OSError:
+        pass
+
+
+def _manual_save_playlist_send_result(client: socket.socket, result: object) -> None:
+    """Send one fixed envelope; unregistered codes/keys can never reach the wire."""
+    if not isinstance(result, Mapping):
+        result = _manual_save_playlist_error("internal")
+    ok = result.get("ok") is True
+    code = result.get("code")
+    if ok and code != "ok":
+        # An "ok" result must carry the fixed success code.
+        ok, code = False, "internal"
+    if not ok and (type(code) is not str or code not in _MANUAL_SAVE_PLAYLIST_HTTP_STATUS):
+        code = "internal"
+    if not ok and code == "ok":
+        code = "internal"
+    data = result.get("data")
+    if not isinstance(data, dict):
+        data = {}
+    _send_manual_save_playlist(client, _manual_save_playlist_http_status(code, ok), {
+        "ok": ok,
+        "code": code,
+        "message": _manual_save_playlist_message(code),
+        "data": data,
+    })
+
+
+def _manual_save_playlist_code_for_exception(exc: BaseException) -> str:
+    code = getattr(exc, "code", None)
+    if type(code) is not str:
+        return "internal"
+    alias = _MANUAL_SAVE_PLAYLIST_EXCEPTION_CODE_ALIASES.get(code)
+    if alias is not None:
+        return alias
+    if code in _MANUAL_SAVE_PLAYLIST_HTTP_STATUS:
+        return code
+    return "internal"
+
+
+def _run_manual_save_playlist_worker(operation, timeout: float):
+    """Run one fixed-code operation in a worker; ``None`` means the join timed out.
+
+    Contract §7.3: a 504 is not a cancellation. The worker keeps its execution
+    lock (when it took one) until the operation really finishes, exactly like
+    the single-track worker.
+    """
+    holder: dict[str, object] = {}
+
+    def worker() -> None:
+        try:
+            holder["value"] = ("ok", operation())
+        except BaseException as exc:  # noqa: BLE001 — fixed code only, no text
+            holder["value"] = ("error", _manual_save_playlist_code_for_exception(exc))
+
+    thread = threading.Thread(
+        target=worker, name="fnmusic-manual-save-playlist", daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        return None
+    return holder.get("value")
+
+
+def _manual_save_playlist_run(client: socket.socket, operation, timeout: float) -> None:
+    outcome = _run_manual_save_playlist_worker(operation, timeout)
+    if outcome is None:
+        _send_manual_save_playlist(
+            client, 504, _manual_save_playlist_error("timeout"))
+        return
+    kind, value = outcome
+    if kind == "error":
+        code = value
+        _send_manual_save_playlist(
+            client,
+            _manual_save_playlist_http_status(code, False),
+            _manual_save_playlist_error(code),
+        )
+        return
+    _manual_save_playlist_send_result(client, value)
+
+
+def _manual_save_playlist_actor_scope(head_raw: bytes, headers: dict) -> "str | None":
+    """L4 authorization + actor scope from the canonical, already-checked claim.
+
+    Contract §2.4/§8.3: the scope is derived only from the L4-validated user-id
+    claim. No request body/query field can influence it (callers use closed key
+    sets, so an identity field there is ``invalid_request``).
+    """
+    if not _manual_save_authorized(head_raw, headers):
+        return None
+    claims = _identity_claims_from_raw_head(head_raw)
+    if claims is None or claims.user_id_claim is None:
+        return None
+    try:
+        claim_text = claims.user_id_claim.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    try:
+        return manual_save_playlist_jobs.derive_actor_scope(claim_text)
+    except manual_save_playlist_jobs.PlaylistJobError:
+        return None
+
+
+def _manual_save_playlist_deps(deps: object) -> "_ManualSavePlaylistDeps":
+    if deps is not None:
+        return deps
+    return _manual_save_playlist_resolve_deps()
+
+
+def _manual_save_playlist_environ() -> dict:
+    """Merge ``.env`` (deployment source) with process environment (fallback).
+
+    ``fnmusic-ext.service`` has no ``EnvironmentFile=``, so the reviewed
+    ``FNMUSIC_MANUAL_SAVE_*`` keys live in ``<repo>/.env``. Process values only
+    fill keys the file omits; a missing file is treated as "all unset".
+    """
+    try:
+        values = manual_save_route.read_env_file()
+    except Exception:  # noqa: BLE001 — a missing/unreadable .env means all unset
+        values = {}
+    keys = (
+        manual_save_playlist_jobs.PLAYLIST_ENABLED_ENV,
+        manual_save_playlist_jobs.JOBS_DB_ENV,
+    )
+    # Keep only the two reviewed keys: never retain the rest of ``.env`` in memory.
+    environ: dict = {}
+    if isinstance(values, Mapping):
+        for key in keys:
+            if key in values:
+                environ[key] = values[key]
+    for key in keys:
+        if key not in environ and key in os.environ:
+            environ[key] = os.environ[key]
+    return environ
+
+
+def _manual_save_playlist_musicbox_url() -> str:
+    """Loopback musicbox base URL from the reviewed route config (default included)."""
+    config = manual_save_route.load_config()
+    url = getattr(config, "musicbox_url", None)
+    if type(url) is not str or not url:
+        raise manual_save_playlist_jobs.ServiceError("config_invalid")
+    return url
+
+
+def _manual_save_playlist_resolve_deps() -> "_ManualSavePlaylistDeps":
+    """Build the production service layer or raise one fixed endpoint code.
+
+    Order: playlist switch (403 ``playlist_disabled``) -> ledger path
+    (500 ``config_invalid``) -> producer client (loopback-checked). Nothing here
+    opens the ledger or the network by itself.
+    """
+    try:
+        config = manual_save_playlist_jobs.load_service_config(
+            _manual_save_playlist_environ())
+    except Exception:  # noqa: BLE001 — invalid config fails closed, fixed code
+        raise manual_save_playlist_jobs.ServiceError("config_invalid") from None
+    if not config.enabled:
+        raise manual_save_playlist_jobs.ServiceError("playlist_disabled")
+    if config.db_path is None:
+        raise manual_save_playlist_jobs.ServiceError("config_invalid")
+    try:
+        base_url = _manual_save_playlist_musicbox_url()
+        producer = manual_save_playlist_jobs.PlaylistSnapshotClient(
+            base_url, timeout=MANUAL_SAVE_PLAYLIST_READ_TIMEOUT)
+    except manual_save_playlist_jobs.PlaylistJobError as exc:
+        if exc.code in (
+            manual_save_playlist_jobs.PRODUCER_NOT_LOOPBACK,
+            manual_save_playlist_jobs.PRODUCER_CONFIG_INVALID,
+        ):
+            raise manual_save_playlist_jobs.ServiceError("config_invalid") from None
+        raise
+    except Exception:  # noqa: BLE001 — invalid musicbox URL/config, fixed code
+        raise manual_save_playlist_jobs.ServiceError("config_invalid") from None
+    service = manual_save_playlist_jobs.PlaylistJobService(config, producer)
+    return _ManualSavePlaylistDeps(service=service, producer=producer, enabled=True)
+
+
+def _manual_save_playlist_total_switch(client: socket.socket, engine) -> bool:
+    """L5 switch: the existing single-track master switch gates every endpoint.
+
+    A closed master switch is 403 ``disabled``; only when it is open does the
+    playlist switch (resolved in the deps layer) produce ``playlist_disabled``.
+    """
+    engine_result = _engine_status(manual_save_route if engine is None else engine)
+    if engine_result is None:
+        _send_manual_save_playlist(
+            client, 500, _manual_save_playlist_error("internal"))
+        return False
+    if engine_result.get("ok") is not True:
+        _send_manual_save_playlist(client, 403, {
+            "ok": False,
+            "code": "disabled",
+            "message": _manual_save_playlist_message("disabled"),
+            "data": {"enabled": False},
+        })
+        return False
+    return True
+
+
+def _manual_save_playlist_gate(client: socket.socket, engine, deps: object):
+    """Parse-independent gate: master switch -> playlist switch -> deps.
+
+    Returns ``(deps, failed)``; on failure the fixed error has already been sent.
+    Runs before any body/query validation so a closed switch has no side effects.
+    """
+    if not _manual_save_playlist_total_switch(client, engine):
+        return None, True
+    try:
+        active = _manual_save_playlist_deps(deps)
+    except Exception as exc:  # noqa: BLE001 — fixed code, never exception text
+        code = _manual_save_playlist_code_for_exception(exc)
+        _send_manual_save_playlist(
+            client,
+            _manual_save_playlist_http_status(code, False),
+            _manual_save_playlist_error(code),
+        )
+        return None, True
+    if not active.enabled:
+        _send_manual_save_playlist(
+            client, 403, _manual_save_playlist_error("playlist_disabled"))
+        return None, True
+    return active, False
+
+
+def _manual_save_playlist_get_head(client: socket.socket, head_raw: bytes, *,
+                                   targets: "tuple[str, ...]",
+                                   allow_query: bool = False):
+    parsed = _parse_manual_save_head(
+        head_raw, method="GET", targets=targets, allow_query=allow_query)
+    if parsed is None:
+        _send_manual_save_playlist(
+            client, 400, _manual_save_playlist_error("invalid_request"))
+        return None
+    headers, rest, target = parsed
+    if rest or headers.get("content-length", "0") != "0":
+        _send_manual_save_playlist(
+            client, 400, _manual_save_playlist_error("invalid_request"))
+        return None
+    return headers, target
+
+
+def _manual_save_playlist_post_head(client: socket.socket, head_raw: bytes, *,
+                                    targets: "tuple[str, ...]"):
+    """Strict POST head parse; returns (headers, rest) before body reading."""
+    parsed = _parse_manual_save_head(
+        head_raw, method="POST", targets=targets)
+    if parsed is None:
+        _send_manual_save_playlist(
+            client, 400, _manual_save_playlist_error("invalid_request"))
+        return None
+    headers, rest, _target = parsed
+    return headers, rest
+
+
+def _manual_save_playlist_json_request(client: socket.socket, headers: dict,
+                                       rest: bytes) -> "dict | None":
+    if "content-length" not in headers:
+        _send_manual_save_playlist(
+            client, 400, _manual_save_playlist_error("invalid_request"))
+        return None
+    body = _read_manual_save_body(client, headers, rest)
+    if body is None:
+        _send_manual_save_playlist(
+            client, 400, _manual_save_playlist_error("invalid_request"))
+        return None
+    try:
+        request = json.loads(body.decode("utf-8"))
+    except (UnicodeError, ValueError):
+        _send_manual_save_playlist(
+            client, 400, _manual_save_playlist_error("invalid_request"))
+        return None
+    if not isinstance(request, dict):
+        _send_manual_save_playlist(
+            client, 400, _manual_save_playlist_error("invalid_request"))
+        return None
+    return request
+
+
+def _manual_save_playlist_query_value(target: str, key: str) -> "tuple[str, str]":
+    """Strict single-key query parsing (same discipline as the search endpoint)."""
+    _path, separator, query = target.partition("?")
+    if not separator or not query:
+        return "", "invalid_request"
+    if len(query) > MANUAL_SAVE_MAX_QUERY:
+        return "", "invalid_request"
+    pairs: list[tuple[str, str]] = []
+    for part in query.split("&"):
+        if not part:
+            return "", "invalid_request"
+        name, equals, value = part.partition("=")
+        if not equals:
+            return "", "invalid_request"
+        try:
+            name = unquote(name, errors="strict")
+            value = unquote(value, errors="strict")
+        except (UnicodeError, ValueError):
+            return "", "invalid_request"
+        pairs.append((name, value))
+    if len(pairs) != 1 or pairs[0][0] != key:
+        return "", "invalid_request"
+    return pairs[0][1], ""
+
+
+def _manual_save_playlist_parse_playlist_id(value: object) -> "int | None":
+    if type(value) is not str or MANUAL_SAVE_PLAYLIST_DECIMAL_RE.fullmatch(value) is None:
+        return None
+    playlist_id = int(value, 10)
+    if not 1 <= playlist_id <= MANUAL_SAVE_PLAYLIST_MAX_PLAYLIST_ID:
+        return None
+    return playlist_id
+
+
+def _manual_save_playlist_parse_job_id(value: object) -> "str | None":
+    if type(value) is not str or MANUAL_SAVE_PLAYLIST_JOB_ID_RE.fullmatch(value) is None:
+        return None
+    return value
+
+
+def _manual_save_playlist_job_id_request(request: dict) -> "tuple[str | None, str]":
+    """Advance/cancel body: exactly one key (``job_id``); bad id -> not_found."""
+    if set(request) != {"job_id"}:
+        return None, "invalid_request"
+    job_id = _manual_save_playlist_parse_job_id(request.get("job_id"))
+    if job_id is None:
+        # §3.5/§3.6: malformed/absent/foreign ids share the fixed not_found code.
+        return None, "not_found"
+    return job_id, ""
+
+
+def _manual_save_playlist_create_request(request: dict):
+    """Create body allow-list; any identity/extra field is ``invalid_request``."""
+    allowed = {"playlist_id", "source_fingerprint", "idempotency_key"}
+    if set(request) - allowed:
+        return None, "invalid_request"
+    playlist_id = request.get("playlist_id")
+    if (
+        type(playlist_id) is not int
+        or isinstance(playlist_id, bool)
+        or not 1 <= playlist_id <= MANUAL_SAVE_PLAYLIST_MAX_PLAYLIST_ID
+    ):
+        return None, "invalid_playlist_id"
+    fingerprint = request.get("source_fingerprint")
+    if (
+        type(fingerprint) is not str
+        or MANUAL_SAVE_PLAYLIST_FINGERPRINT_RE.fullmatch(fingerprint) is None
+    ):
+        return None, "invalid_fingerprint"
+    idempotency_key = None
+    if "idempotency_key" in request:
+        idempotency_key = request.get("idempotency_key")
+        if (
+            type(idempotency_key) is not str
+            or MANUAL_SAVE_PLAYLIST_IDEMPOTENCY_RE.fullmatch(idempotency_key) is None
+        ):
+            return None, "invalid_idempotency_key"
+    return (playlist_id, fingerprint, idempotency_key), ""
+
+
+def _manual_save_playlist_derived_key(playlist_id: int, fingerprint: str) -> str:
+    """§3.4 step 7: ``"p" + str(playlist_id) + "-" + source_fingerprint``."""
+    return "p" + str(playlist_id) + "-" + fingerprint
+
+
+def _manual_save_playlist_manifest_fingerprint(manifest: object) -> str:
+    if not isinstance(manifest, Mapping):
+        return ""
+    version = manifest.get("collection_version")
+    prefix = manual_save_playlist_jobs.COLLECTION_VERSION_PREFIX
+    if type(version) is not str or not version.startswith(prefix):
+        return ""
+    fingerprint = version[len(prefix):]
+    if MANUAL_SAVE_PLAYLIST_FINGERPRINT_RE.fullmatch(fingerprint) is None:
+        return ""
+    return fingerprint
+
+
+def _manual_save_playlist_artifact(payload: Mapping) -> dict:
+    artifact = payload.get("source_artifact")
+    source = artifact if isinstance(artifact, Mapping) else {}
+
+    def text(name: str) -> str:
+        value = source.get(name)
+        return value if type(value) is str else ""
+
+    return {
+        "provider": text("provider"),
+        "package": text("package"),
+        "version": text("version"),
+        "wheel_sha256": text("wheel_sha256"),
+    }
+
+
+def _manual_save_playlist_artifact_valid(payload: Mapping) -> bool:
+    """§3.4 step 5: version/dist-info/error-code recheck (no wheel digest claim).
+
+    The producer already asserts the installed ``NetEase-MusicBox`` version and
+    ``dist-info`` presence; the gateway re-checks the reported fields instead of
+    trusting the snapshot verdict. It never recomputes/validates the wheel
+    SHA-256 at runtime (§4.1 item 3).
+    """
+    artifact = payload.get("source_artifact")
+    if not isinstance(artifact, Mapping):
+        return False
+    if payload.get("artifact_error_code") is not None:
+        return False
+    return (
+        artifact.get("provider") == MANUAL_SAVE_PLAYLIST_ARTIFACT_PROVIDER
+        and artifact.get("package") == MANUAL_SAVE_PLAYLIST_ARTIFACT_PACKAGE
+        and artifact.get("version") == MANUAL_SAVE_PLAYLIST_ARTIFACT_VERSION
+        and artifact.get("dist_info_present") is True
+        and type(artifact.get("wheel_sha256")) is str
+    )
+
+
+def _manual_save_playlist_snapshot_failure_data(playlist_id: int,
+                                                payload: object) -> dict:
+    """§3.3 failure data; only the reviewed fields and the code whitelist."""
+    source = payload if isinstance(payload, Mapping) else {}
+
+    def count(name: str) -> int:
+        value = source.get(name)
+        return value if type(value) is int and not isinstance(value, bool) and value >= 0 else 0
+
+    error_code = source.get("error_code")
+    whitelisted = (
+        error_code
+        if type(error_code) is str
+        and error_code in MANUAL_SAVE_PLAYLIST_SOURCE_ERROR_CODES
+        else ""
+    )
+    return {
+        "playlist_id": playlist_id,
+        "track_count": count("track_count"),
+        "position_count": count("position_count"),
+        "enumeration_complete": False,
+        "source_error_code": whitelisted,
+    }
+
+
+def _manual_save_playlist_snapshot_result(active: "_ManualSavePlaylistDeps",
+                                          playlist_id: int) -> dict:
+    """§3.3 precheck: one producer read, then the gateway re-checks the structure.
+
+    §4.3.1's seven re-checks are executed by ``build_manifest`` (wired here, not
+    trusted from the producer): positions list length == position_count ==
+    track_count, contiguous 1..N positions, positive non-bool track ids with no
+    error_code, 1..1000 tracks, 64-hex fingerprint, fixed provider/schema, and
+    no silent truncate/pad on a count mismatch. The artifact fields are checked
+    separately (also on the complete branch).
+    """
+    payload = active.producer.fetch_snapshot(playlist_id)
+    if not isinstance(payload, Mapping):
+        raise manual_save_playlist_jobs.ProducerError(
+            manual_save_playlist_jobs.PRODUCER_MALFORMED_RESPONSE)
+    failure = _manual_save_playlist_snapshot_failure_data(playlist_id, payload)
+    try:
+        manifest = manual_save_playlist_jobs.build_manifest(playlist_id, payload)
+    except manual_save_playlist_jobs.PlaylistJobError as exc:
+        return _manual_save_playlist_error(
+            _manual_save_playlist_code_for_exception(exc), failure)
+    if not _manual_save_playlist_artifact_valid(payload):
+        return _manual_save_playlist_error("source_artifact_mismatch", failure)
+    if manifest.get("enumeration_complete") is not True:
+        return _manual_save_playlist_error("manifest_incomplete", failure)
+    fingerprint = _manual_save_playlist_manifest_fingerprint(manifest)
+    entries = manifest.get("entries")
+    if not fingerprint or not isinstance(entries, list):
+        return _manual_save_playlist_error("manifest_incomplete", failure)
+    source_ids = [
+        entry.get("source_id")
+        for entry in entries
+        if isinstance(entry, Mapping) and entry.get("source_status") == "ok"
+    ]
+    duplicate_count = len(source_ids) - len({value for value in source_ids if type(value) is str})
+    return _manual_save_playlist_result({
+        "playlist_id": playlist_id,
+        "track_count": len(entries),
+        "position_count": len(entries),
+        "duplicate_position_count": duplicate_count,
+        "enumeration_complete": True,
+        "source_fingerprint": fingerprint,
+        "source_artifact": _manual_save_playlist_artifact(payload),
+        "manifest_schema_version": MANUAL_SAVE_PLAYLIST_MANIFEST_SCHEMA_VERSION,
+    })
+
+
+def _manual_save_playlist_create_result(active: "_ManualSavePlaylistDeps",
+                                        actor_scope: str, playlist_id: int,
+                                        fingerprint: str,
+                                        idempotency_key: "str | None") -> dict:
+    """§3.4 fixed order: re-read snapshot -> bind fingerprint -> recheck -> create.
+
+    No ledger write happens before the fingerprint binding succeeds, so a
+    playlist that changed after the precheck is rejected with 409
+    ``source_changed`` instead of creating a job for an unconfirmed manifest.
+    """
+    payload = active.producer.fetch_snapshot(playlist_id)
+    if not isinstance(payload, Mapping):
+        raise manual_save_playlist_jobs.ProducerError(
+            manual_save_playlist_jobs.PRODUCER_MALFORMED_RESPONSE)
+    if payload.get("status") != "complete":
+        # A non-complete snapshot never reaches the ledger: build_manifest maps
+        # its status to the reviewed fixed code and raises.
+        manual_save_playlist_jobs.build_manifest(playlist_id, payload)
+        raise manual_save_playlist_jobs.ManifestError(
+            manual_save_playlist_jobs.MANIFEST_INCOMPLETE)
+    if payload.get("source_fingerprint") != fingerprint:
+        raise manual_save_playlist_jobs.ManifestError(
+            manual_save_playlist_jobs.SOURCE_CHANGED)
+    manifest = manual_save_playlist_jobs.build_manifest(playlist_id, payload)
+    if not _manual_save_playlist_artifact_valid(payload):
+        raise manual_save_playlist_jobs.ManifestError(
+            manual_save_playlist_jobs.SOURCE_ARTIFACT_MISMATCH)
+    if manifest.get("enumeration_complete") is not True:
+        raise manual_save_playlist_jobs.ManifestError(
+            manual_save_playlist_jobs.MANIFEST_INCOMPLETE)
+    key = (
+        idempotency_key
+        if idempotency_key is not None
+        else _manual_save_playlist_derived_key(playlist_id, fingerprint)
+    )
+    job = active.service.create_job(
+        actor_scope, playlist_id, payload, idempotency_key=key)
+    manifest_sha256 = getattr(job, "manifest_sha256", None)
+    return _manual_save_playlist_result({
+        "job": _manual_save_playlist_job_summary(job),
+        "manifest_sha256": (
+            manifest_sha256
+            if type(manifest_sha256) is str
+            and MANUAL_SAVE_PLAYLIST_MANIFEST_SHA_RE.fullmatch(manifest_sha256)
+            else ""
+        ),
+        "manifest": _manual_save_playlist_manifest_summary(job),
+    })
+
+
+def _manual_save_playlist_manifest_summary(job: object) -> dict:
+    manifest = getattr(job, "manifest", None)
+    source = manifest if isinstance(manifest, Mapping) else {}
+
+    def text(name: str) -> str:
+        value = source.get(name)
+        return value if type(value) is str else ""
+
+    entries = source.get("entries")
+    return {
+        "kind": text("kind"),
+        "target_id": text("target_id"),
+        "provider_id": text("provider_id"),
+        "collection_id": text("collection_id"),
+        "collection_version": text("collection_version"),
+        "enumeration_complete": source.get("enumeration_complete") is True,
+        "positions_total": len(entries) if isinstance(entries, list) else 0,
+    }
+
+
+def _manual_save_playlist_job_summary(job: object) -> dict:
+    """§3.7.1 ``JobSummary``: fixed fields only, readiness flags always false."""
+    job_id = getattr(job, "job_id", None)
+    state = getattr(job, "state", None)
+    manifest_sha256 = getattr(job, "manifest_sha256", None)
+    positions = getattr(job, "positions", ())
+    counts_source = getattr(job, "counts", None)
+    counts: dict[str, int] = {}
+    if isinstance(counts_source, Mapping):
+        for key, value in counts_source.items():
+            if (
+                type(key) is str
+                and key in MANUAL_SAVE_PLAYLIST_POSITION_STATES
+                and type(value) is int
+                and not isinstance(value, bool)
+                and value >= 0
+            ):
+                counts[key] = value
+    return {
+        "job_id": (
+            job_id
+            if type(job_id) is str
+            and MANUAL_SAVE_PLAYLIST_JOB_ID_RE.fullmatch(job_id)
+            else ""
+        ),
+        "state": (
+            state
+            if type(state) is str and state in MANUAL_SAVE_PLAYLIST_TASK_STATES
+            else "unknown"
+        ),
+        "cancel_requested": getattr(job, "cancel_requested", False) is True,
+        "counts": counts,
+        "positions_total": len(positions) if isinstance(positions, (tuple, list)) else 0,
+        "manifest_sha256": (
+            manifest_sha256
+            if type(manifest_sha256) is str
+            and MANUAL_SAVE_PLAYLIST_MANIFEST_SHA_RE.fullmatch(manifest_sha256)
+            else ""
+        ),
+        # Ledger invariants: these three flags are always false (§3.7.1/§6.1).
+        "audio_verified": False,
+        "production_ready": False,
+        "import_ready": False,
+    }
+
+
+def _manual_save_playlist_positions(job: object) -> list:
+    """§3.5 positions: manifest order, sanitized fields + fixed reason text."""
+    positions = getattr(job, "positions", ())
+    rows: list[dict] = []
+    if isinstance(positions, (tuple, list)):
+        for item in positions:
+            position = getattr(item, "position", None)
+            if (
+                type(position) is not int
+                or isinstance(position, bool)
+                or position < 1
+            ):
+                continue
+            source_id = getattr(item, "source_id", None)
+            state = getattr(item, "state", None)
+            reason = getattr(item, "reason", None)
+            safe_reason = (
+                reason
+                if type(reason) is str
+                and MANUAL_SAVE_PLAYLIST_REASON_RE.fullmatch(reason) is not None
+                else None
+            )
+            rows.append({
+                "position": position,
+                "source_id": (
+                    source_id
+                    if type(source_id) is str
+                    and MANUAL_SAVE_PLAYLIST_SOURCE_ID_RE.fullmatch(source_id) is not None
+                    else None
+                ),
+                "state": (
+                    state
+                    if type(state) is str
+                    and state in MANUAL_SAVE_PLAYLIST_POSITION_STATES
+                    else "unknown"
+                ),
+                "reason": safe_reason,
+                "reason_message": _manual_save_playlist_reason_message(safe_reason),
+                "cleanup_pending": getattr(item, "cleanup_pending", None) is True,
+            })
+    return rows
+
+
+def _manual_save_playlist_query_result(active: "_ManualSavePlaylistDeps",
+                                       actor_scope: str, job_id: str) -> dict:
+    job = active.service.get_job(actor_scope, job_id)
+    return _manual_save_playlist_result({
+        "job": _manual_save_playlist_job_summary(job),
+        "positions": _manual_save_playlist_positions(job),
+    })
+
+
+def _manual_save_playlist_cancel_result(active: "_ManualSavePlaylistDeps",
+                                        actor_scope: str, job_id: str) -> dict:
+    job = active.service.cancel_job(actor_scope, job_id)
+    return _manual_save_playlist_result({
+        "job": _manual_save_playlist_job_summary(job),
+    })
+
+
+def _manual_save_playlist_run_block(report: object) -> "dict | None":
+    """§3.6 run block: five statuses only, disposition fixed by the contract table."""
+    status = getattr(report, "status", None)
+    position = getattr(report, "position", None)
+    position_number = getattr(position, "position", None)
+    if (
+        type(position_number) is not int
+        or isinstance(position_number, bool)
+        or position_number < 1
+    ):
+        position_number = None
+    outcome = getattr(position, "outcome", None) if position_number is not None else None
+    if type(outcome) is not str or outcome not in MANUAL_SAVE_PLAYLIST_POSITION_STATES:
+        outcome = None
+    reason = getattr(position, "reason", None) if position_number is not None else None
+    if type(reason) is not str or MANUAL_SAVE_PLAYLIST_REASON_RE.fullmatch(reason) is None:
+        reason = None
+    if status == "completed":
+        disposition = getattr(report, "disposition", None)
+        if disposition not in (
+            manual_save_playlist_jobs.DISPOSITION_CONTINUE,
+            manual_save_playlist_jobs.DISPOSITION_ABORT,
+            manual_save_playlist_jobs.DISPOSITION_FREEZE,
+        ):
+            disposition = manual_save_playlist_jobs.DISPOSITION_FREEZE
+    elif status == "commit_unknown":
+        disposition = manual_save_playlist_jobs.DISPOSITION_FREEZE
+        outcome, reason = "commit_unknown", "commit_unknown"
+    elif status == "no_work":
+        # §3.6 table: no_work -> 200 + continue (refresh/recheck the job).
+        disposition = manual_save_playlist_jobs.DISPOSITION_CONTINUE
+        position_number, outcome, reason = None, None, None
+    elif status == "stale_completion":
+        disposition = manual_save_playlist_jobs.DISPOSITION_FREEZE
+    elif status == "completion_unknown":
+        disposition = manual_save_playlist_jobs.DISPOSITION_FREEZE
+        outcome, reason = "commit_unknown", "commit_unknown"
+    else:
+        return None
+    return {
+        "status": status,
+        "disposition": disposition,
+        "position": position_number,
+        "outcome": outcome,
+        "reason": reason,
+        # §3.6 detail gap (P5 item 6): the P4 executor returns only a
+        # SaveResult and never the raw route data, so P5 must not invent a
+        # detail payload from untrusted input. The field stays null until a
+        # later phase persists/reconstructs a sanitized detail from a fixed
+        # whitelist. Never echo the raw save_track response here.
+        "detail": None,
+    }
+
+
+def _manual_save_playlist_advance_result(active: "_ManualSavePlaylistDeps",
+                                         actor_scope: str, job_id: str) -> dict:
+    """One ``run_next`` attempt under the gateway lock, one track at most.
+
+    The lock is acquired inside the worker and **before** any ledger claim; a
+    lost race returns 409 ``busy`` without consuming a position (§7.1). The same
+    lock object is taken by the single-track worker, so the route's internal
+    save lock can no longer be contended inside this process.
+    """
+    if not MANUAL_SAVE_PLAYLIST_LOCK.acquire(blocking=False):
+        return _manual_save_playlist_error("busy")
+    try:
+        report = active.service.advance_once(actor_scope, job_id)
+        status = getattr(report, "status", None)
+        if status == "busy":
+            return _manual_save_playlist_error("busy")
+        if status == "playlist_disabled":
+            return _manual_save_playlist_error("playlist_disabled")
+        job = active.service.get_job(actor_scope, job_id)
+        run = _manual_save_playlist_run_block(report)
+        if run is None:
+            return _manual_save_playlist_error("internal")
+        data = {"run": run, "job": _manual_save_playlist_job_summary(job)}
+        if status in ("completed", "commit_unknown", "no_work"):
+            return _manual_save_playlist_result(data)
+        if status == "stale_completion":
+            return _manual_save_playlist_error("stale_completion", data)
+        return _manual_save_playlist_error("completion_unknown", data)
+    finally:
+        MANUAL_SAVE_PLAYLIST_LOCK.release()
+
+
+def _manual_save_playlist_loopback_target(base_url: object) -> "tuple[str, int]":
+    """§8.3: http + loopback host only, no userinfo/path/query/fragment."""
+    if (
+        type(base_url) is not str
+        or not base_url
+        or len(base_url) > MANUAL_SAVE_PLAYLIST_MAX_BASE_URL_CHARS
+        or any(character in base_url for character in (chr(0), chr(13), chr(10)))
+    ):
+        raise manual_save_playlist_jobs.ProducerError(
+            manual_save_playlist_jobs.PRODUCER_CONFIG_INVALID)
+    try:
+        parts = urlsplit(base_url)
+        port = parts.port if parts.port is not None else 80
+    except ValueError:
+        raise manual_save_playlist_jobs.ProducerError(
+            manual_save_playlist_jobs.PRODUCER_CONFIG_INVALID) from None
+    if (
+        parts.scheme != "http"
+        or parts.hostname not in MANUAL_SAVE_PLAYLIST_LOOPBACK_HOSTS
+        or parts.username is not None
+        or parts.password is not None
+        or parts.query
+        or parts.fragment
+        or parts.path not in ("", "/")
+    ):
+        raise manual_save_playlist_jobs.ProducerError(
+            manual_save_playlist_jobs.PRODUCER_NOT_LOOPBACK)
+    return parts.hostname, port
+
+
+def _manual_save_playlist_default_list_fetcher(timeout: float) -> object:
+    """GET musicbox ``/api/v1/user/playlists?limit=100`` over bounded loopback HTTP."""
+    host, port = _manual_save_playlist_loopback_target(
+        _manual_save_playlist_musicbox_url())
+    connection = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        try:
+            connection.request(
+                "GET",
+                "/api/v1/user/playlists?limit="
+                + str(MANUAL_SAVE_PLAYLIST_MAX_LIST_ROWS),
+            )
+            response = connection.getresponse()
+            status = response.status
+            body = response.read(MANUAL_SAVE_PLAYLIST_MAX_JSON_BYTES + 1)
+        except (socket.timeout, TimeoutError):
+            raise manual_save_playlist_jobs.ProducerError(
+                manual_save_playlist_jobs.PRODUCER_TIMEOUT) from None
+        except (OSError, http.client.HTTPException):
+            raise manual_save_playlist_jobs.ProducerError(
+                manual_save_playlist_jobs.PRODUCER_UNREACHABLE) from None
+    finally:
+        try:
+            connection.close()
+        except OSError:
+            pass
+    if len(body) > MANUAL_SAVE_PLAYLIST_MAX_JSON_BYTES:
+        raise manual_save_playlist_jobs.ProducerError(
+            manual_save_playlist_jobs.PRODUCER_RESPONSE_TOO_LARGE)
+    if status != 200:
+        raise manual_save_playlist_jobs.ProducerError(
+            manual_save_playlist_jobs.PRODUCER_HTTP_STATUS)
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (UnicodeError, ValueError):
+        raise manual_save_playlist_jobs.ProducerError(
+            manual_save_playlist_jobs.PRODUCER_MALFORMED_RESPONSE) from None
+
+
+def _manual_save_playlist_list_data(payload: object) -> dict:
+    """§3.2 list whitelist: rebuild rows field by field, drop everything else."""
+    if not isinstance(payload, Mapping):
+        raise manual_save_playlist_jobs.ServiceError("playlist_unavailable")
+    if payload.get("ok") is not True:
+        error = payload.get("error")
+        if error == "not_logged_in" or payload.get("logged_in") is False:
+            raise manual_save_playlist_jobs.ServiceError(
+                manual_save_playlist_jobs.NOT_LOGGED_IN)
+        raise manual_save_playlist_jobs.ServiceError("playlist_unavailable")
+    rows = payload.get("data")
+    if not isinstance(rows, list):
+        raise manual_save_playlist_jobs.ServiceError("playlist_unavailable")
+    account_uid = payload.get("account_uid")
+    if type(account_uid) is not int or isinstance(account_uid, bool) or account_uid < 0:
+        account_uid = 0
+    playlists: list[dict] = []
+    for row in rows:
+        if len(playlists) >= MANUAL_SAVE_PLAYLIST_MAX_LIST_ROWS:
+            break
+        if not isinstance(row, Mapping):
+            continue
+        playlist_id = row.get("playlist_id")
+        if (
+            type(playlist_id) is not int
+            or isinstance(playlist_id, bool)
+            or playlist_id <= 0
+        ):
+            continue
+        track_count = row.get("track_count")
+        if (
+            type(track_count) is not int
+            or isinstance(track_count, bool)
+            or track_count < 0
+        ):
+            continue
+        name = row.get("name")
+        if type(name) is not str:
+            name = ""
+        name = name[:MANUAL_SAVE_PLAYLIST_MAX_NAME_CHARS]
+        updated_at = row.get("updated_at")
+        if (
+            type(updated_at) is not int
+            or isinstance(updated_at, bool)
+            or updated_at < 0
+        ):
+            updated_at = 0
+        user_id = row.get("user_id")
+        if type(user_id) is not int or isinstance(user_id, bool):
+            user_id = 0
+        playlists.append({
+            "playlist_id": playlist_id,
+            "name": name,
+            "track_count": track_count,
+            "updated_at": updated_at,
+            "owned": account_uid > 0 and user_id == account_uid,
+        })
+    return {"account_uid": account_uid, "playlists": playlists}
+
+
+def _manual_save_playlist_list_result(fetcher, timeout: float) -> dict:
+    return _manual_save_playlist_result(_manual_save_playlist_list_data(fetcher(timeout)))
+
+
+def handle_manual_save_playlist_playlists(client: socket.socket, head_raw: bytes, *,
+                                          deps=None, engine=None,
+                                          list_fetcher=None, timeout=None) -> None:
+    """GET .../playlist/playlists: account playlist list (sanitized whitelist)."""
+    try:
+        parsed = _manual_save_playlist_get_head(
+            client, head_raw, targets=MANUAL_SAVE_PLAYLIST_PLAYLISTS_PATHS)
+        if parsed is None:
+            return
+        headers, _target = parsed
+        if _manual_save_playlist_actor_scope(head_raw, headers) is None:
+            _send_manual_save_playlist(
+                client, 403, _manual_save_playlist_error("forbidden"))
+            return
+        active, failed = _manual_save_playlist_gate(client, engine, deps)
+        if failed:
+            return
+        budget = (
+            MANUAL_SAVE_PLAYLIST_READ_TIMEOUT if timeout is None else timeout
+        )
+        fetcher = (
+            _manual_save_playlist_default_list_fetcher
+            if list_fetcher is None
+            else list_fetcher
+        )
+        _manual_save_playlist_run(
+            client,
+            lambda: _manual_save_playlist_list_result(fetcher, budget),
+            budget,
+        )
+    except OSError:
+        pass
+    finally:
+        _close_quietly(client)
+
+
+def handle_manual_save_playlist_snapshot(client: socket.socket, head_raw: bytes, *,
+                                         deps=None, engine=None,
+                                         timeout=None) -> None:
+    """GET .../playlist/snapshot?playlist_id=N: read-only precheck (§3.3)."""
+    try:
+        parsed = _manual_save_playlist_get_head(
+            client, head_raw,
+            targets=MANUAL_SAVE_PLAYLIST_SNAPSHOT_PATHS, allow_query=True)
+        if parsed is None:
+            return
+        headers, target = parsed
+        if _manual_save_playlist_actor_scope(head_raw, headers) is None:
+            _send_manual_save_playlist(
+                client, 403, _manual_save_playlist_error("forbidden"))
+            return
+        active, failed = _manual_save_playlist_gate(client, engine, deps)
+        if failed:
+            return
+        value, query_error = _manual_save_playlist_query_value(target, "playlist_id")
+        if query_error:
+            _send_manual_save_playlist(
+                client, 400, _manual_save_playlist_error(query_error))
+            return
+        playlist_id = _manual_save_playlist_parse_playlist_id(value)
+        if playlist_id is None:
+            _send_manual_save_playlist(
+                client, 400, _manual_save_playlist_error("invalid_playlist_id"))
+            return
+        budget = (
+            MANUAL_SAVE_PLAYLIST_READ_TIMEOUT if timeout is None else timeout
+        )
+        _manual_save_playlist_run(
+            client,
+            lambda: _manual_save_playlist_snapshot_result(active, playlist_id),
+            budget,
+        )
+    except OSError:
+        pass
+    finally:
+        _close_quietly(client)
+
+
+def handle_manual_save_playlist_create(client: socket.socket, head_raw: bytes, *,
+                                       deps=None, engine=None,
+                                       timeout=None) -> None:
+    """POST .../playlist/jobs: bind fingerprint, build manifest, create job (§3.4)."""
+    try:
+        parsed = _manual_save_playlist_post_head(
+            client, head_raw, targets=MANUAL_SAVE_PLAYLIST_JOBS_PATHS)
+        if parsed is None:
+            return
+        headers, rest = parsed
+        actor_scope = _manual_save_playlist_actor_scope(head_raw, headers)
+        if actor_scope is None:
+            _send_manual_save_playlist(
+                client, 403, _manual_save_playlist_error("forbidden"))
+            return
+        active, failed = _manual_save_playlist_gate(client, engine, deps)
+        if failed:
+            return
+        request = _manual_save_playlist_json_request(client, headers, rest)
+        if request is None:
+            return
+        parsed_request, request_error = _manual_save_playlist_create_request(request)
+        if request_error:
+            _send_manual_save_playlist(
+                client,
+                _manual_save_playlist_http_status(request_error, False),
+                _manual_save_playlist_error(request_error),
+            )
+            return
+        playlist_id, fingerprint, idempotency_key = parsed_request
+        budget = (
+            MANUAL_SAVE_PLAYLIST_READ_TIMEOUT if timeout is None else timeout
+        )
+        _manual_save_playlist_run(
+            client,
+            lambda: _manual_save_playlist_create_result(
+                active, actor_scope, playlist_id, fingerprint, idempotency_key),
+            budget,
+        )
+    except OSError:
+        pass
+    finally:
+        _close_quietly(client)
+
+
+def handle_manual_save_playlist_job(client: socket.socket, head_raw: bytes, *,
+                                    deps=None, engine=None, timeout=None) -> None:
+    """GET .../playlist/job?job_id=<48hex>: job summary + position list (§3.5)."""
+    try:
+        parsed = _manual_save_playlist_get_head(
+            client, head_raw,
+            targets=MANUAL_SAVE_PLAYLIST_JOB_PATHS, allow_query=True)
+        if parsed is None:
+            return
+        headers, target = parsed
+        scope = _manual_save_playlist_actor_scope(head_raw, headers)
+        if scope is None:
+            _send_manual_save_playlist(
+                client, 403, _manual_save_playlist_error("forbidden"))
+            return
+        active, failed = _manual_save_playlist_gate(client, engine, deps)
+        if failed:
+            return
+        value, query_error = _manual_save_playlist_query_value(target, "job_id")
+        if query_error:
+            _send_manual_save_playlist(
+                client, 400, _manual_save_playlist_error(query_error))
+            return
+        job_id = _manual_save_playlist_parse_job_id(value)
+        if job_id is None:
+            # §3.5: malformed/unknown/other-scope ids share the fixed not_found.
+            _send_manual_save_playlist(
+                client, 404, _manual_save_playlist_error("not_found"))
+            return
+        budget = (
+            MANUAL_SAVE_PLAYLIST_QUERY_TIMEOUT if timeout is None else timeout
+        )
+        _manual_save_playlist_run(
+            client,
+            lambda: _manual_save_playlist_query_result(active, scope, job_id),
+            budget,
+        )
+    except OSError:
+        pass
+    finally:
+        _close_quietly(client)
+
+
+def handle_manual_save_playlist_advance(client: socket.socket, head_raw: bytes, *,
+                                        deps=None, engine=None,
+                                        timeout=None) -> None:
+    """POST .../playlist/advance: exactly one position attempt per request (§3.6)."""
+    try:
+        parsed = _manual_save_playlist_post_head(
+            client, head_raw, targets=MANUAL_SAVE_PLAYLIST_ADVANCE_PATHS)
+        if parsed is None:
+            return
+        headers, rest = parsed
+        actor_scope = _manual_save_playlist_actor_scope(head_raw, headers)
+        if actor_scope is None:
+            _send_manual_save_playlist(
+                client, 403, _manual_save_playlist_error("forbidden"))
+            return
+        active, failed = _manual_save_playlist_gate(client, engine, deps)
+        if failed:
+            return
+        request = _manual_save_playlist_json_request(client, headers, rest)
+        if request is None:
+            return
+        job_id, request_error = _manual_save_playlist_job_id_request(request)
+        if request_error:
+            _send_manual_save_playlist(
+                client,
+                _manual_save_playlist_http_status(request_error, False),
+                _manual_save_playlist_error(request_error),
+            )
+            return
+        budget = (
+            MANUAL_SAVE_PLAYLIST_TIMEOUT if timeout is None else timeout
+        )
+        _manual_save_playlist_run(
+            client,
+            lambda: _manual_save_playlist_advance_result(
+                active, actor_scope, job_id),
+            budget,
+        )
+    except OSError:
+        pass
+    finally:
+        _close_quietly(client)
+
+
+def handle_manual_save_playlist_cancel(client: socket.socket, head_raw: bytes, *,
+                                       deps=None, engine=None,
+                                       timeout=None) -> None:
+    """POST .../playlist/cancel: request cancellation (idempotent, no lock, §3.7)."""
+    try:
+        parsed = _manual_save_playlist_post_head(
+            client, head_raw, targets=MANUAL_SAVE_PLAYLIST_CANCEL_PATHS)
+        if parsed is None:
+            return
+        headers, rest = parsed
+        actor_scope = _manual_save_playlist_actor_scope(head_raw, headers)
+        if actor_scope is None:
+            _send_manual_save_playlist(
+                client, 403, _manual_save_playlist_error("forbidden"))
+            return
+        active, failed = _manual_save_playlist_gate(client, engine, deps)
+        if failed:
+            return
+        request = _manual_save_playlist_json_request(client, headers, rest)
+        if request is None:
+            return
+        job_id, request_error = _manual_save_playlist_job_id_request(request)
+        if request_error:
+            _send_manual_save_playlist(
+                client,
+                _manual_save_playlist_http_status(request_error, False),
+                _manual_save_playlist_error(request_error),
+            )
+            return
+        budget = (
+            MANUAL_SAVE_PLAYLIST_QUERY_TIMEOUT if timeout is None else timeout
+        )
+        _manual_save_playlist_run(
+            client,
+            lambda: _manual_save_playlist_cancel_result(
+                active, actor_scope, job_id),
+            budget,
+        )
+    except OSError:
+        pass
+    finally:
+        _close_quietly(client)
+
+
+_MANUAL_SAVE_PLAYLIST_ROUTES = (
+    ("playlists", "GET", MANUAL_SAVE_PLAYLIST_PLAYLISTS_PATHS),
+    ("snapshot", "GET", MANUAL_SAVE_PLAYLIST_SNAPSHOT_PATHS),
+    ("create", "POST", MANUAL_SAVE_PLAYLIST_JOBS_PATHS),
+    ("job", "GET", MANUAL_SAVE_PLAYLIST_JOB_PATHS),
+    ("advance", "POST", MANUAL_SAVE_PLAYLIST_ADVANCE_PATHS),
+    ("cancel", "POST", MANUAL_SAVE_PLAYLIST_CANCEL_PATHS),
+)
+_MANUAL_SAVE_PLAYLIST_HANDLERS = {
+    "playlists": handle_manual_save_playlist_playlists,
+    "snapshot": handle_manual_save_playlist_snapshot,
+    "create": handle_manual_save_playlist_create,
+    "job": handle_manual_save_playlist_job,
+    "advance": handle_manual_save_playlist_advance,
+    "cancel": handle_manual_save_playlist_cancel,
+}
+
+
+def _manual_save_playlist_request_kind(head_raw: bytes) -> "str | None":
+    """Exact target+method match for the six playlist endpoints.
+
+    A method mismatch never enters the new handlers: it falls through to the
+    forwarding path and the WebUI's 501 (contract §3.0 / §3.8 behaviour).
+    """
+    pair = _request_method_and_target(head_raw)
+    if pair is None:
+        return None
+    method, target = pair
+    path = target.partition("?")[0]
+    for kind, expected_method, paths in _MANUAL_SAVE_PLAYLIST_ROUTES:
+        if method == expected_method and path in paths:
+            return kind
+    return None
+
+
+def handle_manual_save_playlist(client: socket.socket, head_raw: bytes,
+                                kind: str) -> None:
+    """Dispatch one already-identified playlist request to its fixed handler."""
+    handler = _MANUAL_SAVE_PLAYLIST_HANDLERS.get(kind)
+    if handler is None:
+        _send_manual_save_playlist(
+            client, 400, _manual_save_playlist_error("invalid_request"))
+        return
+    handler(client, head_raw)
 
 
 def _channel_policy(environ: "Mapping[str, str] | None" = None) -> "tuple[frozenset[int], int]":
@@ -1315,6 +2780,14 @@ def _handle(client: socket.socket, upstream: tuple[str, int],
         return
     if _is_manual_save_search_request(head_raw):
         handle_manual_save_search(client, head_raw)
+        return
+    # Playlist save endpoints (contract §3) are matched before `_validate_head`
+    # exactly like the other local privileged handlers above: an ambiguous head
+    # is rejected by this handler's own strict parse with its documented fixed
+    # responses, before any body, ledger, engine, or upstream work.
+    playlist_kind = _manual_save_playlist_request_kind(head_raw)
+    if playlist_kind is not None:
+        handle_manual_save_playlist(client, head_raw, playlist_kind)
         return
     client.settimeout(None)
     if _is_host_file_request(head_raw):
