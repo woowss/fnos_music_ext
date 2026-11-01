@@ -135,6 +135,34 @@ def test_export_source_env_from_env_file(tmp_path):
                      "kw,kg", "kugou,netease"]
 
 
+def test_export_source_env_exports_playlist_manifest_readonly(tmp_path):
+    """整歌单快照只读开关必须从 /repo/.env 导出到进程环境。
+
+    [program:musicbox] 没有 environment=，只写 .env 不会进入 musicbox 进程；
+    P3 只读观察依赖 export_source_env() 把它导出，且不得覆盖已存在的环境变量。
+    """
+    env_file = tmp_path / ".env"
+    env_file.write_text("FNMUSIC_PLAYLIST_MANIFEST_READONLY=true\n", encoding="utf-8")
+    lib = CONTAINER_DIR / "env_flag.sh"
+    script = f'. "{lib}"; export_source_env; printenv FNMUSIC_PLAYLIST_MANIFEST_READONLY\n'
+    out = subprocess.run(
+        ["sh", "-c", script], capture_output=True, text=True,
+        env={"PATH": os.environ["PATH"], "FNMUSIC_ENV_FILE": str(env_file)}, timeout=15,
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "true"
+
+    # 已存在的进程环境变量优先，不被 .env 覆盖。
+    script_env_first = f'. "{lib}"; export_source_env; printenv FNMUSIC_PLAYLIST_MANIFEST_READONLY\n'
+    out_env_first = subprocess.run(
+        ["sh", "-c", script_env_first], capture_output=True, text=True,
+        env={"PATH": os.environ["PATH"], "FNMUSIC_ENV_FILE": str(env_file),
+             "FNMUSIC_PLAYLIST_MANIFEST_READONLY": "false"}, timeout=15,
+    )
+    assert out_env_first.returncode == 0, out_env_first.stderr
+    assert out_env_first.stdout.strip() == "false"
+
+
 # ---------------------------------------------------------------- entrypoint.sh
 
 class FakeSupervisor:

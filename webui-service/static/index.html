@@ -296,6 +296,31 @@
           <p class="hint" id="save-result" role="status" aria-live="polite"></p>
           <div class="stack" id="save-results"></div>
         </div>
+        <div class="card">
+          <div class="card-title">手动保存歌单</div>
+          <p class="hint" id="playlist-status" role="status">正在读取整歌单保存状态…</p>
+          <p class="hint">整歌单保存按「一首一次请求」逐首推进，进度记录在任务账本中；刷新页面后可继续。保存只写入新文件，同名文件不会被覆盖。最多显示 100 张歌单。</p>
+          <div class="btn-row">
+            <select class="input grow" id="playlist-select" aria-label="选择歌单"></select>
+            <button class="btn" id="playlist-refresh-btn" type="button">刷新列表</button>
+          </div>
+          <div class="btn-row">
+            <button class="btn" id="playlist-snapshot-btn" type="button">读取清单</button>
+            <button class="btn primary" id="playlist-start-btn" type="button">开始保存</button>
+          </div>
+          <p class="hint" id="playlist-snapshot-status" role="status" aria-live="polite"></p>
+          <div id="playlist-job-panel" hidden>
+            <p class="hint" id="playlist-job-state" role="status"></p>
+            <p class="hint" id="playlist-progress" role="status" aria-live="polite"></p>
+            <p class="hint" id="playlist-run-message" role="status" aria-live="polite"></p>
+            <p class="hint" id="playlist-reconcile-banner" role="alert" hidden></p>
+            <div class="btn-row">
+              <button class="btn" id="playlist-stop-btn" type="button">停止推进</button>
+              <button class="btn" id="playlist-cancel-btn" type="button">取消任务</button>
+            </div>
+            <div class="stack" id="playlist-positions"></div>
+          </div>
+        </div>
       </section>
 
       <!-- LLM -->

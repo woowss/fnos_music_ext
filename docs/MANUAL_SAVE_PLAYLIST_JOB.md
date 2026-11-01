@@ -1224,15 +1224,18 @@ fnmusic-manual-save-playlist code=<固定码> job=<job_id> position=<int> state=
 | P2 快照 producer | ✅ 完成（默认关闭） | `musicbox-service/netease_playlist_snapshot.py`、`proxy/tests/test_musicbox_playlist_snapshot.py`、`musicbox-service/app.py` 只读端点、`requirements.txt` 钉 `==0.5.3`、`docs/NETEASE_DELIVERY_EVIDENCE.md` | 新增 41 例；开关与保存开关解耦 |
 | P4 适配层 | ✅ 完成（零生产接线） | `proxy/manual_save_playlist_jobs.py`、`proxy/tests/test_manual_save_playlist_jobs.py` | 207 例 |
 | P3 只读 artifact 观察 | ⏳ 待用户授权 + 维护窗口 | — | 需真实 NAS 只读观察（§4.7） |
-| P5 网关 6 端点 | ⏳ 待实现 | — | 依赖 P3 PASS + P4 |
-| P6 管理页入口 | ⏳ 待实现 | — | 依赖 P5 |
+| P5 网关 6 端点 | ✅ 完成（离线） | `proxy/webui_gateway.py`（+1478）、`proxy/tests/test_manual_save_playlist_gateway.py` | 独立审查 PASS；7 套 1029/2（新 196） |
+| P6 管理页入口 | ✅ 完成（前端离线） | `webui-service/static/{index.html,app.js}` + `webui-service/test_app_js.js` | node 135/135（既有 102 + 新增 33）；未联调真实浏览器 |
 | P7 真实整歌单验收 | ⏳ 待用户同意写库 | — | 依赖 P5/P6 |
 
 **审查记录**
 
 - **合同审查（P0）：FAIL → 已修订本版**。3 个 P0：① 流程前置缺失（实现先于 P0 结论落地）→ §12.4 已写明 P0 为严格前置并记录本轮补救方式；② artifact 校验接口未定义（网关不可能做进程内版本检查）→ §4.1 第 2 条 / §3.4 步骤 5 改为"版本断言在 producer，网关只按 `artifact_error_code` 映射"；③ P3 只读开关不可达（producer 依赖保存开关，与"保存侧全关"互斥）→ §4.2 明确解耦 + 取值来源。
 - **实现审查（P1/P2/P4）：FAIL → 已回改**。P0：producer 失败信封 `ok` 语义与 consumer 不兼容 → §4.2 明确"观测 payload `ok` 恒 true，仅 503 关闭为 false"；P1：P3 开关互斥（同上）、HTTP seam 跟随重定向（改为禁用/校验最终 URL）、非 complete 状态映射（按 §3.3 分流）；P2：`::1`/http-only、响应体 ≤1 MiB、§5.2 row16 勘误、reason 文案别名、`n=1001` 请求参数断言。
-- **P5 必补清单**（继承自两份审查，缺一不可）：
+- **P5 网关审查：PASS**（`dd45943`；6 端点 + §14 十项全部落地，见下方逐条）。
+- **P6 前端审查（增量）：PASS**（无 P0/P1，4×P2）。其中 2 条有实际影响的 P2 已修：`commit_unknown` 从"失败"桶拆出为"结果未知"；状态刷新网络失败时清空旧任务面板（`playlistRenderJob` 无 job 分支同时清 `#playlist-positions`），并各补 1 条 node 回归用例。其余 P2（`source_error_code` 双重转义、无本地 reason 回退、`container/test_container.py` 本机缺 PyYAML 不可收集）记为已知限制。
+- **部署前置（仓库内已做）**：`container/env_flag.sh` 的 `export_source_env()` 已把 `FNMUSIC_PLAYLIST_MANIFEST_READONLY` 加入导出键列表（`entrypoint.sh` 在 supervisord 之前调用），因此 P3 只需在 `.env` 写入该键即可让 musicbox 进程看到它；`container/test_container.py` 新增对应测试，但本机 venv 缺 PyYAML 无法收集运行（**不得记为绿**），P3 需在容器内 `printenv FNMUSIC_PLAYLIST_MANIFEST_READONLY` 实测。
+- **P5 十项必补（已全部落地，逐条）**：
   1. §4.3.1 的 **7 项**网关复核（5 条结构 + provider/schema 固定值 + 计数一致且不静默修复）；
   2. §3.4 步骤 5 的网关 artifact 复核（`source_artifact.version=="0.5.3"`、`dist_info_present==true`、`artifact_error_code` 为空；P4 目前只在 unsupported 分支用 `artifact_error_code`，complete 分支未查 `source_artifact`）；
   3. §3.9.1 固定码与 HTTP 表（含 `playlist_unsupported`/`source_changed`/`playlist_too_large`/`not_logged_in`/`playlist_unavailable`/`source_artifact_mismatch`）与 §3.9.2 `source_error_code` 白名单（未知一律丢弃为 `""`）；
@@ -1243,6 +1246,8 @@ fnmusic-manual-save-playlist code=<固定码> job=<job_id> position=<int> state=
   8. advance 的**五类** run status（`completed`/`commit_unknown`/`no_work`/`stale_completion`/`completion_unknown`）HTTP 映射——P4 的 `_advance_report` 对 `no_work`/`stale_completion` 的 disposition 仍为 `None`，须按 §3.6 表补 `continue`/`freeze`；
   9. gateway 契约测试文件 `proxy/tests/test_manual_save_playlist_gateway.py`；
   10. 部署侧导出键（见下）。
+- **P3 只读观察**：⏳ 待用户授权 + 维护窗口。
+- **P7 真实整歌单验收**：⏳ 待用户同意写库 + 选定测试歌单。
 - **环境变量落盘限制（本轮实测）**：`.env.example` 在 DSH 工具层属于凭据围栏路径（`.env*`），任何文件工具读写均被拒绝，因此本轮的 `.env.example` 增补未被执行。**必须由操作者在外部编辑器补入**，或在 P5 用不含凭据的示例文档替代。
   需补的三个键（按 `.env.example` 既有注释风格）：
   ```dotenv
