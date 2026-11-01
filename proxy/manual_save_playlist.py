@@ -159,7 +159,6 @@ _TEXT_LIMITS = {
     "format": 255,
     "quality_requested": 120,
     "quality_actual": 120,
-    "message": 120,
 }
 
 __all__ = [
@@ -407,11 +406,7 @@ def _normalize_result(
         item["message"] = _MESSAGES["conflict"]
         _copy_success_fields(item, data, published=False)
         return item
-    raw_message = result.get("message")
-    if type(raw_message) is str:
-        message = raw_message[: _TEXT_LIMITS["message"]]
-    else:
-        message = _MESSAGES.get(code, _ITEM_FALLBACK_MESSAGE)
+    message = _MESSAGES.get(code, _ITEM_FALLBACK_MESSAGE)
     return _failed_item(
         position, song_id, duplicate_of_position, code, message
     )

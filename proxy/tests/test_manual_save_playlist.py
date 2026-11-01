@@ -492,7 +492,7 @@ def test_executor_data_is_whitelisted_and_normalized():
     fourth = items[3]
     assert fourth["status"] == "failed"
     assert fourth["code"] == "download_failed"
-    assert fourth["message"] == "M" * 120
+    assert fourth["message"] == playlist._MESSAGES["download_failed"]
     assert fourth["title"] == ""
     assert fourth["published_size"] == 0
 
@@ -649,6 +649,82 @@ def test_continue_codes_do_not_stop_later_positions(code):
     ]
     assert data["items"][0]["code"] == code
     assert executor.calls == [1, 2, 3]
+
+
+@pytest.mark.parametrize(
+    "code", sorted(playlist.PLAYLIST_CONTINUE_CODES | playlist.PLAYLIST_ABORT_CODES)
+)
+def test_executor_failure_messages_are_fixed_for_all_failure_codes(code):
+    sensitive_values = (
+        "https://signed.example.com/audio?token=secret-token",
+        "Cookie: session=secret-cookie",
+        "/vol1/private/music",
+        "RuntimeError: secret-exception",
+    )
+    injected_message = " | ".join(sensitive_values)
+
+    def result(song_id):
+        if song_id == 1:
+            if code == "conflict":
+                envelope = _conflict(1)
+                envelope["message"] = injected_message
+                return envelope
+            return _route_failure(code, message=injected_message)
+        return _published(song_id)
+
+    executor = _Executor(result)
+    envelope = playlist.save_playlist([1, 2, 3], save_one=executor)
+    first = envelope["data"]["items"][0]
+
+    assert first["code"] == code
+    assert first["message"] == playlist._MESSAGES.get(
+        code, playlist._ITEM_FALLBACK_MESSAGE
+    )
+    if code in playlist.PLAYLIST_CONTINUE_CODES:
+        assert executor.calls == [1, 2, 3]
+        assert first["status"] == ("conflict" if code == "conflict" else "failed")
+        assert [item["status"] for item in envelope["data"]["items"]] == [
+            first["status"], "published", "published"
+        ]
+    else:
+        assert executor.calls == [1]
+        assert first["status"] == "failed"
+        assert [item["status"] for item in envelope["data"]["items"]] == [
+            "failed", "not_executed", "not_executed"
+        ]
+
+    rendered = json.dumps(envelope, ensure_ascii=False)
+    for sensitive_value in sensitive_values:
+        assert sensitive_value not in rendered
+
+
+@pytest.mark.parametrize("code", ["download_failed", "disabled"])
+@pytest.mark.parametrize("message", [None, 123, {"detail": "private"}])
+def test_executor_failure_missing_or_non_string_message_uses_fixed_text(code, message):
+    def result(song_id):
+        if song_id > 1 and code in playlist.PLAYLIST_CONTINUE_CODES:
+            return _published(song_id)
+        failure = _route_failure(code)
+        if message is None:
+            failure.pop("message")
+        else:
+            failure["message"] = message
+        return failure
+
+    executor = _Executor(result)
+    envelope = playlist.save_playlist([1, 2], save_one=executor)
+    first = envelope["data"]["items"][0]
+
+    assert first["status"] == "failed"
+    assert first["code"] == code
+    assert first["message"] == playlist._MESSAGES[code]
+    if code in playlist.PLAYLIST_ABORT_CODES:
+        assert executor.calls == [1]
+        assert envelope["data"]["items"][1]["status"] == "not_executed"
+    else:
+        assert executor.calls == [1, 2]
+        assert envelope["data"]["items"][1]["status"] == "published"
+    assert "private" not in json.dumps(envelope, ensure_ascii=False)
 
 
 @pytest.mark.parametrize("code", sorted(playlist.PLAYLIST_ABORT_CODES))

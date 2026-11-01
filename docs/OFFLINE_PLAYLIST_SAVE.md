@@ -177,7 +177,7 @@ item 状态与固定字段：
 |---|---|---|---|
 | `published` | `ok` | `""` | 执行器 `data` 白名单复制 |
 | `conflict` | `conflict` | `目标文件已存在` | 白名单复制（`published_*` 强制 0/`""`） |
-| `failed` | route 失败码或 `internal` | 执行器 message（str 截断 120 字符）否则本地固定中文 | 空 |
+| `failed` | route 失败码或 `internal` | 按错误码选择的本地固定中文；忽略执行器 message | 空 |
 | `skipped` | `invalid_song_id` | 本地固定中文 | 空 |
 | `not_executed` | `not_executed` | `未执行` | 空 |
 
@@ -200,11 +200,14 @@ item 状态与固定字段：
 - `lyric_status` ∈ `published|unavailable|error|conflict|not_attempted|unknown`，
   白名单复制，其它 `not_attempted`。
 - 未白名单键（`signed_url`/`cookie`/`target_dir`/`tagged` 等）全部丢弃；
-  结果保证 `json.dumps` 成功，且不含 `https://`、cookie、原始异常文本。
+  结果保证 `json.dumps` 成功。失败项的 `message` 只取本模块错误码文案表，
+  不复制执行器文本；成功/冲突项经 `_copy_success_fields` 白名单复制的短文本
+  字段（`title`/`artist`/`basename`/`format`/`quality_*`）只按长度上限截断、
+  不校验内容，执行器回填非常规文本时会原样保留。
 
 ## 8. 测试覆盖映射
 
-新增 `proxy/tests/test_manual_save_playlist.py`（97 用例）：编排层用 fake `save_one`，
+新增 `proxy/tests/test_manual_save_playlist.py`（120 用例）：编排层用 fake `save_one`，
 集成层用真实 `route.save_track` + 全注入 `SaveDeps` fake（禁真实网络/真实 store）。
 
 | 关键实现 | 覆盖用例 |
@@ -212,6 +215,7 @@ item 状态与固定字段：
 | `_validate_inputs`（§3 全部输入分支） | `test_empty_playlist_is_invalid_request`、`test_non_sequence_input_is_invalid_request`、`test_invalid_song_id_entries_reject_whole_call`、`test_over_max_tracks_rejected`、`test_exactly_max_tracks_accepted`、`test_invalid_start_position_rejected`、`test_invalid_budget_rejected`、`test_invalid_now_or_cancelled_rejected` |
 | `_finalize`（信封/status/next_position/counts） | `test_all_published_completes_ok`、`test_counts_and_positions_invariants`、`test_item_field_set_is_exact` |
 | `_normalize_result` + `_copy_success_fields` | `test_executor_data_is_whitelisted_and_normalized`、`test_executor_malformed_results_abort_as_internal` |
+| 失败消息固定化 | `test_executor_failure_messages_are_fixed_for_all_failure_codes`（17 码参数化，断言敏感文本不出现）、`test_executor_failure_missing_or_non_string_message_uses_fixed_text` |
 | 失败分类/中止 | `test_continue_codes_do_not_stop_later_positions`（11 码参数化）、`test_abort_codes_stop_dispatch`（6 码参数化）、`test_executor_exception_aborts_as_internal`、`test_conflict_continues_and_is_reported` |
 | `_duplicate_link` / `None` 跳过 | `test_duplicate_positions_are_all_executed_and_linked`、`test_none_positions_are_skipped_without_executor_calls` |
 | `_run` 取消逻辑 | `test_cancelled_before_first_position_executes_nothing`、`test_cancelled_between_positions_marks_remainder_not_executed`、`test_cancelled_check_error_counts_as_cancelled` |
@@ -253,16 +257,16 @@ cd webui-service && node test_app_js.js
 
 ```bash
 PYTHONUTF8=1 <py> -m pytest proxy/tests/test_manual_save_playlist.py -q
-# 97 passed
+# 120 passed
 
-# 四件套 + 新引擎（合并计数 = 455 + 97）
+# 四件套 + 新引擎（合并计数 = 465 + 120）
 PYTHONUTF8=1 <py> -m pytest \
   proxy/tests/test_manual_save_route.py \
   proxy/tests/test_manual_save_gateway.py \
   proxy/tests/test_manual_save_delivery_guard.py \
   proxy/tests/test_manual_save_metadata.py \
   proxy/tests/test_manual_save_playlist.py -q
-# 552 passed, 2 skipped
+# 585 passed, 2 skipped
 ```
 
 工作区状态（本轮交付）：
@@ -293,6 +297,6 @@ PYTHONUTF8=1 <py> -m pytest \
 - **时钟异常**：注入的 `now` 在批次开始前抛异常 → 全部 `not_executed`、
   `stop_reason="internal"`、`ok=False`；循环中抛异常同样按 `internal` 中止。
   默认 `time.monotonic` 不受影响。
-- **`message` 截断**：严格执行器 message 的 120 字符截断（契约要求）；执行器自身
-  若回显敏感文本，本模块不做二次脱敏，因此生产执行器必须保持 route 的固定文案
-  （`save_track` 已满足）。
+- **失败消息固定化**：失败 item 的 `message` 只从本模块的错误码文案表生成，忽略
+  执行器返回的 message，避免 URL、cookie、路径或原始异常文本经该字段进入批次结果。
+  成功/冲突项的白名单短文本字段仍由执行器提供（见 §7），本模块只做长度上限。

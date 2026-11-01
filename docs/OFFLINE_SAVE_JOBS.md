@@ -66,3 +66,5 @@ py -B -m unittest discover -s offline_tests -p test_manual_save_core.py -v
 ```
 
 这些测试验证本地 SQLite 状态转换和账本并发约束；不证明文件系统媒体发布、音频解码/转换、外部 worker 生命周期、断电持久性、生产接入或导入完成。
+
+`test_subprocess_crash_after_side_effect_requires_explicit_reconciliation` 还会在临时目录和 SQLite 数据库中启动子进程。子进程领取第一个位置、写入代表外部副作用的本地标记，然后在账本记录完成前异常退出。父进程确认子进程退出后重新打开账本，检查该位置仍为 `running`、后续位置仍为 `queued`，且再次派发不会执行执行器。显式恢复后，前一位置变为 `commit_unknown`、任务进入 `reconciliation_required`，后续派发被冻结；再次打开账本时 `audio_verified=false`、`production_ready=false`、`import_ready=false` 仍成立。这只模拟进程退出，不模拟断电、存储硬件故障、NAS 文件系统行为或实际媒体发布。

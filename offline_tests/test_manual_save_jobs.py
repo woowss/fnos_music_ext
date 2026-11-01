@@ -572,6 +572,100 @@ class ManualSaveJobsTests(unittest.TestCase):
             self.ledger.recover_stale_running("actor-A", created.job_id, worker_stopped=False)
         self.assertEqual(caught.exception.code, "worker_stopped_assertion_required")
 
+    def test_subprocess_crash_after_side_effect_requires_explicit_reconciliation(self):
+        crash_manifest = manifest(entries=[
+            {"position": 1, "source_id": "song-1", "source_status": "ok"},
+            {"position": 2, "source_id": "song-2", "source_status": "ok"},
+        ])
+        created = self.ledger.create_job("actor-A", "process-crash", crash_manifest)
+        marker_path = Path(self.temp_dir.name) / "published-marker.txt"
+        repo_root = Path(__file__).resolve().parents[1]
+        child_source = r"""
+import os
+import sys
+from pathlib import Path
+from proxy import manual_save_jobs
+
+database_path, job_id, marker_path = sys.argv[1:]
+ledger = manual_save_jobs.ManualSaveJobsLedger(database_path)
+
+def publish_then_crash(position, _cancellation_check):
+    with Path(marker_path).open("x", encoding="utf-8") as marker:
+        marker.write(str(position.position))
+        marker.flush()
+        os.fsync(marker.fileno())
+    os._exit(73)
+
+ledger.run_next("actor-A", job_id, publish_then_crash)
+raise SystemExit(74)
+"""
+
+        child = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                child_source,
+                self.database_path,
+                created.job_id,
+                str(marker_path),
+            ],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        self.assertEqual(child.returncode, 73, msg=child.stderr)
+        self.assertEqual(marker_path.read_text(encoding="utf-8"), "1")
+
+        reopened = self.new_ledger()
+        snapshot = reopened.get_job("actor-A", created.job_id)
+        self.assertEqual([position.state for position in snapshot.positions], ["running", "queued"])
+        self.assertEqual(snapshot.state, "running")
+        self.assertFalse(snapshot.audio_verified)
+        self.assertFalse(snapshot.production_ready)
+        self.assertFalse(snapshot.import_ready)
+
+        accidental_executions = []
+        no_work = reopened.run_next(
+            "actor-A",
+            created.job_id,
+            lambda position, _cancel: accidental_executions.append(position.position) or published_result(),
+        )
+        self.assertEqual(no_work.status, "no_work")
+        self.assertEqual(accidental_executions, [])
+        self.assertEqual(marker_path.read_text(encoding="utf-8"), "1")
+
+        # subprocess.run returned only after the child exited, so the caller can
+        # now make the explicit worker-stopped assertion required by the API.
+        recovered = reopened.recover_stale_running(
+            "actor-A", created.job_id, worker_stopped=True,
+        )
+        self.assertEqual([position.state for position in recovered.positions], ["commit_unknown", "queued"])
+        self.assertEqual(recovered.positions[0].reason, "commit_unknown")
+        self.assertTrue(recovered.positions[0].cleanup_pending)
+        self.assertEqual(recovered.state, "reconciliation_required")
+        self.assertFalse(recovered.audio_verified)
+        self.assertFalse(recovered.production_ready)
+        self.assertFalse(recovered.import_ready)
+
+        no_work_after_recovery = reopened.run_next(
+            "actor-A",
+            created.job_id,
+            lambda position, _cancel: accidental_executions.append(position.position) or published_result(),
+        )
+        self.assertEqual(no_work_after_recovery.status, "no_work")
+        self.assertEqual(accidental_executions, [])
+        self.assertEqual(marker_path.read_text(encoding="utf-8"), "1")
+
+        final = self.new_ledger().get_job("actor-A", created.job_id)
+        self.assertEqual([position.state for position in final.positions], ["commit_unknown", "queued"])
+        self.assertEqual(final.state, "reconciliation_required")
+        self.assertFalse(final.audio_verified)
+        self.assertFalse(final.production_ready)
+        self.assertFalse(final.import_ready)
+        self.assertEqual(marker_path.read_text(encoding="utf-8"), "1")
+
     def test_cancel_before_claim_during_execution_and_after_publish_preserves_result(self):
         before = self.ledger.create_job("actor-A", "cancel-before", manifest())
         cancelled = self.ledger.cancel_job("actor-A", before.job_id)
