@@ -1,6 +1,8 @@
 # 离线保存任务账本
 
-> 合同：`FNMEXT-OFFLINE-SAVE-JOBS-20261024-01`。这是纯离线 SQLite 任务记录与显式同步派发组件；它不接入现有保存、下载、导入或管理页流程，也不代表媒体已保存、已转换、可播放或已入库。
+> 合同：`FNMEXT-OFFLINE-SAVE-JOBS-20261024-02`。这是纯离线 SQLite 任务记录与显式同步派发组件；它不接入现有保存、下载、导入或管理页流程，也不代表媒体已保存、已转换、可播放或已入库。
+>
+> 2026-11-01 修订（-02）：`rejected`/`failed` 的 `reason` 固定白名单扩展到管理页保存路由的失败码（10 个 CONTINUE 拒绝码 + `disabled`/`config_invalid`/`busy` 三个中止码），依据 `docs/MANUAL_SAVE_PLAYLIST_JOB.md` §5.5。**只扩展字符串白名单，不改 DB schema/表结构**；旧库旧行继续合法，重开校验通过；未知 reason 仍 fail-closed（执行器返回 → `commit_unknown`）。
 
 ## 范围与信任边界
 
@@ -49,6 +51,8 @@
 `get_job` 返回的 manifest 是从数据库重新解码出的副本；修改输入字典或返回快照不会改变已存记录。汇总计数从位置行派生，计数总和等于位置总数。`partial`、`completed_with_issues` 与 `reconciliation_required` 不表示整项任务成功；`completed_bytes_reported` 只表示所有执行器都报告了字节发布，不表示音频有效或被索引。
 
 所有公开快照均固定带有 `audio_verified=false`、`production_ready=false`、`import_ready=false`。即使状态为 `published`，也只表示执行器报告了字节发布。NCM 必须转换为真实 FLAC、其他格式保持不变的产品规则不由此账本实现或验证；这里没有转换器或媒体检查器。
+
+`reason` 的允许集合是固定白名单（`_OUTCOME_REASONS`）：`-02` 起，`rejected`/`failed` 同时覆盖单文件核心的 `invalid_*`/`unsupported_*`/`staging_*` 与保存路由的 10 个 CONTINUE 拒绝码 + `disabled`/`config_invalid`/`busy`。白名单是**写读两侧共用**的校验：未知 reason 会被账本拒绝，执行器返回未知 reason 时按无效结果折叠为 `commit_unknown`（fail-closed，不回退到通用文本）。
 
 ## 数据库拒绝与恢复边界
 

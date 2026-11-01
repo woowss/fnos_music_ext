@@ -464,6 +464,42 @@ class ManualSaveJobsTests(unittest.TestCase):
         self.assertEqual(self.ledger.run_next("actor-A", frozen_job.job_id, lambda *_args: published_result()).status, "no_work")
         self.assertEqual(self.ledger.get_job("actor-A", frozen_job.job_id).positions[1].state, "queued")
 
+    def test_extended_route_reasons_are_accepted_and_unknown_rejected(self):
+        route_rejected = (
+            "service_unavailable", "no_quality_available", "quality_unverified",
+            "quality_identity_mismatch", "trial_only", "download_target_untrusted",
+            "download_failed", "integrity_mismatch", "invalid_audio", "tag_failed",
+        )
+        route_failed = ("disabled", "config_invalid", "busy")
+        cases = [(core.Outcome.REJECTED, reason) for reason in route_rejected]
+        cases += [(core.Outcome.FAILED, reason) for reason in route_failed]
+        for index, (outcome, reason) in enumerate(cases):
+            with self.subTest(reason=reason):
+                created = self.ledger.create_job(
+                    "actor-A", f"route-reason-{index}", one_entry_manifest()
+                )
+                report = self.ledger.run_next(
+                    "actor-A", created.job_id,
+                    lambda _p, _c, outcome=outcome, reason=reason: core.SaveResult(outcome, reason),
+                )
+                self.assertEqual(report.status, "completed")
+                self.assertEqual(report.position.state, outcome.value)
+                self.assertEqual(report.position.reason, reason)
+                reopened = self.new_ledger().get_job("actor-A", created.job_id)
+                self.assertEqual(reopened.positions[0].reason, reason)
+
+        for outcome in (core.Outcome.REJECTED, core.Outcome.FAILED):
+            with self.subTest(outcome=outcome.value, unknown_reason=True):
+                created = self.ledger.create_job(
+                    "actor-A", f"unknown-reason-{outcome.value}", one_entry_manifest()
+                )
+                report = self.ledger.run_next(
+                    "actor-A", created.job_id,
+                    lambda _p, _c, outcome=outcome: core.SaveResult(outcome, "not_a_route_reason"),
+                )
+                self.assertEqual(report.status, "commit_unknown")
+                self.assertEqual(report.position.reason, "commit_unknown")
+
     def test_invalid_executor_result_and_exception_become_commit_unknown_without_details(self):
         created = self.ledger.create_job("actor-A", "bad-result", manifest())
         first = self.ledger.run_next("actor-A", created.job_id, lambda *_args: object())

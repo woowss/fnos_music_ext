@@ -64,3 +64,25 @@ gh run view 40200632732 --repo woowss/fnos_music_ext --job 121190860514 --log
 - 上游 `musicbox download` 虽能把其响应字节写入给定文件系统路径，但没有证明目标为 NAS 音乐库、满足扩展的防覆盖/权限/生命周期要求，或能被飞牛音乐识别索引。不能把它直接视为已获授权的产品交付链路。
 - 静态检查到的下载写入根据 URL 后缀命名 `.mp3`/`.flac`，不构成 `.ncm` 解密或 `.ncm` 转换为真正可解码 `.flac` 的证据。
 - 产品计划要求的 G0 可信身份/服务生命周期、真实曲库落盘、索引和删除/回滚验收仍是单独门槛；本次没有补齐或验证它们。参见 [手动保存与整歌单导入计划](MANUAL_IMPORT_PLAN.md)。
+
+## 已钉版本 + 摘要校验（手动保存歌单快照）
+
+本节记录 `docs/MANUAL_SAVE_PLAYLIST_JOB.md` §4.1 的选型落地，不扩大上文 CI 证据的范围。
+
+- `musicbox-service/requirements.txt` 已由 `NetEase-MusicBox>=0.5.3` 改为 `NetEase-MusicBox==0.5.3`。此前只有下界，实际解析版本来自上文的固定 CI 日志，而不是依赖声明本身；现在部署解析结果被钉死在同一版本。
+- 选中的固定发布物为 `netease_musicbox-0.5.3-py3-none-any.whl`，SHA-256 `7f695b358ee22eda8433ca31503ae60e461b00e636392f366123810afadf5e12`（PyPI JSON 的 `digests.sha256` 与本机把 wheel 字节读入内存后计算的结果一致，见上表）。
+- 新增的只读 producer `musicbox-service/netease_playlist_snapshot.py` 把该版本与摘要写成模块常量（`PINNED_VERSION`、`WHEEL_SHA256`），并在**每次快照前**做运行期断言：`importlib.metadata.version("NetEase-MusicBox") == "0.5.3"` 且 `dist-info/METADATA` 存在。不满足时返回 `status=unsupported` + `artifact_error_code="source_artifact_mismatch"`，fail-closed 且**不读取账号或歌单**。
+
+摘要的校验时机（三者不得混用）：
+
+| 时机 | 校验内容 | 说明 |
+| --- | --- | --- |
+| 构建 / CI | `pip download NetEase-MusicBox==0.5.3` 后比对 wheel 字节 SHA-256 | 与 `requirements.txt` 的 `==` 钉定配套 |
+| 只读集成测试（§4.7，需另行授权） | 容器内实测版本、wheel 文件名与固定摘要 | 冻结 artifact，结果写入 `docs/MANUAL_SAVE_PLAYLIST_SOURCE_EVIDENCE.md` |
+| 运行期 | 仅版本号 + `dist-info/METADATA` 存在 | 安装物是解包后的 `dist-info`，无法低成本重算 wheel 摘要；**不得**声称运行期校验了摘要 |
+
+既有局限（沿用上文，不得省略）：
+
+- CI 安装日志记录了 wheel 文件名与解析版本，但**没有打印所下载字节的 SHA-256**，即"CI 日志未做字节级摘要比对"。当前摘要只由 PyPI JSON 与本机内存计算相互印证；`pip download` + 摘要比对尚未接进 CI。
+- 本节常量只说明"选中的是哪个 artifact"，不证明当前设备已安装同一副本、不证明 NetEase 侧响应行为，也不构成上线验收。
+

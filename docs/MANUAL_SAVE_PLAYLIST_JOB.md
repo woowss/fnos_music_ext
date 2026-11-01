@@ -1,8 +1,9 @@
 # 管理页整歌单保存合同（任务账本 + 按请求推进）
 
 > 合同编号：`FNMEXT-MANUAL-SAVE-PLAYLIST-JOB-20261101-01`
-> 状态：**architect 定稿，待实现**（本文只定义规格，不含代码改动）
+> 状态：**P1/P2/P4 已实现，独立审查 FAIL 项已修正（2026-11-01）；P5/P6 待实现**。本文定义规格，实现状态见 §14。
 > 仓库：`E:\fnmusic-ext-dev`　分支：`codex/fnmusic-prelaunch-20261025`　基线 HEAD：`15d7a42`　仓库 VERSION：2.10.2
+> **行号基线声明**：本文所有 `文件:行号` 以 `15d7a42` 为准；P1 的 reason 枚举扩展落地后 `proxy/manual_save_jobs.py` 在 `_OUTCOME_REASONS` 之后整体后移约 12 行、`offline_tests/test_manual_save_jobs.py` 后移约 36 行，复核时按符号定位。
 > 执行形态：**B（后端任务账本 + 按请求推进）**；快照来源：**A（固定 musicbox artifact + 先做一次只读集成测试观察副作用，再实施接线）**
 > 读者：implementer（唯一写者）、final-reviewer（独立审查）、Lead（验收/决策）
 
@@ -150,8 +151,8 @@
 | 头上限 | `MANUAL_SAVE_MAX_HEADER = 16 * 1024`（`:93`） |
 | 信封 | 固定 `{"ok": bool, "code": str, "message": str, "data": object}`，与既有端一致（`proxy/webui_gateway.py:505-513,725-741`） |
 | 文案 | 新码一律进固定文案表；`message` 不插值、不回显输入、不回显异常文本（同 `proxy/manual_save_playlist.py:94-121` 的纪律） |
-| 引擎开关 | 需同时满足 `FNMUSIC_MANUAL_SAVE_ENABLED=true`（既有）与 `FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED=true`（新增，默认 false）；否则 403 `disabled` |
-| 账本可用 | DB 路径配置非法/不可写 → 403 `config_invalid`，不得创建空 DB 后继续 |
+| 引擎开关 | 需同时满足 `FNMUSIC_MANUAL_SAVE_ENABLED=true`（既有）与 `FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED=true`（新增，默认 false）；否则 403 且无副作用——**总开关关闭 → `disabled`，仅整歌单开关关闭 → `playlist_disabled`**（两码都在 §3.9.1） |
+| 账本可用 | DB 路径配置非法/不可写 → 500 `config_invalid`（与 §3.9.1 一致；不新增 403 版本），不得创建空 DB 后继续 |
 | 幂等 | 创建按 `(actor_scope, idempotency_key)` + 规范 manifest 字节幂等（`docs/OFFLINE_SAVE_JOBS.md:13-22`）；查询/取消天然幂等；推进**不是**幂等操作但**每个位置至多执行一次**（§7.4） |
 
 ### 3.1 路径与常量命名建议
@@ -281,7 +282,7 @@ MANUAL_SAVE_PLAYLIST_LOCK = threading.Lock()  # 模块级，单曲端点与推�
   2. 重新读取一次只读快照（§4.2，musicbox 侧两次独立观测）。
   3. 校验 `snapshot.source_fingerprint == body.source_fingerprint`，否则 409 `source_changed`（**这就是"用户确认的那一份清单"的绑定**，防止用户确认后歌单被改动）。
   4. 校验 `enumeration_complete=true` 且 `track_count == position_count` 且 `1 <= track_count <= 1000`；否则按 §3.3 的码 fail-closed（`manifest_incomplete`/`playlist_too_large`）。
-  5. 校验 artifact（§4.1）：`source_artifact.version=="0.5.3"` 且 `wheel_sha256` 等于固定常量，否则 500 `source_artifact_mismatch`。
+  5. 校验 artifact（§4.1）：**版本断言由 producer 完成**（网关进程未安装 `NetEase-MusicBox`，无法做进程内版本检查）；网关只校验 producer 返回的 `source_artifact.version=="0.5.3"`、`dist_info_present==true` 且 `artifact_error_code` 为空；不符 → 500 `source_artifact_mismatch`。**不得**声称网关校验了 wheel 摘要（§4.1 第 3 条）。
   6. 由**网关**（不是浏览器）构造账本 manifest（§4.3），字段取值见 §4.3.2。
   7. 派生幂等键（当 body 未给）：`"p" + str(playlist_id) + "-" + source_fingerprint`（长度 76，合法标识符）。**派生键使"刷新后重新创建"幂等返回同一个 job**（§6.5）。
   8. `ledger.create_job(actor_scope, key, manifest)`（`proxy/manual_save_jobs.py:541`）。
@@ -365,6 +366,20 @@ MANUAL_SAVE_PLAYLIST_LOCK = threading.Lock()  # 模块级，单曲端点与推�
 - **响应 `data`**：`{"job": { …JobSummary… }}`；HTTP 200。
 - **与推进并发**：取消请求**不**获取 `MANUAL_SAVE_PLAYLIST_LOCK`（快速状态转换，不执行引擎）；账本 `BEGIN IMMEDIATE` 保证与 claim/completion 的串行化（`proxy/manual_save_jobs.py:619-654,702-766`）。若取消发生在 claim 之后，running 位置仍会跑完并按真实结果记录（`docs/OFFLINE_SAVE_JOBS.md:45`）。
 
+#### 3.7.1 `JobSummary` 字段（创建/查询/推进/取消响应共用）
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `job_id` | 48 位小写 hex | 账本主键 |
+| `state` | 字符串 | §6.1 的 8 个任务状态之一 |
+| `cancel_requested` | bool | 是否已请求取消 |
+| `counts` | object | 按位置状态计数的映射（键 ⊆ §6.2 状态集） |
+| `positions_total` | int | 位置总数 |
+| `manifest_sha256` | 64 位 hex | 账本对规范 manifest 字节的摘要 |
+| `audio_verified` / `production_ready` / `import_ready` | bool，恒 `false` | 账本固定标志，UI/API 不得改写或隐藏 |
+
+依据：账本 `JobSnapshot`（`proxy/manual_save_jobs.py` 约 `:147-160`）、`docs/OFFLINE_SAVE_JOBS.md:47-51`。
+
 ### 3.8 对账端点：**本轮不开放**
 
 - 本轮**不提供** `reconcile`/`recover` 端点，也**不提供** `recover_stale_running` 的 HTTP 入口。
@@ -384,11 +399,11 @@ MANUAL_SAVE_PLAYLIST_LOCK = threading.Lock()  # 模块级，单曲端点与推�
 | `invalid_playlist_id` | 400 | 歌单 ID 必须是正整数 | 新 |
 | `invalid_fingerprint` | 400 | 快照指纹无效 | 新 |
 | `invalid_idempotency_key` | 400 | 幂等键无效 | 新 |
-| `invalid_job_id` | 404 | 任务不存在 | 复用账本 `not_found` 语义（对外统一 `not_found`，不用独立码） |
+| ~~`invalid_job_id`~~ | — | — | **不设独立码**：格式非法/不存在/跨 scope 一律固定 `not_found`(404)（§3.5） |
 | `not_found` | 404 | 任务不存在 | 账本 `NotFoundError`（`proxy/manual_save_jobs.py:111-113`） |
 | `forbidden` | 403 | 仅管理员可执行手动保存 | 既有（`proxy/webui_gateway.py:113`） |
 | `disabled` | 403 | 手动保存未启用 | 既有（`:117`） |
-| `playlist_disabled` | 403 | 整歌单保存未启用 | 新开关 |
+| `playlist_disabled` | 403 | 整歌单保存未启用 | 仅整歌单开关关闭；与总开关 `disabled` 区分（两者都为 403，均无副作用） |
 | `not_logged_in` | 403 | 网易云账号未登录 | musicbox `not_logged_in` |
 | `config_invalid` | 500 | 手动保存配置无效 | 新（DB 路径/音乐服务 URL） |
 | `playlist_unavailable` | 502 | 音乐服务不可用 | musicbox 读取失败/连不上 |
@@ -440,7 +455,7 @@ SOURCE_CHANGED_OR_RECHECK_FAILED
 **实现前置条件（硬性）**：
 
 1. `musicbox-service/requirements.txt:2` 当前为 `NetEase-MusicBox>=0.5.3`，**必须改为 `==0.5.3`**（Lead 指出未精确钉版本）；改动列入交付物（§12），并在 `docs/NETEASE_DELIVERY_EVIDENCE.md` 追加一行"已钉版本"。
-2. 运行时断言：producer 模块启动/每次快照时检查 `importlib.metadata.version("NetEase-MusicBox") == "0.5.3"`；不等 → 返回 `status=unsupported, error_code=UNSUPPORTED_SOURCE`，网关映射 500 `source_artifact_mismatch`，**fail-closed 不读取**。
+2. 运行时断言：**producer 模块**在每次快照时检查 `importlib.metadata.version("NetEase-MusicBox") == "0.5.3"` 且 `dist-info/METADATA` 存在；不等 → 返回 `status=unsupported` + `error_code=UNSUPPORTED_SOURCE` + `artifact_error_code="source_artifact_mismatch"`，**在读上游前 fail-closed**。网关只按 `artifact_error_code` 映射 500 `source_artifact_mismatch`，不做进程内版本检查（网关进程未安装该包）。
 3. wheel 摘要无法在运行期低成本重算（已安装为解包后的 dist-info），因此摘要的**验证时机**是构建/CI 与只读观察测试：CI 记录 `pip download NetEase-MusicBox==0.5.3` 的 sha256 并与固定值比对；运行期只断言版本号 + `dist-info/METADATA` 存在。**这一分工必须在实现说明中写明，不得声称运行期校验了摘要。**
 4. 若只读观察测试实测版本 ≠ 0.5.3：**停止接线**，回到"artifact 决策"（不在本合同范围），不得用其它版本继续。
 
@@ -448,6 +463,8 @@ SOURCE_CHANGED_OR_RECHECK_FAILED
 
 - **路径**：`GET /api/v1/user/playlists/{playlist_id}/member-snapshot`（新增；**不修改**既有 `/preview`、`/tracks` 的语义）。
 - **开关**：`FNMUSIC_PLAYLIST_MANIFEST_READONLY`（默认 `false`）；关闭时返回 `{"ok": false, "error": "manifest_disabled"}` + 503，**不读取账号**。
+  - **与保存开关解耦**：该 flag 只控制 producer；**不得**依赖 `FNMUSIC_MANUAL_SAVE_ENABLED` / `FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED`。原因：P3 只读观察的前提恰恰是保存侧全关（§4.7），若 producer 依赖保存开关则 P3 永远 503（本轮审查发现的缺陷，已在实现中修正）。
+  - **取值来源**：容器内 `[program:musicbox]` 未声明 `environment=`，`.env` 是挂载文件而非进程环境。**P5/部署阶段必须**在启动时同源读取 `/repo/.env`（或经 `container/env_flag.sh:export_source_env()` 导出 / supervisord 注入）；**当前 P2 实现只读进程环境**，未配置时按关闭处理（fail-closed 503），因此 P3 之前必须先完成该部署项，不得声称 P3 就绪。
 - **实现要点（不改候选模块）**：
   1. 新增 `musicbox-service/netease_playlist_snapshot.py`（调用方），**只 import，不修改** `playlist_manifest.py`。
   2. 每次调用做**两次独立观测**：
@@ -459,6 +476,7 @@ SOURCE_CHANGED_OR_RECHECK_FAILED
      - **两次观测必须各自重新读取 account 与 playlist**，不得复用同一个响应对象（否则 `ACCOUNT_CHANGED` 永不触发，`compare_snapshots` 的账户检查形同虚设，见 `musicbox-service/playlist_manifest.py:353-367`）。
      - `n = 1001`：比账本单任务上限 1000 多 1，用来**排除截断**（若上游按 n 截断，`trackCount=1001` 时会得到 1001 条并触发 §4.4 的 `playlist_too_large`；而 `trackCount=1000` 且返回 1000 条时，因为请求了 1001 条，可以断言未截断）。**不得**沿用 preview 的 `n=1000`（`musicbox-service/netease_ext.py:511,542`）——在 1000 边界上无法区分"恰好 1000 首"与"被截断在 1000"。
      - `s = 0`，不做分页（与候选文档描述的上游观测一致：`docs/OFFLINE_PLAYLIST_MANIFEST.md` "The observed upstream client request used n=100000 without offset pagination"）。
+     - **边界诚实性**（本轮审查修正）：候选文档观测的是 `n=100000`；**`n=1001` 是尚未真机验证的新形状**。截断排除不依赖"上游如何解释 n"，而依赖 `trackCount == len(positions)`（§4.6）与 §4.7 的 n 对照观察；若 §4.7 实测 1000 边界行为与预期不符，回到 n 决策，不得声称已验证。
   3. 输出 payload（所有字段由 manifest + 调用方持有的 `after` 快照组合得出）：
 
 ```json
@@ -478,6 +496,9 @@ SOURCE_CHANGED_OR_RECHECK_FAILED
 ```
 
   - `schema_version`/`provider`/`source_versions` 来自 `after` 快照（`musicbox-service/playlist_manifest.py:53-62`），**不是**改候选模块的输出。
+  - **`ok` 语义（本轮审查修正）**：所有观测/失败 payload 的 `ok` **恒为 `true`**，失败只靠 `status` + `error_code` 表达；只有端点关闭（503）响应是 `ok:false` + `error`。理由：`ok:false` 表示"协议层失败"，若用它表达业务失败，下游无法区分"响应畸形"与"已知失败态"（本轮已修复 producer/consumer 不兼容）。
+  - **`source_artifact`**（producer 输出，网关只透出/记录）：`{"provider","package","version","wheel_sha256","dist_info_present"}`；`wheel_sha256` 是固定常量，**运行期不重算**（§4.1 第 3 条）。
+  - **`artifact_error_code`**：仅当版本/元数据断言失败时为 `"source_artifact_mismatch"`，否则 `null`。
   - `positions[].error_code` 只允许 `null` 或 `INVALID_TRACK_ID`（候选固定值，`:255`）。
   - 三个 readiness 标志**恒为 false**，与候选文档要求一致（`docs/OFFLINE_PLAYLIST_MANIFEST.md` "Every result keeps `metadata_complete`, `import_ready`, `production_ready`, and `provider_verified` false"）。
   4. **不请求**歌曲详情、音频 URL、歌词、封面；不做元数据补全（`metadata_status="not_requested"` 已在候选 dataclass 中，`:70-77`）。这样上游调用固定为 4 次只读请求（2×account + 2×playlist）。
@@ -486,7 +507,9 @@ SOURCE_CHANGED_OR_RECHECK_FAILED
 
 ### 4.3 两次快照的判定与 manifest 构造
 
-#### 4.3.1 判定（由候选模块负责，网关只信 `status`/`enumeration_complete` + 自行复核结构）
+#### 4.3.1 判定（候选模块给判定，producer 忠实输出，网关**必须自行复核**结构）
+
+- **分工边界**：producer 只做候选判定与 payload 组装，**不做**下列结构复核，因此下游**不得盲信** `status`/`enumeration_complete`。这组复核由网关在 P5 逐条执行（下列 5 条结构 + provider/schema 固定值 + "计数一致不静默修复"共 **7 项**）；P4 适配层的 `build_manifest` 已实现同等复核，待 P5 接线。
 
 - `status=="complete"` 的充要条件：两次观测的 schema/provider、账户、歌单、版本键值、`trackCount`、**完整有序位置序列**全部相同，且 `position_count == track_count` 且无无效 ID（`musicbox-service/playlist_manifest.py:333-399`；候选文档 "Completeness requires identical account, playlist, version-key set and values, declared count, and full ordered ID positions, plus a position count equal to trackCount and no invalid IDs"）。
 - 网关**必须自行复核**（不盲信 musicbox 返回的布尔值）：
@@ -525,7 +548,7 @@ SOURCE_CHANGED_OR_RECHECK_FAILED
 | `entries[].source_id` | 十进制字符串（`str(track_id)`），前导数字、≤128 → 合法 | `proxy/manual_save_jobs.py:33,173-236` |
 | `entries[].source_status` | `"ok"`（全部位置） | 只有完整快照才允许创建 |
 
-- **限制说明（必须写进实现注释与文档）**：账本 manifest 字段是**封闭集合**（`_validate_manifest` 要求键集合严格等于 7 个，`proxy/manual_save_jobs.py:173-181`），**无法**持久化额外 artifact 摘要/标题/路径。因此 artifact 断言在创建前/每次推进前做进程内检查，`provider_id`/`collection_version` 只承载版本与指纹标签；完整证据放 `docs/MANUAL_SAVE_PLAYLIST_SOURCE_EVIDENCE.md`（§4.7）。
+- **限制说明（必须写进实现注释与文档）**：账本 manifest 字段是**封闭集合**（`_validate_manifest` 要求键集合严格等于 7 个，`proxy/manual_save_jobs.py:173-181`），**无法**持久化额外 artifact 摘要/标题/路径。因此 artifact 的**版本断言只在 producer 内做一次**（快照产生时），网关按 `artifact_error_code` 映射失败；`provider_id`/`collection_version` 只承载版本与指纹标签；完整证据放 `docs/MANUAL_SAVE_PLAYLIST_SOURCE_EVIDENCE.md`（§4.7）。
 - `manifest_sha256` 由账本对规范字节计算（`docs/OFFLINE_SAVE_JOBS.md:13-22`），创建响应回显，UI 可用于展示"本次确认的清单指纹"。
 
 ### 4.4 位置上限的三层边界
@@ -630,7 +653,7 @@ route 失败码全集来自 `proxy/manual_save_route.py:162-183` 的 `_MESSAGES`
 | 13 | `disabled` | `failed` | `disabled` | `abort` | ABORT 码；环境前置（开关被关） |
 | 14 | `config_invalid` | `failed` | `config_invalid` | `abort` | ABORT 码 |
 | 15 | `busy` | `failed` | `busy` | `abort` | ABORT 码；正常不可达（§7.1），防御性映射 |
-| 16 | `staging_unavailable` | `failed` | `staging_unavailable` | `abort` | ABORT 码；既有 reason（`proxy/manual_save_jobs.py:50`） |
+| 16 | `staging_unavailable`（route 码） | `failed` | `stage_unavailable`（账本既有 reason；原表字面 `staging_unavailable` 为笔误，P1 未新增该值） | `abort` | ABORT 码；既有 reason（`proxy/manual_save_jobs.py:58` 附近） |
 | 17 | `publish_failed` | `commit_unknown` | `commit_unknown` | `freeze` | **发布异常=结果未知**：posix store 把发布期异常统一表述为"可能已可见、绝不重试/回滚"（`proxy/manual_save_posix.py:254-288`，`docs/OFFLINE_POSIX_STORE.md:34-36`），route 收敛为 `publish_failed`（`proxy/manual_save_route.py:792,806`） |
 | 18 | `internal` | `commit_unknown` | `commit_unknown` | `freeze` | 引擎捕获到未预期异常，**无法排除**已产生副作用；fail-closed |
 | 19 | `invalid_song_id` | `rejected` | `invalid_target` | `abort` | 契约被破坏（manifest 已保证正整数）；不调用引擎/或引擎拒收 |
@@ -641,7 +664,7 @@ route 失败码全集来自 `proxy/manual_save_route.py:162-183` 的 `_MESSAGES`
 
 - `outcome=commit_unknown` → `cleanup_pending=True`；其余全部 `cleanup_pending=False`（账本校验规则，`proxy/manual_save_jobs.py:268-284`）。
 - `published_cleanup_pending` / `cancelled` 两个 Outcome **执行器永不返回**：`cancelled` 只由 `cancel_job` 产生（`proxy/manual_save_jobs.py:629-638`），`published_cleanup_pending` 由单文件核心的清理语义产生，route 不产生。
-- **continue/abort 分类必须与批次引擎完全一致**；测试用一个共享常量断言 `map_save_result` 的分类 == `PLAYLIST_CONTINUE_CODES`/`PLAYLIST_ABORT_CODES`（防止两份表漂移）。
+- **continue/abort 分类必须与批次引擎一致**，但 `publish_failed`/`internal` 在本合同上升级为 `freeze`（比 abort 更严格：停止推进且需人工对账）。测试断言：`ROUTE_CONTINUE_CODES == PLAYLIST_CONTINUE_CODES`；`ROUTE_ABORT_CODES ∪ FREEZE_CODES == PLAYLIST_ABORT_CODES`，且 `publish_failed`/`internal` 属 `freeze`（防止两份表漂移；不得要求 freeze 码也出现在 ABORT 集合里）。
 - `disposition=="abort"` 时**不自动取消任务**：剩余位置保持 `queued`，由前端停止循环；环境修复后可继续（这是执行形态 B 相比整批引擎的关键增益，§7.5）。
 
 ### 5.3 逐位置结果的可持久化信息边界
@@ -997,12 +1020,13 @@ fnmusic-manual-save-playlist code=<固定码> job=<job_id> position=<int> state=
 | A7 | 部分完成语义 | 若有失败，job `state∈{partial,completed_with_issues}`；`ok=True` 的 HTTP 响应**不得**被 UI 表述为"整单成功" |
 | A8 | 刷新不丢 | 中途刷新/关闭页面再打开：进度与位置结果不变（§6.5 两条恢复路径至少一条可用） |
 | A9 | 取消 | 推进中途取消：queued → `cancelled`，已发布保留，running 跑完后如实记录；无文件回滚 |
-| A10 | 开关关闭 | `FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED=false` 时：列表/快照/创建/推进全部 403 `disabled`；**无账本写入、无引擎调用、无 NAS 写**（检查日志与 DB mtime） |
+| A10 | 开关关闭 | `FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED=false` 时：列表/快照/创建/推进全部 403（仅整歌单开关关 → `playlist_disabled`；总开关关 → `disabled`）；**无账本写入、无引擎调用、无 NAS 写**（检查日志与 DB mtime） |
 | A11 | 直连 8774 | `curl 127.0.0.1:8774/api/manual-save/playlist/...` → 501（`webui-service/app.py:1749-1758` 收口）；不得出现执行路径 |
 | A12 | 越权与伪造 | 无 CSRF 头/非 admin/缺 userid/普通用户直连 socket → 403 或被 L2 关闭；跨 `actor_scope` 用他人 `job_id` → 404 |
-| A13 | 脱敏 | 全流程响应/日志/DB 中无签名 URL、Cookie、token、路径；DB 中只有 §4.3.2 的 manifest 与状态列 |
-| A14 | 容量/上限 | 101 首以上歌单（若可得）→ 409 `playlist_too_large`；1000 首可创建（不要求跑完） |
+| A13 | 脱敏（**限定新增 playlist 链路**）| 新增端点的响应/新日志/DB 中无签名 URL、Cookie、token、**目标目录或暂存路径**；DB 只含 §4.3.2 的 manifest 与状态列。既有 `status` 端点回显 `target_dir/staging_dir` 属已验收行为，不在本条范围 |
+| A14 | 容量/上限 | 1001 首/1001 个成员位置以上 → 409 `playlist_too_large`（1000 首合法，不要求跑完）；账本容量（1000 任务/10000 位置）打满时创建 → 409 `capacity_exceeded` |
 | A15 | 测试基线 | 五套手动保存 + `offline_tests` + node 全部只增不减；新增测试全绿；无真实网络/NAS 参与离线测试 |
+| A16 | `commit_unknown` 冻结 | 构造一个 `commit_unknown` 位置后：job 变 `reconciliation_required`、后续 advance 返回 `no_work`（HTTP 200）、UI 显示"需要对账"固定横幅、取消仍可用；**不得**自动重试、不得按文件是否存在判定成功（§5.4） |
 
 验收记录必须包含：命令、exit code、计数、NAS 上逐位置文件清单（可用 `find` 输出）、失败位置证据、DB 中 job 快照（脱敏后）。**代码审查、本地测试、真机验收分别记录，不互相替代**（`docs/MANUAL_IMPORT_PLAN.md:219-243`）。
 
@@ -1010,7 +1034,7 @@ fnmusic-manual-save-playlist code=<固定码> job=<job_id> position=<int> state=
 
 ## 11. 风险与未决问题
 
-> 以下 3 条必须由 Lead/用户决定；每条给出推荐选项与影响。**未决不影响本合同的其余部分落地**（已标注退化路径）。
+> **状态（2026-11-01，Lead 已决）**：Q1 **批准**（账本 reason 枚举扩展；已完成、已测、已审查）；Q2 **本轮不开放 recover 端点**（`worker_stopped` 无法由 API 验证，stuck running 需人工介入）；Q3 **本轮不新增删除 API**（容量清理另立项）。以下保留当时决策依据，供后续复核。
 
 ### Q1 是否批准对已交付账本做"reason 枚举扩展"（§5.5）？
 
@@ -1084,12 +1108,12 @@ fnmusic-manual-save-playlist code=<固定码> job=<job_id> position=<int> state=
 
 | 阶段 | 内容 | 门槛/前置 |
 | --- | --- | --- |
-| P0 | 本合同的独立审查（reviewer 绑定哈希 PASS） | 本文 |
+| P0 | 本合同的独立审查（reviewer 绑定哈希 PASS） | 本文；**P0 PASS 是所有后续阶段的严格前置**。本轮实际执行偏差：P1/P2/P4 在 P0 结论出来前已并发落地，后以"绑定哈希 diff 审查 + P0 发现项回改"补救（见 §14），此偏差不重复 |
 | P1 | 账本 reason 扩展 + `offline_tests` 更新（纯离线） | Q1 批准（§11） |
 | P2 | `netease_playlist_snapshot.py` + 纯函数测试 + `member-snapshot` 端点（flag 默认关）+ `requirements.txt` 钉版本 | 无 NAS 写入 |
 | P3 | **§4.7 只读观察测试**（部署 producer、开只读 flag、跑 `tools/netease_playlist_observe.py`、写证据文档） | **用户授权 + 维护窗口**；artifact 证据齐备；`FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED=false` |
 | P4 | `proxy/manual_save_playlist_jobs.py` 适配层 + 单元/集成测试（fake producer payload） | 可与 P2/P3 并行编写；接线需 P3 PASS |
-| P5 | 网关 6 端点 + 契约测试 | P3 PASS + P1 完成 |
+| P5 | 网关 6 端点 + 契约测试 | P3 PASS + P1 完成 + **P4 适配层完成**（P5 import 它；P4 自身只需单测，不依赖 P3） |
 | P6 | 前端卡片 + node 测试 | P5 完成 |
 | P7 | 真实 NAS 整歌单验收（§10） | 用户明确同意写库 + 选定测试歌单 + P5/P6 完成 |
 | P8 | 交付评审/提交（由 Lead 执行；implementer 不 commit） | P7 记录 |
@@ -1189,4 +1213,47 @@ fnmusic-manual-save-playlist code=<固定码> job=<job_id> position=<int> state=
 
 ---
 
-*本文件是唯一交付物；未修改任何代码、测试、其它文档；未执行 git add/commit；未连接 NAS；未运行任何 `*probe*` 脚本。*
+## 14. 实现状态与审查记录（2026-11-01）
+
+| 阶段 | 状态 | 交付 | 实测证据 |
+| --- | --- | --- | --- |
+| P1 账本 reason 扩展 | ✅ 完成 | `proxy/manual_save_jobs.py`（+13 reason，未改 DB schema）、`offline_tests/test_manual_save_jobs.py`、`docs/OFFLINE_SAVE_JOBS.md`（-02） | 该测试文件 21 passed / 29 subtests |
+| P2 快照 producer | ✅ 完成（默认关闭） | `musicbox-service/netease_playlist_snapshot.py`、`proxy/tests/test_musicbox_playlist_snapshot.py`、`musicbox-service/app.py` 只读端点、`requirements.txt` 钉 `==0.5.3`、`docs/NETEASE_DELIVERY_EVIDENCE.md` | 新增 41 例；开关与保存开关解耦 |
+| P4 适配层 | ✅ 完成（零生产接线） | `proxy/manual_save_playlist_jobs.py`、`proxy/tests/test_manual_save_playlist_jobs.py` | 207 例 |
+| P3 只读 artifact 观察 | ⏳ 待用户授权 + 维护窗口 | — | 需真实 NAS 只读观察（§4.7） |
+| P5 网关 6 端点 | ⏳ 待实现 | — | 依赖 P3 PASS + P4 |
+| P6 管理页入口 | ⏳ 待实现 | — | 依赖 P5 |
+| P7 真实整歌单验收 | ⏳ 待用户同意写库 | — | 依赖 P5/P6 |
+
+**审查记录**
+
+- **合同审查（P0）：FAIL → 已修订本版**。3 个 P0：① 流程前置缺失（实现先于 P0 结论落地）→ §12.4 已写明 P0 为严格前置并记录本轮补救方式；② artifact 校验接口未定义（网关不可能做进程内版本检查）→ §4.1 第 2 条 / §3.4 步骤 5 改为"版本断言在 producer，网关只按 `artifact_error_code` 映射"；③ P3 只读开关不可达（producer 依赖保存开关，与"保存侧全关"互斥）→ §4.2 明确解耦 + 取值来源。
+- **实现审查（P1/P2/P4）：FAIL → 已回改**。P0：producer 失败信封 `ok` 语义与 consumer 不兼容 → §4.2 明确"观测 payload `ok` 恒 true，仅 503 关闭为 false"；P1：P3 开关互斥（同上）、HTTP seam 跟随重定向（改为禁用/校验最终 URL）、非 complete 状态映射（按 §3.3 分流）；P2：`::1`/http-only、响应体 ≤1 MiB、§5.2 row16 勘误、reason 文案别名、`n=1001` 请求参数断言。
+- **P5 必补清单**（继承自两份审查，缺一不可）：
+  1. §4.3.1 的 **7 项**网关复核（5 条结构 + provider/schema 固定值 + 计数一致且不静默修复）；
+  2. §3.4 步骤 5 的网关 artifact 复核（`source_artifact.version=="0.5.3"`、`dist_info_present==true`、`artifact_error_code` 为空；P4 目前只在 unsupported 分支用 `artifact_error_code`，complete 分支未查 `source_artifact`）；
+  3. §3.9.1 固定码与 HTTP 表（含 `playlist_unsupported`/`source_changed`/`playlist_too_large`/`not_logged_in`/`playlist_unavailable`/`source_artifact_mismatch`）与 §3.9.2 `source_error_code` 白名单（未知一律丢弃为 `""`）；
+  4. §3.3 只读预检 + §3.4 步骤 3 指纹绑定（body fp vs 新快照 fp → 409 `source_changed`）与派生幂等键；
+  5. §3.6 `detail` 缺口决策（P4 的 executor 只返 `SaveResult`，不含已脱敏 detail；不得回传原始 data）；
+  6. `_MANUAL_SAVE_PLAYLIST_REASON_MESSAGES`（含 `stage_unavailable`/`staging_failed`）；
+  7. 网关级执行锁与既有单曲端点串行化（避免锁序死锁，`busy` 不得吃掉位置）；
+  8. advance 的**五类** run status（`completed`/`commit_unknown`/`no_work`/`stale_completion`/`completion_unknown`）HTTP 映射——P4 的 `_advance_report` 对 `no_work`/`stale_completion` 的 disposition 仍为 `None`，须按 §3.6 表补 `continue`/`freeze`；
+  9. gateway 契约测试文件 `proxy/tests/test_manual_save_playlist_gateway.py`；
+  10. 部署侧导出键（见下）。
+- **环境变量落盘限制（本轮实测）**：`.env.example` 在 DSH 工具层属于凭据围栏路径（`.env*`），任何文件工具读写均被拒绝，因此本轮的 `.env.example` 增补未被执行。**必须由操作者在外部编辑器补入**，或在 P5 用不含凭据的示例文档替代。
+  需补的三个键（按 `.env.example` 既有注释风格）：
+  ```dotenv
+  # 整歌单保存（管理页）开关，默认关闭
+  FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED=false
+  # 任务账本 SQLite 路径（私有目录、root 可写）
+  FNMUSIC_MANUAL_SAVE_JOBS_DB=
+  # 只读歌单成员快照端点开关，默认关闭；与上面两个保存开关解耦
+  FNMUSIC_PLAYLIST_MANIFEST_READONLY=false
+  ```
+  部署生效路径（P5/部署清单）：`container/env_flag.sh` 的 `export_source_env()` 导出键列表追加 `FNMUSIC_PLAYLIST_MANIFEST_READONLY`（`musicbox-service` 的 `[program:musicbox]` 无 `environment=`，仅写 `.env` 不会进入进程环境；`entrypoint.sh` 在启动 supervisord 前调用该函数，故追加即可被继承）。
+- 本表与审查记录**不证明**真实 NAS 行为、真实网易云响应、音频有效性或生产接入。
+
+---
+
+*本文档为唯一交付物；实现阶段另行产生代码/测试改动（见 §12）。*
+

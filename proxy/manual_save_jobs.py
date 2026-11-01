@@ -39,14 +39,26 @@ _OUTCOME_REASONS = {
     Outcome.PUBLISHED_CLEANUP_PENDING.value: frozenset({"published_cleanup_pending"}),
     Outcome.CONFLICT.value: frozenset({"destination_conflict"}),
     Outcome.CANCELLED.value: frozenset({"cancelled_before_publish"}),
+    # REJECTED/FAILED 的 reason 白名单同时覆盖两套固定码表：
+    # 1) 单文件核心的 invalid_*/unsupported_*/staging_* 等（既有）；
+    # 2) 管理页单曲/歌单保存路由的失败码（FNMEXT-MANUAL-SAVE-PLAYLIST-JOB-20261101-01 §5.5）。
+    # 只扩展字符串白名单，不改变 DB schema：旧行继续合法，重开校验通过。
     Outcome.REJECTED.value: frozenset({
         "invalid_target", "invalid_format", "unsupported_ncm", "unsupported_format",
         "invalid_basename", "invalid_limit", "invalid_length", "invalid_plan",
         "invalid_chunks", "invalid_storage", "invalid_cancel_check", "too_many_chunks",
         "invalid_chunk", "empty_chunk", "chunk_too_large", "stream_too_long",
         "length_mismatch",
+        # 路由 CONTINUE 失败码（逐位置可继续执行）。
+        "service_unavailable", "no_quality_available", "quality_unverified",
+        "quality_identity_mismatch", "trial_only", "download_target_untrusted",
+        "download_failed", "integrity_mismatch", "invalid_audio", "tag_failed",
     }),
-    Outcome.FAILED.value: frozenset({"stage_unavailable", "staging_failed", "cancel_check_failed"}),
+    Outcome.FAILED.value: frozenset({
+        "stage_unavailable", "staging_failed", "cancel_check_failed",
+        # 路由 ABORT 失败码（环境前置/并发，需停止本轮推进）。
+        "disabled", "config_invalid", "busy",
+    }),
     Outcome.COMMIT_UNKNOWN.value: frozenset({"commit_unknown"}),
 }
 
