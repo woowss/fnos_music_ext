@@ -1249,7 +1249,7 @@ fnmusic-manual-save-playlist code=<固定码> job=<job_id> position=<int> state=
   9. gateway 契约测试文件 `proxy/tests/test_manual_save_playlist_gateway.py`；
   10. 部署侧导出键（见下）。
 - **P3 只读观察**：⏳ 待用户授权 + 维护窗口。**离线准备已完成**：`tools/netease_playlist_observe.py`（默认 dry-run；`--confirm-observe` 才读网络；只 stat Cookie、只统计禁止日志路径次数、报告纯哈希/计数/耗时；保存侧开关为真时在任何读取前拒绝）+ `offline_tests/test_netease_playlist_observe.py`（10 例自检，实跑 10 passed）+ `docs/MANUAL_SAVE_PLAYLIST_SOURCE_EVIDENCE.md`（模板）。执行方式：容器 `/tmp` 临时目录 + 只读导入，**不部署、不改 `.env`、不重启**。
-- **P7 真实整歌单验收**：⏳ 待用户同意写库 + 选定测试歌单。**离线准备已完成**：`docs/MANUAL_SAVE_PLAYLIST_ACCEPTANCE_RUNBOOK.md`（A1–A16 命令化步骤、证据清单、失败/回滚、飞牛音乐侧确认）；执行前须确认部署侧已包含 P1/P2/P4/P5/P6 代码。
+- **P7 真实整歌单验收**：⏳ 待用户同意写库 + 选定测试歌单。**离线准备已完成**：`docs/MANUAL_SAVE_PLAYLIST_ACCEPTANCE_RUNBOOK.md`（A1–A16 命令化步骤、证据清单、失败/回滚、飞牛音乐侧确认）与 `docs/MANUAL_SAVE_PLAYLIST_DEPLOY_CHECKLIST.md`（打包范围、构建/安装/G3 验证、部署后顺序、回滚）；执行前须确认部署侧已包含 P1/P2/P4/P5/P6 代码。
 - **环境变量落盘限制（本轮实测）**：`.env.example` 在 DSH 工具层属于凭据围栏路径（`.env*`），任何文件工具读写均被拒绝，因此本轮的 `.env.example` 增补未被执行。**必须由操作者在外部编辑器补入**，或在 P5 用不含凭据的示例文档替代。
   需补的三个键（按 `.env.example` 既有注释风格）：
   ```dotenv
