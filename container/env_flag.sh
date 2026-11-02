@@ -33,7 +33,11 @@ export_source_env() {
     if [ ! -f "$ENV_FILE" ]; then
         return 0
     fi
-    for _key in LX_SOURCE_URL LX_SOURCE_LIST LX_SOURCES MUSICDL_SOURCES LXSERVER_ADMIN_PASSWORD; do
+    # FNMUSIC_PLAYLIST_MANIFEST_READONLY：整歌单快照只读端点开关（默认关）。
+    # 必须导出为进程环境，因为 [program:musicbox] 没有 environment=，
+    # 只写入 /repo/.env 不会进入 musicbox 进程（P3 只读观察依赖此项）。
+    for _key in LX_SOURCE_URL LX_SOURCE_LIST LX_SOURCES MUSICDL_SOURCES LXSERVER_ADMIN_PASSWORD \
+        FNMUSIC_PLAYLIST_MANIFEST_READONLY; do
         if printenv "$_key" >/dev/null 2>&1; then
             continue
         fi

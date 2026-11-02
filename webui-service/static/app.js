@@ -102,9 +102,10 @@ function clearDirty() {
 function switchPage(page) {
   $$(".page").forEach((el) => el.classList.toggle("active", el.id === "page-" + page));
   $$("[data-page]").forEach((el) => el.classList.toggle("active", el.dataset.page === page));
-  // 储存父标题：边听边存/目录设置任一子页激活时强调（子项保持各自的实心高亮）
+  // 储存父标题：边听边存/目录设置/保存到 NAS 任一子页激活时强调（子项保持各自的实心高亮）
   const storageTitle = $("#nav-storage-title");
-  if (storageTitle) storageTitle.classList.toggle("active", page === "tee" || page === "dirs");
+  if (storageTitle) storageTitle.classList.toggle("active", page === "tee" || page === "dirs" || page === "save");
+  if (page === "save") loadSaveStatus().catch(() => {});
   if (page === "about") loadAbout().catch((exc) => { $("#about-logs").textContent = "加载失败：" + exc.message; });
 }
 $$("[data-page]").forEach((btn) => btn.addEventListener("click", () => switchPage(btn.dataset.page)));
@@ -1937,6 +1938,1121 @@ window.addEventListener("keydown", (ev) => {
     (document.activeElement === cancel ? $("#cleanup-confirm-btn") : cancel).focus();
   }
 });
+
+/* -------------------------------------------------------------- 保存到 NAS */
+const saveState = {
+  enabled: false,
+  statusLoaded: false,
+  searching: false,
+  saving: new Set(),
+  searchSeq: 0,
+};
+
+async function manualSaveApi(path, options = {}) {
+  const headers = Object.assign({}, options.headers || {}, { "x-fnmusic-save": "1" });
+  const resp = await fetch(APP_BASE + path, Object.assign({}, options, { headers }));
+  let body = {};
+  try { body = await resp.json(); } catch (_) { /* 非 JSON 响应 */ }
+  return { status: resp.status, ok: resp.ok, body };
+}
+
+function manualSaveMessage(body, fallback) {
+  if (body && body.code === "conflict") return "目标目录已存在同名文件，未覆盖。";
+  if (body && body.code === "busy") return "已有保存任务进行中，请稍后再试。";
+  if (body && typeof body.message === "string" && body.message) return body.message;
+  return fallback;
+}
+
+function formatSaveSize(bytes) {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value <= 0) return "";
+  return (value / (1024 * 1024)).toFixed(1) + " MB";
+}
+
+function formatSaveDuration(ms) {
+  const totalSeconds = Math.floor(Number(ms) / 1000);
+  if (!Number.isFinite(totalSeconds) || totalSeconds <= 0) return "";
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = String(totalSeconds % 60).padStart(2, "0");
+  return minutes + ":" + seconds;
+}
+
+function setSaveControlsEnabled(enabled) {
+  const input = $("#save-keyword");
+  const button = $("#save-search-btn");
+  if (input) input.disabled = !enabled;
+  if (button) button.disabled = !enabled;
+}
+
+async function loadSaveStatus() {
+  const statusEl = $("#save-status");
+  if (!statusEl) return;
+  try {
+    const { status, ok, body } = await manualSaveApi("/api/manual-save/status");
+    const data = (body && body.data) || {};
+    saveState.enabled = !!(ok && body && body.ok === true && data.enabled === true);
+    saveState.statusLoaded = true;
+    if (saveState.enabled) {
+      const target = typeof data.target_dir === "string" && data.target_dir ? "，目标目录 " + data.target_dir : "";
+      statusEl.textContent = "手动保存已启用" + target + "；保存不会覆盖同名文件。";
+      setSaveControlsEnabled(true);
+    } else if (body && body.code === "disabled") {
+      statusEl.textContent = "手动保存未启用：请在 .env 设置 FNMUSIC_MANUAL_SAVE_ENABLED=true，并填写 FNMUSIC_MANUAL_SAVE_TARGET / FNMUSIC_MANUAL_SAVE_STAGING 后重启代理。";
+      setSaveControlsEnabled(false);
+      const results = $("#save-results");
+      if (results) results.innerHTML = "";
+      const resultEl = $("#save-result");
+      if (resultEl) resultEl.textContent = "";
+    } else {
+      statusEl.textContent = "无法读取手动保存状态（HTTP " + status + "），请确认正通过飞牛桌面打开管理台。";
+      setSaveControlsEnabled(false);
+    }
+  } catch (exc) {
+    saveState.enabled = false;
+    saveState.statusLoaded = true;
+    statusEl.textContent = "读取手动保存状态失败：" + (exc && exc.message ? exc.message : "网络错误");
+    setSaveControlsEnabled(false);
+  }
+  // 整歌单卡片：单曲开关判定后再读取歌单开关/列表（单曲开关关闭时本轮不会发任何
+  // playlist 请求，见 loadPlaylistSaveStatus 的守卫）。歌单卡片失败不影响单曲保存。
+  try { await loadPlaylistSaveStatus(); } catch (_) { /* 忽略：歌单卡片独立降级 */ }
+}
+
+function renderSaveResults(items) {
+  const container = $("#save-results");
+  if (!container) return;
+  if (!items.length) {
+    container.innerHTML = `<span class="muted pad">没有找到匹配的歌曲</span>`;
+    return;
+  }
+  container.innerHTML = items.map((item) => {
+    const title = escapeHtml(item.title || "未知标题");
+    const meta = [item.artist, item.album, item.quality, formatSaveDuration(item.duration)]
+      .filter((part) => typeof part === "string" && part)
+      .map((part) => escapeHtml(part))
+      .join(" · ");
+    return `
+      <div class="lx-item save-item">
+        <div class="lx-item-main">
+          <div class="lx-item-header"><span class="lx-item-name">${title}</span></div>
+          <div class="lx-item-url">${meta || "未知歌手"}</div>
+        </div>
+        <div class="lx-item-btns">
+          <button class="btn small save-track-btn" type="button" data-song-id="${Number(item.song_id) || 0}">保存</button>
+          <span class="muted save-track-state"></span>
+        </div>
+      </div>`;
+  }).join("");
+  container.querySelectorAll(".save-track-btn").forEach((button) => {
+    button.addEventListener("click", () => { void saveOneTrack(button); });
+  });
+}
+
+async function searchSaveTracks() {
+  if (!saveState.enabled || saveState.searching) return;
+  const input = $("#save-keyword");
+  const resultEl = $("#save-result");
+  const keyword = input ? input.value.trim() : "";
+  if (!keyword) {
+    if (resultEl) resultEl.textContent = "请输入搜索关键词";
+    return;
+  }
+  const seq = ++saveState.searchSeq;
+  saveState.searching = true;
+  const button = $("#save-search-btn");
+  if (button) button.disabled = true;
+  if (resultEl) resultEl.textContent = "搜索中…";
+  try {
+    const { ok, body } = await manualSaveApi(
+      "/api/manual-save/search?keyword=" + encodeURIComponent(keyword),
+    );
+    if (seq !== saveState.searchSeq) return;
+    if (!ok || !body || body.ok !== true) {
+      if (resultEl) resultEl.textContent = "搜索失败：" + manualSaveMessage(body, "服务不可用");
+      renderSaveResults([]);
+      return;
+    }
+    const items = body.data && Array.isArray(body.data.items) ? body.data.items : [];
+    if (resultEl) {
+      resultEl.textContent = items.length
+        ? "共找到 " + items.length + " 首，点击「保存」写入目标目录"
+        : "没有找到匹配的歌曲";
+    }
+    renderSaveResults(items);
+  } catch (exc) {
+    if (seq === saveState.searchSeq && resultEl) {
+      resultEl.textContent = "搜索失败：" + (exc && exc.message ? exc.message : "网络错误");
+    }
+  } finally {
+    if (seq === saveState.searchSeq) {
+      saveState.searching = false;
+      if (button) button.disabled = !saveState.enabled;
+    }
+  }
+}
+
+async function saveOneTrack(button) {
+  if (!saveState.enabled) return;
+  const songId = Number(button.dataset.songId);
+  if (!Number.isInteger(songId) || songId <= 0) return;
+  if (saveState.saving.has(songId)) return;
+  saveState.saving.add(songId);
+  button.disabled = true;
+  const row = button.closest(".save-item");
+  const stateEl = row ? row.querySelector(".save-track-state") : null;
+  if (stateEl) stateEl.textContent = "保存中…";
+  const resultEl = $("#save-result");
+  if (resultEl) resultEl.textContent = "正在保存，请保持页面打开…";
+  try {
+    const { body } = await manualSaveApi("/api/manual-save/track", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ song_id: songId }),
+    });
+    if (body && body.ok === true && body.code === "ok") {
+      const data = body.data || {};
+      // 音质只展示服务端上报的原始 token：不翻译档位名，也不用请求档顶替未知档。
+      const qualityParts = [];
+      if (data.quality_actual_status === "reported" && data.quality_actual) {
+        qualityParts.push("实际档位：" + data.quality_actual);
+        if (data.quality_fallback === true || data.quality_actual !== data.quality_requested) {
+          const requested = typeof data.quality_requested === "string" ? data.quality_requested : "";
+          if (requested) qualityParts.push("请求档位：" + requested);
+          qualityParts.push("回退");
+        }
+      } else if (data.quality_actual_status === "unknown") {
+        qualityParts.push("档位未知");
+      } else if (typeof data.quality_actual === "string" && data.quality_actual) {
+        // 旧引擎没有 quality_actual_status：保持原有展示，不推断档位状态。
+        qualityParts.push(data.quality_actual);
+      } else {
+        qualityParts.push("档位未知");
+      }
+      const parts = [
+        ...qualityParts, data.format, formatSaveSize(data.size),
+        data.basename, data.target_dir,
+      ].filter((part) => typeof part === "string" && part);
+      const coverLabels = {
+        embedded: "封面已嵌入", preserved: "源封面已保留",
+        unavailable: "音源未提供封面", unsupported: "封面格式不受 MP3 支持",
+        error: "封面获取或嵌入失败",
+      };
+      // 封面失败只展示固定原因，绝不回显 host/URL。
+      const coverErrorLabels = {
+        host_untrusted: "封面域名不在已验证列表（p1/p2），已跳过抓取",
+        address_untrusted: "封面地址未通过公网校验，已跳过抓取",
+        url_invalid: "封面地址格式无效，已跳过抓取",
+        http_error: "封面获取失败",
+        payload_invalid: "封面内容无效",
+        decode_failed: "封面解码失败",
+        embed_failed: "封面嵌入失败",
+      };
+      const lyricLabels = {
+        published: "歌词已保存为同名 LRC", unavailable: "音源未提供歌词",
+        error: "歌词获取或保存失败", conflict: "同名 LRC 已存在，未覆盖",
+        not_attempted: "歌词未处理", unknown: "歌词发布结果待核对",
+      };
+      if (data.cover_status === "error") {
+        parts.push(coverErrorLabels[data.cover_error] || "封面获取或嵌入失败");
+      } else {
+        parts.push(coverLabels[data.cover_status] || "封面状态未知");
+      }
+      parts.push(lyricLabels[data.lyric_status] || "歌词状态未知");
+      parts.push(data.artist_status === "tagged" ? "歌手标签已写入" : "音源未提供歌手");
+      const lyricist = data.lyricist_status === "tagged" && data.lyricist
+        ? "词：" + data.lyricist : "词：未提供";
+      const composer = data.composer_status === "tagged" && data.composer
+        ? "曲：" + data.composer : "曲：未提供";
+      parts.push(lyricist + " / " + composer);
+      const metadataFailed = data.cover_status === "error"
+        || data.lyric_status === "error" || data.lyric_status === "unknown";
+      const prefix = metadataFailed
+        ? "音频已发布；部分元数据/歌词附加项失败（文件分开发布）："
+        : "音频已保存；元数据状态：";
+      if (stateEl) stateEl.textContent = "已保存";
+      if (resultEl) resultEl.textContent = prefix + parts.join(" · ");
+    } else if (body && body.code === "conflict") {
+      if (stateEl) stateEl.textContent = "已存在";
+      if (resultEl) resultEl.textContent = "目标目录已存在同名文件，未覆盖。";
+    } else {
+      if (stateEl) stateEl.textContent = "失败";
+      if (resultEl) resultEl.textContent = "保存失败：" + manualSaveMessage(body, "内部错误");
+    }
+  } catch (exc) {
+    if (stateEl) stateEl.textContent = "失败";
+    if (resultEl) resultEl.textContent = "保存失败：" + (exc && exc.message ? exc.message : "网络错误");
+  } finally {
+    saveState.saving.delete(songId);
+    button.disabled = false;
+  }
+}
+
+const saveSearchButton = $("#save-search-btn");
+if (saveSearchButton) saveSearchButton.addEventListener("click", () => { void searchSaveTracks(); });
+const saveKeywordInput = $("#save-keyword");
+if (saveKeywordInput) {
+  saveKeywordInput.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); void searchSaveTracks(); }
+  });
+}
+
+/* --------------------------------------------------------- 手动保存歌单 */
+/* 合同：docs/MANUAL_SAVE_PLAYLIST_JOB.md §3.5/§6.3/§6.4/§6.5/§7.2/§8
+ * 纪律：
+ * - 所有请求复用 manualSaveApi（自动带 x-fnmusic-save: 1），信封固定 {ok,code,message,data}；
+ * - 文案只走固定表，未知 code 回落 internal 文案，绝不拼接服务端原始文本；
+ * - 推进严格串行：一次 advance 只跑一首，成功（disposition=continue）立即下一首；
+ *   只有 busy / no_work / 504 超时 / 网络错误才退避，且都不重放"未查询即重试"；
+ * - 终态（completed 系列 / partial / cancelled / reconciliation_required）或队尾停止轮询；
+ * - 前端不把任何 URL/Cookie/路径写进 DOM 或 console。 */
+const PLAYLIST_API = "/api/manual-save/playlist";
+const PLAYLIST_JOB_STORAGE_KEY = "fnmusic.save.playlist.job.v1";
+const PLAYLIST_MAX_OPTIONS = 100;      // §3.2：列表最多 100 张（服务端无分页）
+const PLAYLIST_BACKOFF_BASE_MS = 600;  // 退避：600 → 1200 → 2400 → 3000（上限 3s）
+const PLAYLIST_BACKOFF_MAX_MS = 3000;
+const PLAYLIST_MAX_NO_WORK = 5;        // §7.2：no_work 最多连续 5 次
+const PLAYLIST_MAX_TRANSIENT = 5;      // busy / 网络错误连续上限，避免无限轮询
+const PLAYLIST_JOB_ID_RE = /^[0-9a-f]{48}$/;
+const PLAYLIST_FINGERPRINT_RE = /^[0-9a-f]{64}$/;
+const PLAYLIST_RECONCILE_TEXT = "存在结果未知的位置，已停止推进。请核对 NAS 上是否已出现该文件后再人工处理。";
+const PLAYLIST_TERMINAL_STATES = new Set([
+  "cancelled", "partial", "completed_with_issues",
+  "completed_bytes_reported", "reconciliation_required",
+]);
+
+// §3.9.1 固定 code → 固定中文（与网关逐字一致）。未登记的 code 一律回落 internal。
+const PLAYLIST_CODE_MESSAGES = {
+  ok: "",
+  invalid_request: "请求无效",
+  invalid_playlist_id: "歌单 ID 必须是正整数",
+  invalid_fingerprint: "快照指纹无效",
+  invalid_idempotency_key: "幂等键无效",
+  not_found: "任务不存在",
+  forbidden: "仅管理员可执行手动保存",
+  disabled: "手动保存未启用",
+  playlist_disabled: "整歌单保存未启用",
+  not_logged_in: "网易云账号未登录",
+  config_invalid: "手动保存配置无效",
+  playlist_unavailable: "音乐服务不可用",
+  playlist_unsupported: "该歌单不支持可验证快照",
+  playlist_too_large: "歌单成员超过 1000 个",
+  manifest_incomplete: "歌单成员清单不完整",
+  source_changed: "歌单在确认后发生变化，请重新读取",
+  source_artifact_mismatch: "音乐服务版本与固定证据不一致",
+  idempotency_conflict: "幂等键已用于不同清单",
+  capacity_exceeded: "任务账本容量已满",
+  ledger_unavailable: "任务账本不可用",
+  busy: "已有保存任务进行中",
+  completion_unknown: "任务结果写入失败，需人工核对",
+  stale_completion: "迟到的执行结果未覆盖记录",
+  timeout: "保存超时",
+  internal: "内部错误",
+};
+
+// §6.2 位置状态固定中文
+const PLAYLIST_POSITION_LABELS = {
+  queued: "等待",
+  running: "保存中",
+  published: "已发布",
+  published_cleanup_pending: "已发布（暂存待清理）",
+  conflict: "已存在（未覆盖）",
+  cancelled: "已取消",
+  rejected: "未保存",
+  failed: "失败",
+  commit_unknown: "结果未知",
+  unknown: "状态未知",
+};
+
+// §6.2 位置 reason 固定中文（用于推进响应的 run.reason；位置列表用服务端 reason_message）
+const PLAYLIST_REASON_MESSAGES = {
+  bytes_published: "已发布",
+  destination_conflict: "目标已存在同名文件，未覆盖",
+  cancelled_before_publish: "已取消（未执行）",
+  commit_unknown: "执行结果未知，需要人工对账",
+  stage_unavailable: "暂存不可用",
+  staging_failed: "暂存不可用",
+  cancel_check_failed: "取消检查失败（按已取消处理）",
+  disabled: "手动保存未启用",
+  config_invalid: "手动保存配置无效",
+  busy: "已有保存任务进行中",
+  service_unavailable: "音乐服务不可用",
+  no_quality_available: "没有可用的音质",
+  quality_unverified: "音质响应无法核验",
+  quality_identity_mismatch: "无法确认音质响应所属曲目",
+  trial_only: "仅取得试听片段，未保存",
+  download_target_untrusted: "下载目标未通过安全校验",
+  download_failed: "下载失败",
+  integrity_mismatch: "文件校验不一致",
+  invalid_audio: "音频文件无效",
+  tag_failed: "写入标签失败",
+  invalid_target: "输入无效，未执行",
+};
+
+const playlistState = {
+  enabled: false,          // 整歌单开关（GET playlists 成功即开启）
+  loaded: false,
+  disabledCode: "",
+  playlists: [],
+  selectedId: 0,
+  snapshot: null,          // {playlist_id, source_fingerprint, track_count, ...}
+  jobId: "",
+  job: null,
+  positions: [],
+  running: false,          // 推进循环在跑（串行守卫）
+  stopRequested: false,
+  terminal: false,
+  message: "",
+  storageAvailable: true,
+};
+
+function playlistSleep(ms) {
+  // 测试替换点：测试用可控计时桩替换本函数（不真 sleep）
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
+}
+
+function playlistBackoffDelay(attempt) {
+  const index = Number.isInteger(attempt) && attempt > 0 ? attempt : 0;
+  const delay = PLAYLIST_BACKOFF_BASE_MS * Math.pow(2, index);
+  return Math.min(PLAYLIST_BACKOFF_MAX_MS, delay);
+}
+
+function playlistJobMessage(body, fallback) {
+  const code = body && typeof body.code === "string" ? body.code : "";
+  if (Object.prototype.hasOwnProperty.call(PLAYLIST_CODE_MESSAGES, code)) {
+    return PLAYLIST_CODE_MESSAGES[code];
+  }
+  // §6.3：未知码 → internal 文案，绝不回显服务端 message/异常文本
+  return fallback || PLAYLIST_CODE_MESSAGES.internal;
+}
+
+function playlistReasonMessage(reason) {
+  if (typeof reason !== "string" || !reason) return "";
+  if (Object.prototype.hasOwnProperty.call(PLAYLIST_REASON_MESSAGES, reason)) {
+    return PLAYLIST_REASON_MESSAGES[reason];
+  }
+  return "未保存（原因未登记）";  // §6.2 固定兜底
+}
+
+function playlistJobStateText(job) {
+  const state = job && typeof job.state === "string" ? job.state : "unknown";
+  const total = Number.isInteger(job && job.positions_total) && job.positions_total > 0 ? job.positions_total : 0;
+  switch (state) {
+    case "queued": return total > 0 ? "等待开始（共 " + total + " 首）" : "等待开始";
+    case "running": return "正在保存…";
+    case "cancelling": return "正在取消…（当前这首会跑完）";
+    case "cancelled": return "已取消";
+    case "partial": return "部分完成（有失败项）";
+    case "completed_with_issues": return "已完成但有失败项";
+    case "completed_bytes_reported": return "已完成（仅表示字节已发布，不表示可播放/已入库）";
+    case "reconciliation_required": return "需要对账：存在结果未知的位置";
+    default: return "状态未知";
+  }
+}
+
+function playlistProgressText(job) {
+  const counts = job && job.counts && typeof job.counts === "object" ? job.counts : {};
+  const count = (key) => (Number.isInteger(counts[key]) && counts[key] > 0 ? counts[key] : 0);
+  const published = count("published") + count("published_cleanup_pending");
+  const conflict = count("conflict");
+  const failed = count("failed") + count("rejected");
+  // ``commit_unknown`` 是"结果未知"，不是失败：单独计数，避免与冻结语义混淆。
+  const unknown = count("commit_unknown");
+  const queued = count("queued");
+  const running = count("running");
+  const cancelled = count("cancelled");
+  let total = Number.isInteger(job && job.positions_total) && job.positions_total > 0 ? job.positions_total : 0;
+  if (!total) total = published + conflict + failed + queued + running + cancelled;
+  const processed = Math.max(0, total - queued - running);
+  let text = "已处理 " + processed + "/" + total
+    + "：已发布 " + published + " · 已存在 " + conflict
+    + " · 失败 " + failed + " · 未执行 " + queued;
+  if (running > 0) text += " · 保存中 " + running;
+  if (unknown > 0) text += " · 结果未知 " + unknown;
+  if (cancelled > 0) text += " · 已取消 " + cancelled;
+  return text;
+}
+
+function playlistRenderPositions(positions) {
+  const rows = Array.isArray(positions) ? positions : [];
+  if (!rows.length) return "";
+  const seen = new Map();
+  rows.forEach((row) => {
+    const sourceId = row && typeof row.source_id === "string" ? row.source_id : "";
+    if (sourceId) seen.set(sourceId, (seen.get(sourceId) || 0) + 1);
+  });
+  return rows.map((row, index) => {
+    const raw = row && typeof row === "object" ? row : {};
+    const position = Number.isInteger(raw.position) && raw.position > 0 ? raw.position : index + 1;
+    const state = typeof raw.state === "string" ? raw.state : "unknown";
+    const stateText = PLAYLIST_POSITION_LABELS[state] || "状态未知";
+    const reason = typeof raw.reason_message === "string" ? raw.reason_message : "";
+    const sourceId = typeof raw.source_id === "string" ? raw.source_id : "";
+    const duplicate = sourceId && (seen.get(sourceId) || 0) > 1;
+    // §6.3：所有来自服务端的字符串统一 escapeHtml
+    const metaParts = [reason, sourceId, duplicate ? "重复位置" : ""]
+      .filter((part) => typeof part === "string" && part)
+      .map((part) => escapeHtml(part));
+    return '<div class="lx-item"><div class="lx-item-main">'
+      + '<div class="lx-item-header"><span class="lx-item-name">'
+      + escapeHtml("#" + position + " " + stateText) + "</span></div>"
+      + '<div class="lx-item-url">' + metaParts.join(" · ") + "</div>"
+      + "</div></div>";
+  }).join("");
+}
+
+function playlistUpdateButtons() {
+  const enabled = playlistState.enabled === true;
+  const busy = playlistState.running === true;
+  const job = playlistState.job;
+  const state = job && typeof job.state === "string" ? job.state : "";
+  const blockedForStart = state === "reconciliation_required" || state === "cancelling";
+  const select = $("#playlist-select");
+  if (select) select.disabled = !enabled || busy;
+  const refreshBtn = $("#playlist-refresh-btn");
+  if (refreshBtn) refreshBtn.disabled = !enabled || busy;
+  const snapshotBtn = $("#playlist-snapshot-btn");
+  if (snapshotBtn) {
+    snapshotBtn.disabled = !enabled || busy
+      || !Number.isInteger(playlistState.selectedId) || playlistState.selectedId <= 0;
+  }
+  const startBtn = $("#playlist-start-btn");
+  if (startBtn) {
+    const canStart = enabled && !busy && !blockedForStart
+      && !!playlistState.snapshot && playlistState.snapshot.enumeration_complete === true;
+    startBtn.disabled = !canStart;
+  }
+  const stopBtn = $("#playlist-stop-btn");
+  if (stopBtn) stopBtn.disabled = !busy;
+  const cancelBtn = $("#playlist-cancel-btn");
+  if (cancelBtn) {
+    // §3.8：reconciliation_required 保留取消；cancelling 不再可取消
+    const canCancel = enabled && !!job
+      && (state === "queued" || state === "running" || state === "reconciliation_required");
+    cancelBtn.disabled = !canCancel;
+  }
+}
+
+function playlistSetSnapshotStatus(text) {
+  const el = $("#playlist-snapshot-status");
+  if (el) el.textContent = typeof text === "string" ? text : "";
+}
+
+function playlistRenderJob() {
+  const panel = $("#playlist-job-panel");
+  if (!panel) return;
+  const job = playlistState.job;
+  if (!job) {
+    panel.hidden = true;
+    // 隐藏面板的同时清空旧渲染，避免刷新失败后 DOM 里残留过期进度。
+    const staleList = $("#playlist-positions");
+    if (staleList) staleList.innerHTML = "";
+    playlistUpdateButtons();
+    return;
+  }
+  panel.hidden = false;
+  const stateEl = $("#playlist-job-state");
+  if (stateEl) stateEl.textContent = "任务状态：" + playlistJobStateText(job);
+  const progressEl = $("#playlist-progress");
+  if (progressEl) progressEl.textContent = playlistProgressText(job);
+  const messageEl = $("#playlist-run-message");
+  if (messageEl) messageEl.textContent = playlistState.message || "";
+  const banner = $("#playlist-reconcile-banner");
+  if (banner) {
+    const reconcile = job.state === "reconciliation_required"
+      || (playlistState.positions || []).some((row) => row && row.state === "commit_unknown");
+    banner.textContent = PLAYLIST_RECONCILE_TEXT;
+    banner.hidden = !reconcile;
+  }
+  const list = $("#playlist-positions");
+  if (list) list.innerHTML = playlistRenderPositions(playlistState.positions);
+  playlistUpdateButtons();
+}
+
+function playlistRenderOptions() {
+  const select = $("#playlist-select");
+  const rows = Array.isArray(playlistState.playlists)
+    ? playlistState.playlists.slice(0, PLAYLIST_MAX_OPTIONS)
+    : [];
+  const options = [];
+  rows.forEach((row) => {
+    const playlistId = row && row.playlist_id;
+    if (!Number.isInteger(playlistId) || playlistId <= 0) return;
+    const name = row && typeof row.name === "string" && row.name ? row.name : "未命名歌单";
+    const trackCount = row && Number.isInteger(row.track_count) && row.track_count >= 0
+      ? row.track_count : 0;
+    options.push('<option value="' + playlistId + '">'
+      + escapeHtml(name) + "（" + trackCount + " 首）</option>");
+  });
+  if (select) {
+    select.innerHTML = options.length ? options.join("") : '<option value="">没有可选歌单</option>';
+  }
+  const ids = rows.filter((row) => Number.isInteger(row && row.playlist_id) && row.playlist_id > 0)
+    .map((row) => row.playlist_id);
+  if (ids.indexOf(playlistState.selectedId) < 0) {
+    playlistState.selectedId = ids.length ? ids[0] : 0;
+    playlistState.snapshot = null;
+    playlistSetSnapshotStatus("");
+  }
+  if (select && playlistState.selectedId > 0) select.value = String(playlistState.selectedId);
+}
+
+/* localStorage 读取/写入全部 try/catch：隐私模式/配额/无存储时降级为会话内状态（§6.5.4） */
+function playlistStorage() {
+  try {
+    const store = typeof globalThis !== "undefined" ? globalThis.localStorage : undefined;
+    if (!store || typeof store.getItem !== "function" || typeof store.setItem !== "function") return null;
+    return store;
+  } catch (_) {
+    return null;
+  }
+}
+
+function playlistReadStoredJob() {
+  try {
+    const store = playlistStorage();
+    if (!store) { playlistState.storageAvailable = false; return null; }
+    playlistState.storageAvailable = true;
+    const raw = store.getItem(PLAYLIST_JOB_STORAGE_KEY);
+    if (typeof raw !== "string" || !raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    const jobId = typeof parsed.job_id === "string" ? parsed.job_id : "";
+    const playlistId = parsed.playlist_id;
+    if (!PLAYLIST_JOB_ID_RE.test(jobId)) return null;
+    if (!Number.isInteger(playlistId) || playlistId <= 0) return null;
+    return {
+      job_id: jobId,
+      playlist_id: playlistId,
+      source_fingerprint: typeof parsed.source_fingerprint === "string" ? parsed.source_fingerprint : "",
+      manifest_sha256: typeof parsed.manifest_sha256 === "string" ? parsed.manifest_sha256 : "",
+    };
+  } catch (_) {
+    playlistState.storageAvailable = false;
+    return null;
+  }
+}
+
+function playlistStoreJob() {
+  const jobId = playlistState.jobId;
+  const snapshot = playlistState.snapshot;
+  if (!jobId || !PLAYLIST_JOB_ID_RE.test(jobId)) return false;
+  try {
+    const store = playlistStorage();
+    if (!store) { playlistState.storageAvailable = false; return false; }
+    store.setItem(PLAYLIST_JOB_STORAGE_KEY, JSON.stringify({
+      playlist_id: snapshot && Number.isInteger(snapshot.playlist_id) ? snapshot.playlist_id : 0,
+      job_id: jobId,
+      source_fingerprint: snapshot && typeof snapshot.source_fingerprint === "string"
+        ? snapshot.source_fingerprint : "",
+      manifest_sha256: playlistState.job && typeof playlistState.job.manifest_sha256 === "string"
+        ? playlistState.job.manifest_sha256 : "",
+    }));
+    playlistState.storageAvailable = true;
+    return true;
+  } catch (_) {
+    playlistState.storageAvailable = false;
+    return false;
+  }
+}
+
+function playlistClearStoredJob() {
+  try {
+    const store = playlistStorage();
+    if (store && typeof store.removeItem === "function") store.removeItem(PLAYLIST_JOB_STORAGE_KEY);
+  } catch (_) { /* 存储不可用：忽略，会话内状态仍然有效 */ }
+}
+
+function playlistDisabledText(code, response) {
+  if (code === "playlist_disabled") {
+    return "整歌单保存未启用：请在 .env 设置 FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED=true 后重启代理。";
+  }
+  if (code === "disabled") {
+    return "手动保存未启用：请在 .env 设置 FNMUSIC_MANUAL_SAVE_ENABLED=true 后重启代理。";
+  }
+  if (code === "not_logged_in") {
+    return "网易云账号未登录：请先在「账号」里扫码登录后再使用整歌单保存。";
+  }
+  if (code === "forbidden") return "仅管理员可执行手动保存：请通过飞牛桌面打开管理台。";
+  const status = response && Number.isInteger(response.status) ? response.status : 0;
+  return "无法读取整歌单保存状态（HTTP " + status + "）："
+    + playlistJobMessage(response && response.body, "服务不可用") + "。";
+}
+
+async function loadPlaylistSaveStatus() {
+  const statusEl = $("#playlist-status");
+  const wasEnabled = playlistState.enabled;
+  playlistState.loaded = true;
+  // 单曲开关关闭时不得发起任何 playlist 请求（§6.3 禁用守卫 6）
+  if (!saveState.enabled) {
+    playlistState.enabled = false;
+    playlistState.playlists = [];
+    playlistState.disabledCode = "disabled";
+    if (wasEnabled) { playlistState.job = null; playlistState.positions = []; playlistState.jobId = ""; }
+    if (statusEl) statusEl.textContent = "整歌单保存不可用：单曲手动保存未启用。";
+    playlistRenderOptions();
+    playlistRenderJob();
+    playlistUpdateButtons();
+    return false;
+  }
+  playlistState.enabled = false;
+  playlistState.disabledCode = "";
+  if (statusEl) statusEl.textContent = "正在读取整歌单保存状态…";
+  playlistUpdateButtons();
+  let response;
+  try {
+    response = await manualSaveApi(PLAYLIST_API + "/playlists");
+  } catch (_) {
+    if (statusEl) statusEl.textContent = "读取整歌单保存状态失败：网络错误，请稍后重试。";
+    // 失败时清掉可能残留的旧任务面板，避免显示过期进度（按钮由 updateButtons 禁用）。
+    playlistState.jobId = "";
+    playlistState.job = null;
+    playlistState.positions = [];
+    playlistState.message = "";
+    playlistState.terminal = false;
+    playlistRenderJob();
+    playlistUpdateButtons();
+    return false;
+  }
+  const body = (response && response.body) || {};
+  const data = (body && body.data) || {};
+  if (response && response.ok === true && body.ok === true && Array.isArray(data.playlists)) {
+    playlistState.enabled = true;
+    playlistState.disabledCode = "";
+    playlistState.playlists = data.playlists.slice(0, PLAYLIST_MAX_OPTIONS);
+    if (statusEl) {
+      statusEl.textContent = "整歌单保存已启用；共 " + playlistState.playlists.length
+        + " 张歌单（最多显示 100 张）。";
+    }
+    playlistRenderOptions();
+    playlistUpdateButtons();
+    await playlistResumeFromStorage();  // §6.5 路径 1：localStorage 恢复
+    return true;
+  }
+  playlistState.playlists = [];
+  playlistState.disabledCode = body && typeof body.code === "string" ? body.code : "";
+  if (statusEl) statusEl.textContent = playlistDisabledText(playlistState.disabledCode, response);
+  playlistRenderOptions();
+  playlistRenderJob();
+  playlistUpdateButtons();
+  return false;
+}
+
+function playlistSelectPlaylist(value) {
+  const playlistId = Number(value);
+  playlistState.selectedId = Number.isInteger(playlistId) && playlistId > 0 ? playlistId : 0;
+  playlistState.snapshot = null;
+  playlistSetSnapshotStatus("");
+  playlistUpdateButtons();
+}
+
+async function playlistReadSnapshot() {
+  if (!playlistState.enabled) return false;
+  const playlistId = playlistState.selectedId;
+  if (!Number.isInteger(playlistId) || playlistId <= 0) {
+    playlistSetSnapshotStatus("请先选择歌单。");
+    return false;
+  }
+  playlistState.snapshot = null;
+  playlistSetSnapshotStatus("正在读取歌单清单…");
+  playlistUpdateButtons();
+  let response;
+  try {
+    response = await manualSaveApi(PLAYLIST_API + "/snapshot?playlist_id=" + playlistId);
+  } catch (_) {
+    playlistSetSnapshotStatus("读取清单失败：网络错误，请稍后重试；不能创建保存任务。");
+    playlistUpdateButtons();
+    return false;
+  }
+  const body = (response && response.body) || {};
+  const data = (body && body.data) || {};
+  const complete = response && response.ok === true && body.ok === true
+    && data.enumeration_complete === true
+    && typeof data.source_fingerprint === "string"
+    && PLAYLIST_FINGERPRINT_RE.test(data.source_fingerprint);
+  if (complete) {
+    const trackCount = Number.isInteger(data.track_count) && data.track_count >= 0 ? data.track_count : 0;
+    const positionCount = Number.isInteger(data.position_count) && data.position_count >= 0
+      ? data.position_count : 0;
+    const duplicate = Number.isInteger(data.duplicate_position_count) && data.duplicate_position_count > 0
+      ? data.duplicate_position_count : 0;
+    playlistState.snapshot = {
+      playlist_id: playlistId,
+      source_fingerprint: data.source_fingerprint,
+      track_count: trackCount,
+      position_count: positionCount,
+      duplicate_position_count: duplicate,
+      enumeration_complete: true,
+    };
+    playlistSetSnapshotStatus("共 " + trackCount + " 首（含 " + duplicate + " 个重复位置），可以开始保存。");
+    playlistUpdateButtons();
+    return true;
+  }
+  // 不完整/失败：固定文案 + 不进入可创建状态（snapshot 保持 null → 开始按钮 disabled）
+  const sourceCode = data && typeof data.source_error_code === "string" && data.source_error_code
+    ? "（" + escapeHtml(data.source_error_code) + "）" : "";
+  const prefix = data && data.enumeration_complete === false
+    ? "歌单成员清单不完整" + sourceCode
+    : "读取清单失败：" + playlistJobMessage(body, "服务不可用");
+  playlistSetSnapshotStatus(prefix + "；不能创建保存任务。");
+  playlistUpdateButtons();
+  return false;
+}
+
+async function playlistRefreshJob(jobId) {
+  const rawId = typeof jobId === "string" ? jobId : playlistState.jobId;
+  const id = PLAYLIST_JOB_ID_RE.test(rawId) ? rawId : "";
+  if (!id) return false;
+  let response;
+  try {
+    response = await manualSaveApi(PLAYLIST_API + "/job?job_id=" + id);
+  } catch (_) {
+    return false;
+  }
+  const body = (response && response.body) || {};
+  const data = (body && body.data) || {};
+  if (response && response.ok === true && body.ok === true && data.job && typeof data.job === "object") {
+    const jobId_ = typeof data.job.job_id === "string" && PLAYLIST_JOB_ID_RE.test(data.job.job_id)
+      ? data.job.job_id : id;
+    playlistState.jobId = jobId_;
+    playlistState.job = data.job;
+    playlistState.positions = Array.isArray(data.positions) ? data.positions : [];
+    playlistState.terminal = PLAYLIST_TERMINAL_STATES.has(data.job.state);
+    playlistRenderJob();
+    return true;
+  }
+  if (body && body.code === "not_found") {
+    playlistClearStoredJob();
+    playlistState.jobId = "";
+    playlistState.job = null;
+    playlistState.positions = [];
+    playlistState.terminal = false;
+    playlistState.message = "";
+    playlistSetSnapshotStatus("任务不存在：请重新读取歌单清单后创建。");
+    playlistRenderJob();
+  }
+  return false;
+}
+
+function playlistRunMessage(run) {
+  const status = run && typeof run.status === "string" ? run.status : "";
+  const position = run && Number.isInteger(run.position) && run.position > 0 ? run.position : 0;
+  const where = position > 0 ? "位置 " + position + "：" : "";
+  const reasonText = playlistReasonMessage(run && run.reason);
+  if (status === "no_work") return "暂无待执行位置（可能另一窗口正在推进）。";
+  if (status === "commit_unknown" || status === "completion_unknown") {
+    return where + "执行结果未知，需要人工对账。";
+  }
+  if (status === "stale_completion") return where + "迟到的执行结果未覆盖记录。";
+  if (status === "completed") return where + (reasonText || "已处理");
+  return where + "保存结果：" + (reasonText || "已处理");
+}
+
+async function playlistCreateAndStart() {
+  if (!playlistState.enabled) return false;
+  const snapshot = playlistState.snapshot;
+  if (!snapshot || snapshot.enumeration_complete !== true
+      || !PLAYLIST_FINGERPRINT_RE.test(snapshot.source_fingerprint || "")) {
+    playlistSetSnapshotStatus("请先成功读取歌单清单，再开始保存。");
+    return false;
+  }
+  const previousJobId = playlistState.jobId;
+  let response;
+  try {
+    response = await manualSaveApi(PLAYLIST_API + "/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        playlist_id: snapshot.playlist_id,
+        source_fingerprint: snapshot.source_fingerprint,
+      }),
+    });
+  } catch (_) {
+    playlistSetSnapshotStatus("创建任务失败：网络错误，请稍后重试。");
+    return false;
+  }
+  const body = (response && response.body) || {};
+  const data = (body && body.data) || {};
+  if (!(response && response.ok === true && body.ok === true
+        && data.job && typeof data.job === "object")) {
+    playlistSetSnapshotStatus("创建任务失败：" + playlistJobMessage(body, "服务不可用") + "。");
+    return false;
+  }
+  const job = data.job;
+  const jobId = typeof job.job_id === "string" && PLAYLIST_JOB_ID_RE.test(job.job_id) ? job.job_id : "";
+  if (!jobId) {
+    playlistSetSnapshotStatus("创建任务失败：内部错误。");
+    return false;
+  }
+  // §3.4 派生幂等键：同歌单 + 同指纹的重复创建命中同一个 job
+  const reused = playlistState.jobId === jobId || previousJobId === jobId;
+  playlistState.jobId = jobId;
+  playlistState.job = job;
+  playlistState.positions = [];
+  playlistState.terminal = PLAYLIST_TERMINAL_STATES.has(job.state);
+  playlistState.message = "";
+  playlistStoreJob();
+  await playlistRefreshJob(jobId);
+  playlistSetSnapshotStatus(reused
+    ? "已存在同一任务（同一歌单 + 同一快照指纹），继续上次进度。"
+    : "已创建保存任务，开始逐首推进。");
+  playlistRenderJob();
+  if (!PLAYLIST_TERMINAL_STATES.has(playlistState.job.state)) {
+    void playlistAdvanceLoop(jobId);
+  }
+  return true;
+}
+
+async function playlistAdvanceLoop(jobId) {
+  const rawId = typeof jobId === "string" ? jobId : playlistState.jobId;
+  const id = PLAYLIST_JOB_ID_RE.test(rawId) ? rawId : "";
+  if (!id) return null;
+  if (playlistState.running) return null;  // 串行守卫：绝不发起第二个并行 advance
+  playlistState.running = true;
+  playlistState.stopRequested = false;
+  playlistState.jobId = id;
+  let transient = 0;
+  let noWork = 0;
+  try {
+    while (!playlistState.stopRequested) {
+      const job = playlistState.job;
+      if (!job || typeof job.state !== "string") break;
+      if (PLAYLIST_TERMINAL_STATES.has(job.state)) break;
+      if (job.state === "cancelling") break;  // §6.1：cancelling 不允许推进（no_work）
+      playlistUpdateButtons();
+      let response;
+      try {
+        response = await manualSaveApi(PLAYLIST_API + "/advance", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ job_id: id }),
+        });
+      } catch (_) {
+        transient += 1;
+        if (transient >= PLAYLIST_MAX_TRANSIENT) {
+          playlistState.message = "推进失败：网络错误，已停止本页推进，请稍后刷新查看任务状态。";
+          break;
+        }
+        playlistState.message = "网络错误，正在重试（第 " + transient + " 次）…";
+        playlistRenderJob();
+        await playlistSleep(playlistBackoffDelay(transient - 1));
+        continue;
+      }
+      const body = (response && response.body) || {};
+      const code = body && typeof body.code === "string" ? body.code : "";
+      const data = (body && body.data) || {};
+      const okRun = response && response.ok === true && body.ok === true
+        && data.run && typeof data.run === "object" && data.job && typeof data.job === "object";
+      if (okRun) {
+        transient = 0;
+        const run = data.run;
+        const runStatus = typeof run.status === "string" ? run.status : "";
+        playlistState.job = data.job;
+        playlistState.message = playlistRunMessage(run);
+        if (runStatus !== "no_work") noWork = 0;
+        // 逐首刷新位置列表（一次 GET job），保证进度与失败逐首可见
+        const refreshed = await playlistRefreshJob(id);
+        if (!refreshed) playlistRenderJob();
+        const jobState = playlistState.job && typeof playlistState.job.state === "string"
+          ? playlistState.job.state : "";
+        if (PLAYLIST_TERMINAL_STATES.has(jobState)) { playlistClearStoredJob(); break; }
+        // §3.6：freeze → 停止并转对账；abort → 停止并提示
+        if (run.disposition === "freeze" || runStatus === "commit_unknown"
+            || runStatus === "completion_unknown" || runStatus === "stale_completion") {
+          break;
+        }
+        if (run.disposition === "abort") break;
+        if (runStatus === "no_work") {
+          noWork += 1;
+          if (noWork >= PLAYLIST_MAX_NO_WORK) {
+            playlistState.message = "另一窗口正在推进或状态异常，已停止本页推进。";
+            playlistRenderJob();
+            break;
+          }
+          playlistState.message = "暂无待执行位置（另一窗口可能正在推进），稍后自动重试…";
+          playlistRenderJob();
+          await playlistSleep(PLAYLIST_BACKOFF_BASE_MS);
+          const again = await playlistRefreshJob(id);
+          if (!again) { playlistState.message = "任务读取失败，已停止本页推进。"; break; }
+          continue;
+        }
+        continue;  // completed + continue：立即进入下一首（不留空转延迟，§7.2）
+      }
+      if (code === "busy") {
+        transient += 1;
+        if (transient >= PLAYLIST_MAX_TRANSIENT) {
+          playlistState.message = "另一窗口长时间占用保存任务，已停止本页推进，请稍后刷新。";
+          break;
+        }
+        playlistState.message = "另一窗口正在保存，本页稍后自动继续…";
+        playlistRenderJob();
+        await playlistSleep(playlistBackoffDelay(transient - 1));
+        await playlistRefreshJob(id);
+        continue;
+      }
+      if (code === "timeout" || (response && response.status === 504)) {
+        // §7.3：504 不是取消/失败——先 GET job 再判定，绝不盲目重放 advance
+        playlistState.message = "保存超时：正在核对任务状态…";
+        playlistRenderJob();
+        const refreshed = await playlistRefreshJob(id);
+        if (!refreshed || !playlistState.job) {
+          playlistState.message = "保存超时且未能读取任务状态，已停止推进，请稍后刷新。";
+          break;
+        }
+        if (PLAYLIST_TERMINAL_STATES.has(playlistState.job.state)) break;
+        const stillRunning = (playlistState.positions || []).some(
+          (row) => row && (row.state === "running" || row.state === "queued"));
+        if (stillRunning) {
+          playlistState.message = "上次保存请求超时：任务仍在执行，已停止本页推进，请稍后刷新查看进度。";
+          break;
+        }
+        playlistState.message = "上次保存请求超时，已按账本状态继续推进。";
+        playlistRenderJob();
+        await playlistSleep(playlistBackoffDelay(0));
+        continue;
+      }
+      playlistState.message = "推进失败：" + playlistJobMessage(body, "内部错误") + "（已停止本页推进）";
+      playlistRenderJob();
+      break;
+    }
+  } finally {
+    playlistState.running = false;
+    playlistState.terminal = !!(playlistState.job
+      && PLAYLIST_TERMINAL_STATES.has(playlistState.job.state));
+    playlistRenderJob();
+  }
+  return playlistState.message;
+}
+
+async function playlistCancelJob() {
+  if (!playlistState.enabled) return false;
+  const jobId = playlistState.jobId;
+  if (!jobId) {
+    playlistState.message = "当前没有可取消的任务。";
+    playlistRenderJob();
+    return false;
+  }
+  playlistState.message = "正在取消…";
+  playlistRenderJob();
+  let response;
+  try {
+    response = await manualSaveApi(PLAYLIST_API + "/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_id: jobId }),
+    });
+  } catch (_) {
+    playlistState.message = "取消失败：网络错误，请稍后重试。";
+    playlistRenderJob();
+    return false;
+  }
+  const body = (response && response.body) || {};
+  const data = (body && body.data) || {};
+  if (response && response.ok === true && body.ok === true
+      && data.job && typeof data.job === "object") {
+    playlistState.stopRequested = true;  // 取消后本页不再发起 advance
+    playlistState.job = data.job;
+    playlistState.terminal = PLAYLIST_TERMINAL_STATES.has(data.job.state);
+    if (data.job.state === "cancelled") {
+      playlistClearStoredJob();
+      playlistState.message = "已取消：未开始的位置不会执行，已发布文件保留。";
+    } else if (data.job.state === "cancelling") {
+      playlistState.message = "正在取消：当前这首会跑完，之后不再开始新的位置。";
+    } else {
+      playlistState.message = "已请求取消：已发布文件保留。";
+    }
+    playlistRenderJob();
+    return true;
+  }
+  playlistState.message = "取消失败：" + playlistJobMessage(body, "服务不可用") + "。";
+  playlistRenderJob();
+  return false;
+}
+
+function playlistStopLoop() {
+  if (!playlistState.running) {
+    playlistState.message = "当前没有正在推进的任务。";
+    playlistRenderJob();
+    return false;
+  }
+  playlistState.stopRequested = true;
+  playlistState.message = "已停止推进：任务仍记录在账本中，可点「开始保存」或刷新页面后继续。";
+  playlistRenderJob();
+  return true;
+}
+
+async function playlistResumeFromStorage() {
+  // §6.3 守卫 6：单曲开关关闭时不得发起任何 playlist 请求
+  if (!saveState.enabled || !playlistState.enabled) return { resumed: false, reason: "disabled" };
+  if (playlistState.running) return { resumed: false, reason: "running" };
+  const stored = playlistReadStoredJob();
+  if (!stored) return { resumed: false, reason: "empty" };
+  if (stored.playlist_id > 0) {
+    playlistState.selectedId = stored.playlist_id;
+    const select = $("#playlist-select");
+    if (select) select.value = String(stored.playlist_id);
+  }
+  const found = await playlistRefreshJob(stored.job_id);
+  if (!found) {
+    playlistClearStoredJob();
+    return { resumed: false, reason: "unavailable" };
+  }
+  if (PLAYLIST_TERMINAL_STATES.has(playlistState.job.state)) {
+    playlistClearStoredJob();
+    playlistState.message = "已恢复上次任务：任务已结束，可重新读取清单后新建任务。";
+    playlistRenderJob();
+    return { resumed: false, reason: "terminal", jobId: playlistState.jobId };
+  }
+  playlistState.message = "已恢复上次未完成的任务进度，继续推进。";
+  playlistRenderJob();
+  void playlistAdvanceLoop(playlistState.jobId);  // 恢复轮询推进
+  return { resumed: true, jobId: playlistState.jobId };
+}
+
+// 只读快照：诊断/测试用，不改变任何状态
+function playlistUiState() {
+  return {
+    enabled: playlistState.enabled,
+    loaded: playlistState.loaded,
+    disabledCode: playlistState.disabledCode,
+    playlistCount: playlistState.playlists.length,
+    selectedId: playlistState.selectedId,
+    snapshot: playlistState.snapshot ? Object.assign({}, playlistState.snapshot) : null,
+    jobId: playlistState.jobId,
+    jobState: playlistState.job && typeof playlistState.job.state === "string" ? playlistState.job.state : "",
+    positionCount: playlistState.positions.length,
+    running: playlistState.running,
+    stopRequested: playlistState.stopRequested,
+    terminal: playlistState.terminal,
+    message: playlistState.message,
+    storageAvailable: playlistState.storageAvailable,
+  };
+}
+
+const playlistRefreshButton = $("#playlist-refresh-btn");
+if (playlistRefreshButton) {
+  playlistRefreshButton.addEventListener("click", () => { void loadPlaylistSaveStatus(); });
+}
+const playlistSelectEl = $("#playlist-select");
+if (playlistSelectEl) {
+  playlistSelectEl.addEventListener("change", () => { playlistSelectPlaylist(playlistSelectEl.value); });
+}
+const playlistSnapshotButton = $("#playlist-snapshot-btn");
+if (playlistSnapshotButton) {
+  playlistSnapshotButton.addEventListener("click", () => { void playlistReadSnapshot(); });
+}
+const playlistStartButton = $("#playlist-start-btn");
+if (playlistStartButton) {
+  playlistStartButton.addEventListener("click", () => { void playlistCreateAndStart(); });
+}
+const playlistStopButton = $("#playlist-stop-btn");
+if (playlistStopButton) {
+  playlistStopButton.addEventListener("click", () => { playlistStopLoop(); });
+}
+const playlistCancelButton = $("#playlist-cancel-btn");
+if (playlistCancelButton) {
+  playlistCancelButton.addEventListener("click", () => { void playlistCancelJob(); });
+}
+playlistUpdateButtons();
 
 /* -------------------------------------------------------------- 启动 */
 (async function boot() {

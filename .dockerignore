@@ -11,6 +11,7 @@ proxy/*
 !proxy/__init__.py
 !proxy/env_merge.py
 !proxy/fnlog.py
+!proxy/gateway_identity.py
 !proxy/publicplaylists.py
 !proxy/version.py
 !proxy/llm_usage.py

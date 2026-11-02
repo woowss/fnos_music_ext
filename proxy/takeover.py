@@ -445,7 +445,87 @@ class State:
             move_no_replace(staged, self.target)
 
 
-def wait_ready(state, seconds):
+def _verify_maintenance_identity(state, expected, deadline):
+    """Recheck the recorded socket owner after the maintenance liveness probe."""
+    recorded = state.load().get('proxy')
+    if recorded != expected:
+        raise Unsafe('maintenance readiness ownership changed')
+    identity = expected.get('process') if isinstance(expected, dict) else None
+    if not isinstance(identity, dict) or type(identity.get('pid')) is not int:
+        raise Unsafe('maintenance readiness identity unavailable')
+    expected_inode = expected.get('inode')
+    if inode(state.target) != expected_inode or process(identity['pid']) != identity:
+        raise Unsafe('maintenance readiness identity changed')
+
+    sock, peer = connect(state.target, min(0.4, max(0.001, deadline-time.monotonic())))
+    try:
+        if peer != identity:
+            raise Unsafe('maintenance readiness peer changed')
+    finally:
+        sock.close()
+
+    if (inode(state.target) != expected_inode or
+            process(identity['pid']) != identity or
+            state.load().get('proxy') != expected):
+        raise Unsafe('maintenance readiness identity changed')
+
+
+def _wait_ready_maintenance(state, seconds):
+    """Use only the local liveness route; never fall back to dependency health."""
+    deadline = time.monotonic() + seconds
+    reason = 'maintenance-liveness-not-ready'
+    while time.monotonic() < deadline:
+        try:
+            data = state.load()
+            current = snapshot(state.target, min(0.9, max(0.001, deadline-time.monotonic())))
+            if current.get('kind') != 'proxy' or current != data.get('proxy'):
+                raise Unsafe('maintenance readiness ownership is not verified')
+            identity = current.get('process')
+            if not isinstance(identity, dict) or type(identity.get('pid')) is not int:
+                raise Unsafe('maintenance readiness identity is unavailable')
+        except Exception:
+            reason = 'maintenance-liveness-ownership-unavailable'
+            time.sleep(min(0.2, max(0, deadline-time.monotonic())))
+            continue
+
+        try:
+            body, peer = request(
+                state.target, '/_ext/livez',
+                min(4, max(0.001, deadline-time.monotonic())))
+        except TimeoutError:
+            reason = 'maintenance-liveness-timeout'
+        except ValueError:
+            reason = 'maintenance-liveness-invalid-json'
+        except OSError:
+            reason = 'maintenance-liveness-transport-error'
+        except Unsafe:
+            reason = 'maintenance-liveness-rejected'
+        except Exception:
+            reason = 'maintenance-liveness-probe-error'
+        else:
+            if not isinstance(body, dict):
+                reason = 'maintenance-liveness-invalid-response'
+            elif (body.get('ok') is not True or
+                  body.get('service') != 'fnmusic-ext' or
+                  body.get('maintenance_startup') is not True or
+                  type(body.get('pid')) is not int):
+                reason = 'maintenance-liveness-invalid-response'
+            elif (peer != identity or type(peer.get('pid')) is not int or
+                  body['pid'] != peer['pid']):
+                reason = 'maintenance-liveness-peer-mismatch'
+            else:
+                try:
+                    _verify_maintenance_identity(state, current, deadline)
+                    return
+                except Exception:
+                    reason = 'maintenance-liveness-identity-changed'
+        time.sleep(min(0.2, max(0, deadline-time.monotonic())))
+    raise Unsafe('readiness deadline exceeded: ' + reason)
+
+
+def wait_ready(state, seconds, *, maintenance_startup=False):
+    if maintenance_startup:
+        return _wait_ready_maintenance(state, seconds)
     deadline = time.monotonic() + seconds
     reason = 'not probed'
     while time.monotonic() < deadline:
@@ -467,7 +547,7 @@ def wait_ready(state, seconds):
     raise Unsafe('readiness deadline exceeded: ' + reason)
 
 
-def environment(base):
+def environment(base, *, maintenance_startup=False):
     # Parse the installer's shell-quoted dotenv as data; do not execute arbitrary shell.
     import shlex
     env = os.environ.copy()
@@ -487,7 +567,8 @@ def environment(base):
                 raise Unsafe('dotenv value must be quoted')
             env[key] = words[0] if words else ''
     env.update(FNMUSIC_HOME=str(base), PYTHONUNBUFFERED='1', PYTHONDONTWRITEBYTECODE='1',
-               FNMUSIC_BACKGROUND_JOBS='1')
+               FNMUSIC_BACKGROUND_JOBS='0' if maintenance_startup else '1',
+               FNMUSIC_MAINTENANCE_STARTUP='1' if maintenance_startup else '0')
     return env
 
 
@@ -633,8 +714,10 @@ def wait_official_target(state, budget):
         time.sleep(0.5)
 
 
-def supervise(state, base):
-    env = environment(base)
+def supervise(state, base, *, maintenance_startup=False):
+    # Use one environment for the isolated import preflight and the eventual
+    # uvicorn child so maintenance suppression cannot be lost between them.
+    env = environment(base, maintenance_startup=maintenance_startup)
     env['FNMUSIC_UPSTREAM_SOCK'] = str(state.upstream)
     preflight(base, env)
     child = None
@@ -677,7 +760,7 @@ def supervise(state, base):
             # Readiness is the acceptance gate; keep this window below the unit's
             # 65s ExecStartPost deadline so a failure reports the real dependency
             # state instead of racing systemd's own timeout.
-            wait_ready(state, 55)
+            wait_ready(state, 55, maintenance_startup=maintenance_startup)
             print('[takeover] proxy identity and readiness verified', flush=True)
             code = child.wait()
             failure = Unsafe(f'proxy exited (status {code})')
@@ -850,7 +933,11 @@ def main():
                         help='lock path for lock-holders (testing)')
     parser.add_argument('--deploy-mode', choices=['docker', 'native'], default=None,
                         help='deployment form recorded by deployment-remember')
+    parser.add_argument('--maintenance-startup', action='store_true',
+                        help='suppress new-process startup side effects for a bounded maintenance run')
     args = parser.parse_args()
+    if args.maintenance_startup and args.command not in ('run', 'ready'):
+        parser.error('--maintenance-startup is only valid with the run and ready commands')
     state = State(args.target, args.upstream, args.state_dir)
     try:
         if args.command == 'prepare-install-lock':
@@ -874,7 +961,7 @@ def main():
                 raise Unsafe('unsupported unit path characters')
             print((args.base / 'fnmusic-ext.service').read_text().replace('@BASE_DIR@', base), end='')
         elif args.command == 'ready':
-            wait_ready(state, args.timeout)
+            wait_ready(state, args.timeout, maintenance_startup=args.maintenance_startup)
         elif args.command == 'status':
             print(json.dumps({'target': snapshot(state.target), 'upstream': snapshot(state.upstream)}))
         elif args.command == 'restore-plan':
@@ -886,7 +973,7 @@ def main():
             # Lifetime supervisor lock is separate from mutation and installer locks.
             with open(state.directory / 'supervisor.lock', 'a') as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                supervise(state, args.base)
+                supervise(state, args.base, maintenance_startup=args.maintenance_startup)
         else:
             getattr(state, args.command)()
     except Exception as exc:

@@ -1217,7 +1217,7 @@ ENV_DESIRED="$(mktemp)"
     else
         echo "FNMUSIC_ONLINE_SOURCES='MiguMusicClient,KuwoMusicClient'"
     fi
-    echo "FNMUSIC_TEE_SAVE_ENABLED='true'"
+    echo "FNMUSIC_TEE_SAVE_ENABLED='false'"
     echo "FNMUSIC_TEE_SAVE_DIR=''"
     echo "FNMUSIC_TEE_CACHE_MAX='2'"
     echo "FNMUSIC_LX_ENABLED='${LX_FLAG}'"

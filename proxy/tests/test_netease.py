@@ -37,6 +37,7 @@ def setup_netease_env(tmp_path, monkeypatch):
     os.makedirs(fav_dir, exist_ok=True)
     monkeypatch.setitem(CONF, "cache_dir", cache_dir)
     monkeypatch.setitem(CONF, "library_dir", library_dir)
+    monkeypatch.setitem(CONF, "tee_save_dir", library_dir)
     monkeypatch.setitem(CONF, "fav_dir", fav_dir)
     monkeypatch.setitem(CONF, "search_list_path", "data.list")
     monkeypatch.setitem(CONF, "online_limit", 30)
@@ -479,6 +480,7 @@ async def test_fetch_musicbox_search_row_cover_used_without_detail():
 # 4. stream_track netease 分支 (直链 206 透传/tee 落盘，缓存命中直接 206 不打上游)
 # =========================================================================
 def test_stream_track_netease_direct_stream_and_cache(tmp_path, monkeypatch):
+    monkeypatch.setitem(CONF, "tee_save_enabled", True)
     audio_content = b"FLAC_MAGIC_HEADER_TEST_AUDIO_CONTENT" * 40
     content_len = str(len(audio_content))
 
@@ -571,6 +573,7 @@ def test_stream_track_netease_direct_stream_and_cache(tmp_path, monkeypatch):
 
 def test_stream_track_early_disconnect_background_tee(tmp_path, monkeypatch):
     """Bug1 回归测试：客户端提前断开（流式只读少量 chunk 后 break），后台 task 仍能完整落盘转正，且无 .part 残留。"""
+    monkeypatch.setitem(CONF, "tee_save_enabled", True)
     audio_content = b"FLAC_STREAM_TEST_CHUNK_PAYLOAD_PADDING_" * 128  # 5120 字节
     content_len = str(len(audio_content))
 
@@ -661,6 +664,7 @@ def test_stream_track_early_disconnect_background_tee(tmp_path, monkeypatch):
 
 def test_stream_track_netease_mpeg_content_type_override_to_flac(tmp_path, monkeypatch):
     """Bug2 回归测试：网易 CDN 返回 content-type audio/mpeg 但 info 有 sq → 落盘为 .flac 且响应 content-type 为 audio/flac。"""
+    monkeypatch.setitem(CONF, "tee_save_enabled", True)
     audio_content = b"FLAC_AUDIO_CONTENT_WITH_MPEG_HEADER" * 40
     content_len = str(len(audio_content))
 

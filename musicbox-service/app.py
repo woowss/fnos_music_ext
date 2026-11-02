@@ -26,7 +26,9 @@ from netease_ext import (
     song_lyric_pair,
     vip_entitled,
     user_playlists as fetch_user_playlists,
+    user_playlist_preview as fetch_user_playlist_preview,
 )
+import netease_playlist_snapshot as playlist_snapshot
 import runner
 import playback
 from playback import get_song_url_async
@@ -283,6 +285,12 @@ def user_playlists(limit: int = Query(100, ge=1, le=100)):
     return {"ok": True, "data": res["playlists"], "account_uid": res["uid"], "logged_in": True}
 
 
+@app.get("/api/v1/user/playlists/{playlist_id}/preview")
+def user_playlist_preview(playlist_id: int = Path(..., ge=1)):
+    """读取当前账号歌单的临时预览；不下载、不保存，也不代表可导入。"""
+    return fetch_user_playlist_preview(playlist_id)
+
+
 @app.get("/api/v1/user/playlists/{playlist_id}/tracks")
 def user_playlist_tracks(playlist_id: int = Path(..., ge=1)):
     """网易歌单曲目：trackIds -> 批量详情（不做可播过滤，VIP 曲目带 needs_vip 标记）。"""
@@ -290,6 +298,21 @@ def user_playlist_tracks(playlist_id: int = Path(..., ge=1)):
     if ids is None:
         return {"ok": False, "error": "not_logged_in", "logged_in": False}
     return {"ok": True, "data": _mark_needs_vip(batch_song_details(ids[:1000]))}
+
+
+@app.get("/api/v1/user/playlists/{playlist_id}/member-snapshot")
+def user_playlist_member_snapshot(playlist_id: int = Path(..., ge=1)):
+    """只读歌单成员快照：两次独立观测（2×account + 2×/api/v6/playlist/detail）。
+
+    只读：不下载、不写盘、不请求歌曲详情/音频 URL/歌词/封面；上游异常一律折叠为
+    固定 status/error_code（正常/失败观测 payload 的 ok 恒为 true，只有本端点的禁用
+    响应是 ok=false + error="manifest_disabled" + 503）。
+    开关独立于保存侧：仅 FNMUSIC_PLAYLIST_MANIFEST_READONLY=true 才读取，默认关闭。
+    """
+    if not playlist_snapshot.producer_enabled():
+        return JSONResponse(status_code=503, content={"ok": False, "error": "manifest_disabled"})
+    fetch_account, fetch_playlist = playlist_snapshot.live_fetchers()
+    return playlist_snapshot.build_snapshot(playlist_id, fetch_account, fetch_playlist)
 
 
 def _cli_error_or_raise(exc: UpstreamException) -> Any:

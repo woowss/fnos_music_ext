@@ -123,7 +123,7 @@ chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 | :--- | :--- | :--- |
 | 播放音质 | `FNMUSIC_QUALITY_MODE` | `high` / `balanced` / `smooth` |
 | App 下载音质 | `FNMUSIC_DL_QUALITY` | `app` / `original` / `standard`；跟随 App 时仅显式标准档转 MP3，否则交付原文件 |
-| 边听边存 | `FNMUSIC_TEE_SAVE_ENABLED` | 默认开启 |
+| 边听边存 | `FNMUSIC_TEE_SAVE_ENABLED` | 默认关闭；显式开启后，歌曲下载完整即自动保存到曲库，不必听完整首 |
 | 下载 / 缓存目录 | `FNMUSIC_TEE_SAVE_DIR` / `FNMUSIC_CACHE_DIR` | 留空分别自动探测共享曲库 / 使用安装目录 `cache` |
 | 落库文件名 | `FNMUSIC_LIBRARY_NAME_PATTERN` | 默认 `{artist} - {title}` |
 | 封面 / 歌词落盘 | `FNMUSIC_AUTO_COVER` / `FNMUSIC_LYRIC_AUTO_DL` | 默认开启封面、关闭歌词 |

@@ -120,6 +120,18 @@ def test_config_view_merges_defaults(env_file):
         assert rj["schema"]["FNMUSIC_DL_QUALITY"]["default"] == "app"
 
 
+def test_config_view_defaults_tee_save_off_when_key_is_missing(env_file):
+    env_file.write_text(
+        BASE_ENV.replace("FNMUSIC_TEE_SAVE_ENABLED='true'\n", ""), encoding="utf-8"
+    )
+    with authed_client() as client:
+        response = client.get("/api/config")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["values"]["FNMUSIC_TEE_SAVE_ENABLED"] == "false"
+        assert body["schema"]["FNMUSIC_TEE_SAVE_ENABLED"]["default"] == "false"
+
+
 # ------------------------------------------------------------------ PUT 校验 ---
 
 def test_put_rejects_unknown_key(env_file):
