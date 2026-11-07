@@ -195,6 +195,137 @@ class RedactionTests(unittest.TestCase):
         self.assertNotEqual(ref["ref_id"], other["ref_id"])
 
 
+class ProviderExtractionTests(unittest.TestCase):
+    """provider 响应白名单抽取：只允许白名单字段，档位/完整性不得过度声称。"""
+
+    def test_quality_extract_is_whitelisted_and_hashed(self):
+        payload = {"code": 200, "data": {
+            "id": 186016, "url": "https://cdn.example/x.flac?token=SECRET",
+            "level": "lossless", "type": "flac", "size": 12345,
+            "md5": "A" * 32, "freeTrialInfo": None,
+        }}
+        facts = capture.extract_provider_quality(payload)
+        self.assertEqual(facts["reported_level"], "lossless")
+        self.assertEqual(facts["reported_status"], "reported")
+        self.assertTrue(facts["level_in_ladder"] is True)
+        self.assertFalse(facts["trial"])
+        self.assertEqual(facts["digest"], {"size": 12345, "md5": "a" * 32})
+        blob = json.dumps(facts, ensure_ascii=False)
+        self.assertNotIn("cdn.example", blob)
+        self.assertNotIn("SECRET", blob)
+        self.assertEqual(len(facts["raw_sha256"]), 64)
+
+    def test_level_outside_ladder_is_unknown_not_equivalent(self):
+        facts = capture.extract_provider_quality({"data": {"level": "hires_lossless"}})
+        self.assertEqual(facts["reported_status"], "reported")
+        self.assertFalse(facts["level_in_ladder"])
+        facts2 = capture.extract_provider_quality({"data": {}})
+        self.assertEqual(facts2["reported_status"], "unknown")
+        self.assertEqual(facts2["level_in_ladder"], "unknown")
+
+    def test_trial_detected(self):
+        facts = capture.extract_provider_quality(
+            {"data": {"level": "lossless", "freeTrialInfo": {"start": 0, "end": 30}}})
+        self.assertTrue(facts["trial"])
+
+    def test_container_claim_only_flac_or_mp3(self):
+        self.assertEqual(capture.extract_container_claim({"data": {"type": "flac"}}),
+                         {"api_type": "flac", "status": "reported"})
+        self.assertEqual(capture.extract_container_claim({"data": {"type": "m4a"}}),
+                         {"api_type": "", "status": "unknown"})
+
+    def test_metadata_claim_from_song_info(self):
+        info = {"songs": [{
+            "name": "曲目", "ar": [{"name": "歌手A"}, {"name": "歌手B"}],
+            "al": {"name": "专辑", "trackNumber": 3},
+            "lyricist": ["词作者"], "composer": None,
+        }]}
+        facts = capture.extract_metadata_claim(info)
+        self.assertEqual(facts["title"], "曲目")
+        self.assertEqual(facts["artist"], "歌手A/歌手B")
+        self.assertEqual(facts["album"], "专辑")
+        self.assertEqual(facts["track"], "3")
+        self.assertIsNone(facts["disc"])
+        self.assertEqual(facts["lyricist"], "词作者")
+        self.assertEqual(facts["status"], "reported")
+
+    def test_empty_metadata_is_unknown(self):
+        facts = capture.extract_metadata_claim({})
+        self.assertEqual(facts["status"], "unknown")
+        self.assertIsNone(facts["track"])
+
+    def test_cover_and_lyric_claim_enums_are_normalized(self):
+        self.assertEqual(capture.extract_cover_claim(status="error", error="http_error"),
+                         {"status": "error", "error": "http_error"})
+        self.assertEqual(capture.extract_cover_claim(status="embedded", error="http_error"),
+                         {"status": "embedded", "error": ""})
+        self.assertEqual(capture.extract_cover_claim(status="bogus", error="bogus"),
+                         {"status": "error", "error": "unknown"})
+        self.assertEqual(capture.extract_lyric_claim(status="bogus"), {"status": "unknown"})
+
+    def test_integrity_matrix(self):
+        self.assertEqual(capture.extract_integrity_claim()["status"], "not_provided")
+        self.assertEqual(capture.extract_integrity_claim(
+            api_size=10, downloaded_size=10)["status"], "match")
+        self.assertEqual(capture.extract_integrity_claim(
+            api_size=10, downloaded_size=9)["status"], "mismatch")
+        self.assertEqual(capture.extract_integrity_claim(
+            api_md5="a" * 32, downloaded_md5="b" * 32)["status"], "mismatch")
+        self.assertEqual(capture.extract_integrity_claim(
+            api_md5="a" * 32, downloaded_md5="a" * 32)["status"], "match")
+        self.assertEqual(capture.extract_integrity_claim(
+            api_size=10, api_md5="a" * 32, downloaded_size=10,
+            downloaded_md5="a" * 32)["status"], "match")
+
+    def test_source_evidence_is_schema_shaped(self):
+        document = capture.build_source_evidence(
+            provider_payload={"data": {"level": "lossless", "type": "flac", "size": 11,
+                                       "md5": "a" * 32, "url": "https://x/y"}},
+            captured_at=_TS,
+            tier_requested="lossless",
+            fallback=True,
+            info_payload={"songs": [{"name": "t"}]},
+            cover_status="embedded",
+            lyric_status="published",
+            api_size=11, api_md5="a" * 32, downloaded_size=11, downloaded_md5="a" * 32,
+        )
+        self.assertEqual(document["quality"]["claim_scope"], capture.CLAIM_SCOPE)
+        self.assertEqual(len(document["quality"]["claim_refs"]), 1)
+        self.assertEqual(document["integrity"]["status"], "match")
+        self.assertEqual(capture.find_sensitive_leaks(document), [])
+
+
+class SourceEvidenceStructureTests(unittest.TestCase):
+    def test_extracted_source_evidence_has_no_structural_violations(self):
+        source_evidence = capture.build_source_evidence(
+            provider_payload={"data": {"level": "lossless", "type": "flac",
+                                       "size": 11, "md5": "a" * 32}},
+            captured_at=_TS,
+            tier_requested="lossless",
+            fallback=False,
+            info_payload={"songs": [{"name": "t"}]},
+            cover_status="embedded",
+            lyric_status="published",
+            api_size=11, api_md5="a" * 32,
+            downloaded_size=11, downloaded_md5="a" * 32,
+        )
+        position = capture.build_position_uncaptured(
+            position=1, captured_at=_TS, source_id="1")
+        position["state"] = "published"
+        position["source_evidence"] = source_evidence
+        position["record_sha256"] = capture.recompute_record_sha256(position)
+        document = capture.build_evidence_set(
+            environment=_environment(),
+            job=_job(1),
+            positions=[position],
+            created_at=_TS,
+        )
+        issues = VALIDATOR._structure_issues(document)
+        relevant = [issue for issue in issues
+                    if "source_evidence" in issue.get("path", "")]
+        self.assertEqual(relevant, [], relevant)
+
+
 class RejectionTests(unittest.TestCase):
     def test_empty_positions_rejected(self):
         with self.assertRaises(capture.CaptureError):

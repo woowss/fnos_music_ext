@@ -19,9 +19,9 @@
 ## 2. 已实现的生产者骨架
 
 - 模块：`proxy/acceptance_capture.py`（纯 stdlib，**不 import `proxy.app`**，可离线/独立运行）
-  - sha256 `af4e675c3f516a83ae667a33eb3e6b811f90d13b13cd36d908093a820fd6c15a`（366 行）
+  - sha256 `a3894661c934ead8c6ec85727b86272f716fc5b53d1323e5ebc1602c7bdd04ae`（609 行）
 - 合同测试：`offline_tests/test_acceptance_capture.py`
-  - sha256 `4c262c2bac543ce71b496d2c459ced81a7d827d31ff30c2bb68c7014a7ba8a40`（235 行，**18 passed**）
+  - sha256 `890aacca62a80ed0255b5c60836de7cfdc789ba264f6e2db3c0415f57bda73a2`（366 行，**28 passed**）
 
 ### 2.1 API
 
@@ -76,6 +76,22 @@
 | P-f1 失败/拒绝 | 账本 position 行（`GET job`） | 固定 reason + 阶段 + 引用 | 不得写异常文本/URL/路径 |
 
 **硬性要求**：采集代码只读、异常必须被吞掉并标记 unknown；**采集失败不得改变保存结果**；采集开关默认关闭。
+
+### 4.0 已实现：provider 响应白名单抽取（`source_evidence`）
+
+`proxy/acceptance_capture.py` 内（纯函数，无 IO、无锁、不 import `proxy.app`）：
+
+| 函数 | 产出 | 关键约束 |
+| --- | --- | --- |
+| `extract_provider_quality(payload)` | `reported_level/status`、`level_in_ladder`、`trial`、`digest{size,md5}`、`raw_sha256` | 只抽白名单；**URL 只记 `url_present`**；`md5` 仅接受 32hex 小写归一；level 不在阶梯 ⇒ `level_in_ladder=False`（不得推断等价） |
+| `extract_container_claim(payload)` | `{api_type, status}` | 仅 `flac/mp3` 可信，其余 `unknown` |
+| `extract_metadata_claim(info_payload)` | title/artist/album/track/disc/lyricist/composer + status | 支持 `ar/al` 结构与多值 `/` 连接；空元数据 ⇒ `unknown` |
+| `extract_cover_claim(status, error)` | 封面状态/固定码 | 非 `error` 时强制 `error=""`；非法枚举归一到安全值 |
+| `extract_lyric_claim(status)` | 歌词状态 | 非法枚举 ⇒ `unknown` |
+| `extract_integrity_claim(api_*, downloaded_*)` | `match/mismatch/not_provided` | 两侧都有值才判定；缺失 ⇒ `not_provided` |
+| `build_source_evidence(...)` | 完整 schema §2.4.2 块 | 自动生成 `provider_response_extract` 证据引用（对白名单 JSON 重算 sha256） |
+
+测试：`offline_tests/test_acceptance_capture.py` 共 **28 passed**（含抽取矩阵、脱敏、结构零违规）。
 
 ### 4.1 已实现：落盘后独立观测器（`delivered_evidence`）
 
