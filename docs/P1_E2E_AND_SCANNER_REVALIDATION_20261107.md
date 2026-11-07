@@ -84,6 +84,18 @@
 
 **结论**：迁移后基线上，P1 的「观测 → 抽取 → 组装 → 独立校验」链路可端到端跑通，且产出**能通过语义校验器**（结构/不变量一致）同时**保持未知结论**；敏感信息未进入证据或证据集。
 
+### 3.1 全量离线套件（含本轮新增 P1 测试）
+
+在同一 NAS 环境以非特权 `kurumi` + 专用隔离协议（`FNMUSIC_OFFLINE_TEST_ISOLATION=dedicated-disposable-runner-v1`，
+root 为 `/tmp/fnm-offline-root-k`，0700 + 0400 marker）运行 `offline_tests` 全量：
+
+```
+535 passed, 3 skipped, 274 subtests passed
+```
+
+对比：迁移收尾时为 **494 passed / 3 skipped**（新增 41 = `test_acceptance_capture.py` 28 + `test_observe_delivered_evidence.py` 13）。
+说明新基线 + P1 采集代码在真机离线套件中无回归。
+
 ## 4. 证明边界（必须保留）
 
 1. **扫描器的 Btrfs RO 路径仍未验证**：本次只在 ext4 副本上验证 `independent-copy` 与「非 Btrfs 拒绝」；Btrfs 只读子卷/生成号 bracket 需要 `/vol1` 上的隔离探针，属门禁动作，未执行。
