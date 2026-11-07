@@ -82,8 +82,14 @@ logger = logging.getLogger("fnmusic_proxy")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 # httpx INFO 包含完整签名 URL；播放诊断仅记录歌曲、耗时和状态。
 logging.getLogger("httpx").setLevel(logging.WARNING)
-# 本地文件日志（logs/proxy.log，按天滚动保留 3 天）；失败静默降级为仅 stdout
-setup_logging("fnmusic_proxy", "proxy")
+_MAINTENANCE_STARTUP = os.environ.get("FNMUSIC_MAINTENANCE_STARTUP", "") == "1"
+if _MAINTENANCE_STARTUP:
+    # A fresh maintenance child keeps console logging, but must not create a
+    # file handler or run setup_logging's import-time purge_stale().
+    logger.setLevel(logging.INFO)
+else:
+    # 本地文件日志（logs/proxy.log，按天滚动保留 3 天）；失败静默降级为仅 stdout
+    setup_logging("fnmusic_proxy", "proxy")
 
 _HOME = dailyrec.home_dir()
 DOWNLOAD_LAYOUTS = ("flat", "artist", "album", "artist_album")
@@ -173,9 +179,9 @@ CONF = {
     "music_db": os.environ.get(
         "FNMUSIC_MUSIC_DB", "/usr/local/apps/@appdata/trim.music/db/music.db"
     ),
-    # 边听边存：默认开；保存路径空=自动探测飞牛共享曲库，不可用自动回退；
+    # 边听边存：默认关；仅显式开启后，保存路径空才自动探测飞牛共享曲库；
     # tee_cache_max 仅在关闭边听边存时生效（滚动保留最新 N 首试听缓存）
-    "tee_save_enabled": os.environ.get("FNMUSIC_TEE_SAVE_ENABLED", "true").lower() in ("true", "1", "yes"),
+    "tee_save_enabled": os.environ.get("FNMUSIC_TEE_SAVE_ENABLED", "false").lower() in ("true", "1", "yes"),
     "tee_save_dir": os.environ.get("FNMUSIC_TEE_SAVE_DIR", ""),
     "download_layout": os.environ.get("FNMUSIC_DOWNLOAD_LAYOUT", "flat")
         if os.environ.get("FNMUSIC_DOWNLOAD_LAYOUT", "flat") in
@@ -5303,21 +5309,23 @@ async def _maintenance_request(method: str, path: str, body: dict) -> tuple[int,
 @asynccontextmanager
 async def lifespan(fastapi_app: FastAPI):
     global _LX_SCRIPT_MAP_TASK, _LIKED_EPOCH, _LIKED_BUILD_LOCK
+    maintenance_startup = _MAINTENANCE_STARTUP
     logger.info("=== fnmusic-ext v%s configuration ===", get_version())
     for k, v in CONF.items():
         logger.info("  %s = %s", k, _conf_log_value(k, v))
     logger.info("  llm_enabled = %s", dailyrec.llm_enabled())
     logger.info("==================================")
-    # 运行环境快照（issue 诊断 + 日志导出）：宿主视角落 proxy.log 与 env_snapshot.txt
-    for line in env_snapshot_lines("host"):
-        logger.info(line)
-    write_env_snapshot("host")
-    # 版本变化失效当日推荐缓存（issue #49）：升级重启后旧歌单曲目的音源侧
-    # songInfo 反查全冷，重建才能进持久层，不留"第二天才好"的空窗
-    _sync_recommend_version_marker()
-    if _background_jobs_enabled():
+    if not maintenance_startup:
+        # 运行环境快照（issue 诊断 + 日志导出）：宿主视角落 proxy.log 与 env_snapshot.txt
+        for line in env_snapshot_lines("host"):
+            logger.info(line)
+        write_env_snapshot("host")
+        # 版本变化失效当日推荐缓存（issue #49）：升级重启后旧歌单曲目的音源侧
+        # songInfo 反查全冷，重建才能进持久层，不留"第二天才好"的空窗
+        _sync_recommend_version_marker()
+    background_jobs_enabled = _background_jobs_enabled() and not maintenance_startup
+    if background_jobs_enabled:
         await _try_migrate_public_playlist_users()
-
     sweeper_task = None
     log_task = None
     env_task = None
@@ -5362,7 +5370,7 @@ async def lifespan(fastapi_app: FastAPI):
         created_llm = True
 
     maintenance_server = None
-    if _background_jobs_enabled():
+    if background_jobs_enabled:
         try:
             from . import maintenance_socket
         except ImportError:
@@ -5380,7 +5388,7 @@ async def lifespan(fastapi_app: FastAPI):
     _drop_privileges()
 
     # 后台任务在降权之后创建，避免首个 await 期间以 root 写用户目录。
-    if _background_jobs_enabled():
+    if background_jobs_enabled:
         sweeper_task = asyncio.create_task(_lyric_orphan_sweeper())
         log_task = asyncio.create_task(_log_retention_loop())
         if CONF.get("env_watch", True):
@@ -5390,7 +5398,7 @@ async def lifespan(fastapi_app: FastAPI):
     # 预热 平台→激活脚本名 映射：首次搜索的标记渲染是同步读缓存，映射刷新又是
     # 搜索触发的后台任务，冷启动时来不及完成，第一屏会全部退回 [lx-平台]。
     # 启动即拉一次（失败静默，搜索路径自带兜底与 TTL 重试）。
-    if CONF.get("lx_enabled"):
+    if CONF.get("lx_enabled") and not maintenance_startup:
         _LX_SCRIPT_MAP_TASK = asyncio.create_task(
             refresh_lx_script_map(get_lx_client(fastapi_app))
         )
@@ -5503,11 +5511,25 @@ async def log_client_requests(request: Request, call_next):
 
 @app.get("/_ext/livez")
 async def ext_livez():
-    return {"ok": True, "service": "fnmusic-ext", "pid": os.getpid()}
+    result = {"ok": True, "service": "fnmusic-ext", "pid": os.getpid()}
+    # The marker selects a maintenance readiness contract only. It is not an
+    # identity, authorization, or deployment attestation.
+    if _MAINTENANCE_STARTUP:
+        result["maintenance_startup"] = True
+    return result
 
 
 @app.get("/_ext/healthz")
 async def ext_healthz(request: Request):
+    # A maintenance unit must fail closed even if its caller accidentally uses
+    # the ordinary dependency readiness probe. Do not construct clients or
+    # reach any configured audio source from this path.
+    if _MAINTENANCE_STARTUP:
+        return JSONResponse(
+            content={"ok": False, "error": "maintenance-startup-readiness-unavailable"},
+            status_code=503,
+        )
+
     async def probe(name: str, client: httpx.AsyncClient, path: str) -> dict:
         try:
             response = await asyncio.wait_for(client.get(path, timeout=2.0), timeout=2.4)

@@ -425,6 +425,7 @@ async def test_handoff_falls_back_to_full_download_on_no_range(tmp_path, monkeyp
 @pytest.mark.anyio
 async def test_disconnect_mid_stream_hands_off_part(env, monkeypatch):
     """切歌（客户端断开）不中断下载：未写完的 part 交接给后台续传。"""
+    monkeypatch.setitem(CONF, "tee_save_enabled", True)
     handed: dict = {}
 
     def fake_register_handoff(guid, part, written, expected, ext, headers_factory):

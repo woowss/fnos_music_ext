@@ -10,6 +10,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -40,13 +41,18 @@ class _Handler(BaseHTTPRequestHandler):
         return
 
 
+def _loopback_policy() -> "tuple[frozenset[int], int]":
+    """Test peers connect from this interpreter, so its own uid must be allowed."""
+    return frozenset({getattr(os, "geteuid", lambda: 0)()}), 0o600
+
+
 def _start_gateway(tmp_path: Path, port: int) -> Path:
     sock_path = tmp_path / "fnmusic-ext.sock"
     errors = []
 
     def _run():
         try:
-            serve(sock_path, ("127.0.0.1", port))
+            serve(sock_path, ("127.0.0.1", port), policy=_loopback_policy())
         except Exception as exc:  # noqa: BLE001 — 断言里带出线程失败原因
             errors.append(exc)
 
@@ -236,6 +242,17 @@ def _fs_check(sock_path: Path, path: str, is_admin: str = "true") -> "tuple[byte
     return head.split(b"\r\n", 1)[0], (json.loads(body.decode()) if body else {})
 
 
+def test_probe_dir_writable_preserves_preexisting_name_collision(tmp_path: Path, monkeypatch):
+    fixed_uuid = type("FixedUUID", (), {"hex": "0123456789abcdef"})()
+    monkeypatch.setattr(_MOD.os, "getpid", lambda: 4242)
+    monkeypatch.setattr(_MOD.uuid, "uuid4", lambda: fixed_uuid)
+    probe = tmp_path / ".fnmusic-fscheck-4242-01234567"
+    probe.write_bytes(b"pre-existing data")
+
+    assert _MOD._probe_dir_writable(str(tmp_path)) is False
+    assert probe.read_bytes() == b"pre-existing data"
+
+
 def test_fs_check_requires_admin(tmp_path: Path):
     upstream = _TestHTTPServer(("127.0.0.1", 0), _Handler)
     port = upstream.server_address[1]
@@ -404,6 +421,76 @@ def test_maintenance_rejects_bad_headers(tmp_path, extra):
     assert _request(sock, _maintenance_request(extra=extra)).startswith(b"HTTP/1.1 400")
 
 
+@pytest.mark.parametrize(
+    ("content_length", "transfer_encoding", "admin", "expected", "expected_auth_checks"),
+    [
+        ("64", "chunked", "true", b"HTTP/1.1 400", 0),
+        (None, "chunked", "true", b"HTTP/1.1 400", 0),
+        ("invalid", None, "true", b"HTTP/1.1 400", 0),
+        (str(_MOD.MAINTENANCE_MAX_BODY + 1), None, "true", b"HTTP/1.1 400", 0),
+        ("64", None, "false", b"HTTP/1.1 403", 1),
+    ],
+)
+def test_maintenance_rejects_before_body_or_backend_io(
+    monkeypatch, content_length, transfer_encoding, admin, expected,
+    expected_auth_checks,
+):
+    class Client:
+        def __init__(self):
+            self.responses = []
+            self.recv_calls = 0
+            self.closed = False
+
+        def settimeout(self, _timeout):
+            pass
+
+        def sendall(self, data):
+            self.responses.append(data)
+
+        def recv(self, _size):
+            self.recv_calls += 1
+            raise AssertionError("rejected requests must not read a request body")
+
+        def close(self):
+            self.closed = True
+
+    client = Client()
+    auth_checks = []
+    backend_calls = []
+    check_admin = _MOD._admin_claim_from_raw_head
+
+    def tracked_admin_check(head):
+        auth_checks.append(True)
+        return check_admin(head)
+
+    def backend_socket(*_args, **_kwargs):
+        backend_calls.append(True)
+        raise AssertionError("rejected requests must not create a backend socket")
+
+    monkeypatch.setattr(_MOD, "_admin_claim_from_raw_head", tracked_admin_check)
+    monkeypatch.setattr(_MOD.socket, "socket", backend_socket)
+    headers = [
+        "POST /api/maintenance/cleanup HTTP/1.1",
+        "Host: localhost",
+        f"X-Trim-Isadmin: {admin}",
+    ]
+    if content_length is not None:
+        headers.append(f"Content-Length: {content_length}")
+    if transfer_encoding is not None:
+        headers.append(f"Transfer-Encoding: {transfer_encoding}")
+    # Keep any declared positive Content-Length, but intentionally provide only
+    # the head. A rejected request must not attempt to read a missing body.
+    raw = "\r\n".join(headers).encode("ascii") + b"\r\n\r\n"
+
+    _MOD.handle_maintenance(client, raw, "POST", "/api/maintenance/cleanup")
+
+    assert client.responses[0].startswith(expected)
+    assert client.recv_calls == 0
+    assert len(auth_checks) == expected_auth_checks
+    assert backend_calls == []
+    assert client.closed
+
+
 @pytest.mark.parametrize("prefix", ["", "/app/fnmusic-ext"])
 def test_maintenance_real_unix_delegation(tmp_path, monkeypatch, prefix):
     spec = importlib.util.spec_from_file_location(
@@ -451,3 +538,333 @@ def test_maintenance_real_unix_delegation(tmp_path, monkeypatch, prefix):
         finally:
             await maintenance.stop(server)
     asyncio.run(run())
+
+
+# --------------------------------- trusted ingress (G0-FNMEXT) ---
+#
+# These checks drive the already-read-head path in-memory so they run on every
+# platform; the real AF_UNIX kernel boundary lives in
+# test_gateway_channel_linux.py.
+
+
+class _HeadClient:
+    """In-memory client that supplies one already-read head and nothing else."""
+
+    def __init__(self, raw: bytes):
+        self._chunks = [raw]
+        self.data = b""
+        self.closed = False
+        self.timeouts = []
+
+    def settimeout(self, value):
+        self.timeouts.append(value)
+
+    def recv(self, _size):
+        if self._chunks:
+            return self._chunks.pop(0)
+        return b""
+
+    def sendall(self, data):
+        self.data += data
+
+    def close(self):
+        self.closed = True
+
+
+class _SilentThread:
+    def __init__(self, *, target, args, daemon):
+        self.target = target
+        self.args = args
+
+    def start(self):
+        pass
+
+    def join(self):
+        pass
+
+
+def _dispatch_raw(monkeypatch, raw: bytes, *, engine=None):
+    upstream_calls = []
+
+    def forbidden_connect(*_args, **_kwargs):
+        upstream_calls.append(True)
+        raise AssertionError("rejected request must not open an upstream socket")
+
+    monkeypatch.setattr(_MOD.socket, "create_connection", forbidden_connect)
+    if engine is not None:
+        monkeypatch.setattr(_MOD, "manual_save_route", engine)
+    client = _HeadClient(raw)
+    _MOD._handle(client, ("127.0.0.1", 1))
+    return client, upstream_calls
+
+
+_FRAMING_CASES = [
+    pytest.param(b"Content-Length: 1\r\nContent-Length: 1\r\n",
+                 "invalid_framing", id="duplicate-content-length"),
+    pytest.param(b"Content-Length: 5\r\nTransfer-Encoding: chunked\r\n",
+                 "invalid_framing", id="content-length-transfer-encoding"),
+    pytest.param(b"Content-Length: abc\r\n", "invalid_framing",
+                 id="invalid-content-length"),
+    pytest.param(b"Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n",
+                 "invalid_framing", id="duplicate-transfer-encoding"),
+    pytest.param(b"Bad Header: x\r\n", "invalid_framing", id="invalid-header-name"),
+    pytest.param(b"X-Big: " + b"x" * 70000 + b"\r\n", "invalid_framing",
+                 id="header-bytes-limit"),
+    pytest.param(b"".join(b"X-H%d: v\r\n" % index for index in range(130)),
+                 "invalid_framing", id="too-many-headers"),
+    pytest.param(b"X-Trim-Isadmin: true\r\nX-Trim-Isadmin: true\r\n",
+                 "invalid_identity_claim", id="duplicate-admin-claim"),
+]
+
+
+class _StatusEngine:
+    def __init__(self):
+        self.calls = 0
+
+    def status(self):
+        self.calls += 1
+        return {"ok": True, "data": {}}
+
+
+@pytest.mark.parametrize(("extra_headers", "expected_code"), _FRAMING_CASES)
+def test_ambiguous_forwarded_head_is_rejected_before_upstream(
+    monkeypatch, extra_headers, expected_code,
+):
+    raw = (
+        b"GET /app/fnmusic-ext/ HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"X-Trim-Isadmin: true\r\n"
+        b"X-Trim-Userid: 1000\r\n"
+        + extra_headers
+        + b"Connection: close\r\n\r\n"
+    )
+    client, upstream_calls = _dispatch_raw(monkeypatch, raw)
+    head, _, body = client.data.partition(b"\r\n\r\n")
+    assert head.startswith(b"HTTP/1.1 400")
+    payload = json.loads(body.decode("utf-8"))
+    assert payload["code"] == expected_code
+    assert payload["ok"] is False
+    assert upstream_calls == []
+    assert client.closed is True
+
+
+@pytest.mark.parametrize(
+    "extra_headers",
+    [
+        b"Content-Length: 1\r\nContent-Length: 1\r\n",
+        b"X-Trim-Isadmin: true\r\nX-Trim-Isadmin: true\r\n",
+        b"X-Trim-Isadmin: TRUE\r\n",
+    ],
+)
+def test_manual_save_ambiguous_head_is_rejected_before_engine(
+    monkeypatch, extra_headers,
+):
+    engine = _StatusEngine()
+    raw = (
+        b"GET " + _MOD.MANUAL_SAVE_STATUS_PATHS[0].encode() + b" HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"X-Trim-Isadmin: true\r\n"
+        b"X-Trim-Userid: 1000\r\n"
+        b"x-fnmusic-save: 1\r\n"
+        + extra_headers
+        + b"Connection: close\r\n\r\n"
+    )
+    client, upstream_calls = _dispatch_raw(monkeypatch, raw, engine=engine)
+    head, _, body = client.data.partition(b"\r\n\r\n")
+    assert head.startswith(b"HTTP/1.1 400")
+    payload = json.loads(body.decode("utf-8"))
+    assert payload["code"] == "invalid_request"
+    assert upstream_calls == []
+    assert engine.calls == 0
+    assert client.closed is True
+
+
+def test_local_host_file_route_keeps_its_documented_403_for_ambiguous_claims(
+    monkeypatch,
+):
+    raw = (
+        b"POST /app/fnmusic-ext/api/host-file HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"X-Trim-Isadmin: true\r\n"
+        b"X-Trim-Isadmin: false\r\n"
+        b"Content-Length: 2\r\n"
+        b"Connection: close\r\n\r\n{}"
+    )
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("rejected host-file request must not read a body")
+
+    monkeypatch.setattr(_MOD, "_read_full_body", forbidden)
+    client, upstream_calls = _dispatch_raw(monkeypatch, raw)
+    head, _, body = client.data.partition(b"\r\n\r\n")
+    assert head.startswith(b"HTTP/1.1 403")
+    assert "仅管理员".encode("utf-8") in body
+    assert upstream_calls == []
+    assert client.closed is True
+
+
+def test_ordinary_duplicate_non_identity_header_still_forwards(monkeypatch):
+    raw = (
+        b"GET /app/fnmusic-ext/ HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"X-Note: first\r\n"
+        b"X-Note: second\r\n"
+        b"\r\n"
+    )
+    remote = SimpleNamespace(settimeout=lambda _timeout: None,
+                             close=lambda: None)
+    connected = []
+
+    def fake_connect(*args, **kwargs):
+        connected.append((args, kwargs))
+        return remote
+
+    monkeypatch.setattr(_MOD.socket, "create_connection", fake_connect)
+    monkeypatch.setattr(_MOD.threading, "Thread", _SilentThread)
+    client = _HeadClient(raw)
+    _MOD._handle(client, ("127.0.0.1", 1))
+    assert connected
+    assert client.closed is True
+
+
+def test_channel_policy_defaults_to_root_only(monkeypatch):
+    monkeypatch.delenv(_MOD.GATEWAY_PEER_ALLOW_ENV, raising=False)
+    monkeypatch.delenv(_MOD.GATEWAY_SOCKET_MODE_ENV, raising=False)
+    assert _MOD._channel_policy() == (frozenset({0}), 0o600)
+
+
+def test_channel_policy_derives_the_shared_default_mode(monkeypatch):
+    monkeypatch.setenv(_MOD.GATEWAY_PEER_ALLOW_ENV, "0,33")
+    monkeypatch.delenv(_MOD.GATEWAY_SOCKET_MODE_ENV, raising=False)
+    assert _MOD._channel_policy() == (frozenset({0, 33}), 0o660)
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "expected_code"),
+    [
+        (_MOD.GATEWAY_PEER_ALLOW_ENV, "abc", "peer_allow_invalid"),
+        (_MOD.GATEWAY_PEER_ALLOW_ENV, " 0 ", "peer_allow_invalid"),
+        (_MOD.GATEWAY_SOCKET_MODE_ENV, "0666", "socket_mode_invalid"),
+        (_MOD.GATEWAY_SOCKET_MODE_ENV, "0777", "socket_mode_invalid"),
+    ],
+)
+def test_invalid_channel_policy_refuses_startup_with_a_fixed_code(
+    monkeypatch, capsys, name, value, expected_code,
+):
+    monkeypatch.delenv(_MOD.GATEWAY_PEER_ALLOW_ENV, raising=False)
+    monkeypatch.delenv(_MOD.GATEWAY_SOCKET_MODE_ENV, raising=False)
+    monkeypatch.setenv(name, value)
+    with pytest.raises(SystemExit) as raised:
+        _MOD._policy_or_exit()
+    assert raised.value.code == 2
+    assert expected_code in capsys.readouterr().err
+
+
+def test_channel_rejection_log_is_throttled_and_fixed(monkeypatch, capsys):
+    monkeypatch.setattr(_MOD, "_channel_reject_log_state", {})
+    first = _MOD._log_channel_rejection("peer_uid_not_allowed")
+    second = _MOD._log_channel_rejection("peer_uid_not_allowed")
+    _MOD._log_channel_rejection(
+        "peer_credentials_unsupported",
+        SimpleNamespace(pid=42, uid=0, gid=0),
+    )
+    err = capsys.readouterr().err
+    assert first is None and second is None
+    assert err.count("code=peer_uid_not_allowed") == 1
+    assert err.count("code=peer_credentials_unsupported") == 1
+    assert "pid=42" in err and "uid=0" in err
+    assert "Host:" not in err and "Cookie" not in err
+
+
+class _CloseableClient:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def _peer(uid: int):
+    return _MOD.gateway_identity.PeerCredentialsMetadata(
+        pid=123, uid=uid, gid=uid)
+
+
+def test_admit_peer_accepts_an_allowed_uid(monkeypatch):
+    peer = _peer(0)
+    monkeypatch.setattr(
+        _MOD.gateway_identity, "read_peer_credentials", lambda _sock: peer)
+    client = _CloseableClient()
+    assert _MOD._admit_peer(client, frozenset({0})) is True
+    assert client.closed is False
+
+
+def test_admit_peer_rejects_an_unlisted_uid(monkeypatch, capsys):
+    monkeypatch.setattr(_MOD, "_channel_reject_log_state", {})
+    peer = _peer(1000)
+    monkeypatch.setattr(
+        _MOD.gateway_identity, "read_peer_credentials", lambda _sock: peer)
+    client = _CloseableClient()
+    assert _MOD._admit_peer(client, frozenset({0})) is False
+    assert client.closed is True
+    err = capsys.readouterr().err
+    assert "code=peer_uid_not_allowed" in err
+    assert "uid=1000" in err
+
+
+def test_admit_peer_maps_unsupported_credentials_to_the_documented_code(
+    monkeypatch, capsys,
+):
+    monkeypatch.setattr(_MOD, "_channel_reject_log_state", {})
+
+    def unsupported(_sock):
+        raise _MOD.gateway_identity.PeerCredentialsError("UNSUPPORTED_PLATFORM")
+
+    monkeypatch.setattr(
+        _MOD.gateway_identity, "read_peer_credentials", unsupported)
+    client = _CloseableClient()
+    assert _MOD._admit_peer(client, frozenset({0})) is False
+    assert client.closed is True
+    assert "code=peer_credentials_unsupported" in capsys.readouterr().err
+
+
+def test_admit_peer_maps_malformed_credentials_to_the_documented_code(
+    monkeypatch, capsys,
+):
+    monkeypatch.setattr(_MOD, "_channel_reject_log_state", {})
+
+    def malformed(_sock):
+        raise _MOD.gateway_identity.PeerCredentialsError(
+            "INVALID_PEER_CREDENTIALS_PAYLOAD")
+
+    monkeypatch.setattr(
+        _MOD.gateway_identity, "read_peer_credentials", malformed)
+    client = _CloseableClient()
+    assert _MOD._admit_peer(client, frozenset({0})) is False
+    assert client.closed is True
+    assert "code=peer_credentials_invalid" in capsys.readouterr().err
+
+
+def test_serve_reasserts_the_policy_socket_mode(monkeypatch, tmp_path):
+    events = []
+
+    class FakeServer:
+        def bind(self, _path):
+            events.append("bind")
+
+        def listen(self, _backlog):
+            events.append("listen")
+
+        def accept(self):
+            raise KeyboardInterrupt
+
+        def close(self):
+            events.append("server-close")
+
+    monkeypatch.setattr(_MOD.socket, "socket", lambda *_a, **_k: FakeServer())
+    monkeypatch.setattr(_MOD.socket, "AF_UNIX", 1, raising=False)
+    monkeypatch.setattr(_MOD.socket, "SOCK_STREAM", 1, raising=False)
+    monkeypatch.setattr(_MOD.os, "chmod", lambda _path, mode: events.append(mode))
+    sock_path = tmp_path / "unused.sock"
+    with pytest.raises(KeyboardInterrupt):
+        _MOD.serve(sock_path, policy=(frozenset({0}), 0o600))
+    assert events == ["bind", 0o600, "listen", "server-close"]

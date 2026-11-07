@@ -159,7 +159,7 @@ musicdl 平台编号与短名见 [平台清单](musicdl-service/PLATFORMS.md)。
 
 ### 边听边存与曲库管理
 
-「边听边存」默认开启：在线音频完整下载后可保存到本地曲库，后续优先复用已核对的本地文件；切歌后的未完成下载可按并发限制转后台续传。
+「边听边存」默认关闭：显式开启后，在线音频完整下载后可保存到本地曲库，后续优先复用已核对的本地文件；切歌后的未完成下载可按并发限制转后台续传。
 
 1. 在「存储 → 目录设置」选择**下载目录**和**歌曲缓存目录**，可使用飞牛文件选择器或手动输入。
 2. 下载目录应属于希望被官方扫描的曲库；留空时自动探测共享曲库。缓存目录留空时使用安装目录下的 `cache/`。
@@ -235,15 +235,19 @@ native 模式会探测 Node.js、ffmpeg / ffprobe 等依赖；补装及降级行
 | 洛雪自动切源 / 平台优选 | `FNMUSIC_LX_AUTO_SWITCH` / `FNMUSIC_LX_PLATFORM_PREFERRED` | 分别为 `true` / `false` |
 | 洛雪脚本顺序 | `FNMUSIC_LX_SOURCE_ORDER` | 稳定脚本 ID 的 JSON 数组，建议在管理页排序 |
 | 三类音源直连 | `FNMUSIC_NETEASE_DIRECT_PLAY` / `FNMUSIC_MUSICDL_DIRECT_PLAY` / `FNMUSIC_LX_DIRECT_PLAY` | 均为 `false`，Beta |
-| 边听边存 | `FNMUSIC_TEE_SAVE_ENABLED` | `true` |
-| 下载 / 缓存目录 | `FNMUSIC_TEE_SAVE_DIR` / `FNMUSIC_CACHE_DIR` | 留空自动选择；必须分离 |
+| 边听边存 | `FNMUSIC_TEE_SAVE_ENABLED` | 默认关闭；显式开启后，歌曲下载完整即自动保存到曲库，不必听完整首 |
+| 下载 / 缓存目录 | `FNMUSIC_TEE_SAVE_DIR` / `FNMUSIC_CACHE_DIR` | 留空自动选择且必须分离：分别自动探测共享曲库 / 使用安装目录 `cache` |
 | 目录布局 / 文件名 | `FNMUSIC_DOWNLOAD_LAYOUT` / `FNMUSIC_LIBRARY_NAME_PATTERN` | `flat` / `{artist} - {title}` |
-| 封面 / 歌词落盘 | `FNMUSIC_AUTO_COVER` / `FNMUSIC_LYRIC_AUTO_DL` | 分别为 `true` / `false` |
-| 每日 / 热门推荐 | `FNMUSIC_RECOMMEND_DAILY` / `FNMUSIC_RECOMMEND_HOT` | 均为 `true` |
-| 公共 / 网易账号 / 网易常驻歌单 | `FNMUSIC_PUBLIC_PLAYLISTS_ENABLED` / `FNMUSIC_NETEASE_MY_PLAYLISTS` / `FNMUSIC_NETEASE_PLAYLIST_RESIDENT` | 均为 `false` |
-| 收藏自动绑定本地 | `FNMUSIC_FAV_AUTO_BIND` | `false` |
-| 大模型连接 | `FNMUSIC_LLM_BASE_URL` / `FNMUSIC_LLM_API_KEY` / `FNMUSIC_LLM_MODEL` | 只填连接不会启用用途 |
-| 大模型用途 | `FNMUSIC_LLM_DAILY_ENABLED` / `FNMUSIC_LLM_LIKED_ENABLED` | 均为 `false`，独立开启 |
+| 封面 / 歌词落盘 | `FNMUSIC_AUTO_COVER` / `FNMUSIC_LYRIC_AUTO_DL` | 分别为 `true` / `false`（默认开启封面、关闭歌词） |
+| 每日 / 热门推荐 | `FNMUSIC_RECOMMEND_DAILY` / `FNMUSIC_RECOMMEND_HOT` | 均为 `true`，可分别关闭 |
+| 公共 / 网易账号 / 网易常驻歌单 | `FNMUSIC_PUBLIC_PLAYLISTS_ENABLED` / `FNMUSIC_NETEASE_MY_PLAYLISTS` / `FNMUSIC_NETEASE_PLAYLIST_RESIDENT` | 均为 `false`；公共歌单选单在管理页完成，账号歌单仍需登录 |
+| 收藏自动绑定本地 | `FNMUSIC_FAV_AUTO_BIND` | `false`；显式收藏或加入歌单后下载并等待官方入库再绑定，浏览列表不触发音频下载 |
+| 大模型连接 | `FNMUSIC_LLM_BASE_URL` / `FNMUSIC_LLM_API_KEY` / `FNMUSIC_LLM_MODEL` | 只填连接不会启用用途；接口地址和密钥须完整，模型默认 `gpt-4o-mini` |
+| 大模型用途 | `FNMUSIC_LLM_DAILY_ENABLED` / `FNMUSIC_LLM_LIKED_ENABLED` | 均为 `false`，独立开启；接口不完整时不调用模型 |
+| 大模型接口协议 | `FNMUSIC_LLM_PROTOCOL` | `chat`（默认，`/chat/completions`）或 `responses`（`/responses`），两种协议均完整实现 |
+| 大模型单次输出上限 | `FNMUSIC_LLM_MAX_TOKENS` | 256–131072（默认 8192，含推理 token）；DeepSeek 等推理模型吃满预算导致正文为空时调大，或用 `FNMUSIC_LLM_EXTRA_BODY` 关闭思考（如 `{"thinking":{"type":"disabled"}}`） |
+| 大模型每日 token 上限 | `FNMUSIC_LLM_DAILY_TOKEN_LIMIT` | 默认 1000000，0=不限制；达到后当天不再调用、次日自动重置，用量与最近失败见管理页及 `/_ext/healthz` |
+| 大模型猜你喜欢间隔 / 数量 | `FNMUSIC_LIKED_REFRESH_HOURS` / `FNMUSIC_LIKED_SIZE` | 间隔为有限数字且 ≥0.5 小时（默认 0.5，无上限）；数量为 0–100 整数（默认 20）；不是缓存失效时间 |
 
 ### 更新、停止与还原
 
