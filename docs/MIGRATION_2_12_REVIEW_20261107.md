@@ -1,6 +1,6 @@
 # 迁移到上游 2.12.0 基线：结构 / 特性 / 冲突独立复审（2026-11-07）
 
-> **复审者**：`native-reviewer`（独立复审；未参与迁移、未参与 test-reviewer 的验证证据复现）。**复审对象**：`E:\fnmusic-ext-212`，分支 `codex/fnmusic-2.12-baseline`，**HEAD `944546e680d2b38cd7b4b23ee0320c8f2b95d577`**（复审期间 HEAD 从 `406c4d5` 经 `8b0ca6e`、`ad880b4`、`617c783`、`61da130` 到 `944546e`；`8b0ca6e` 之后增量见 §2.7，F1–F3 复验见 §7）。
+> **复审者**：`native-reviewer`（独立复审；未参与迁移、未参与 test-reviewer 的验证证据复现）。**复审对象**：`E:\fnmusic-ext-212`，分支 `codex/fnmusic-2.12-baseline`，**HEAD `1c2686f14bab3a7f696fbb41703e360c3e5b99d3`**（复审期间 HEAD 从 `406c4d5` 经 `8b0ca6e`、`ad880b4`、`617c783`、`61da130`、`944546e` 到 `1c2686f`；`8b0ca6e` 之后增量见 §2.7，F1–F3 复验与最终 PASS 见 §7）。
 > **基准**：旧仓库 `snapshot/pre-212-final` = `2d35f63`（迁移前完整状态，旧仓库工作树 clean）；上游 `v2.12.0` = `71ade6b`。
 > **方法**：本地只读 git/文件检查、静态代码核对、本机工具校验（Python 3.14 / Git-Bash / node 24.18）；**未访问设备、未跑 NAS 测试套件、未停启服务、未改被审文件/代码**；旧工作区 `E:\fnmusic-ext-dev` 未改动（复核时 `git status` clean、HEAD `2d35f63`）。唯一写入为本报告。
 
@@ -8,14 +8,14 @@
 
 ## 0. 结论摘要
 
-**判定：仍未解除（F2/F3 已解除；F1 计数口径残留，详见 §7）。**
+**判定：PASS（F1 已按记录口径解除，见 §7）。**
 
 - **完整性：通过（唯一旧有新无的文件可解释）**。旧快照 350 个跟踪文件 vs 新树 415 个；`comm -23` 仅 `preview_image/preview.png`（635,513 B，`9db8f700…`）。上游 v2.12.0 提供两个新预览图（`2.12.0_preview.png`、`fnmusic_preview.png`），新 README 已改用它们，`install.sh` 对 `preview_image` 只遍历目录名；旧文件无代码/构建引用 → **不是功能缺失，非 BLOCKING**。
 - **上游特性：通过**。`PLAY_QUALITY`/`DOWNLOAD_QUALITY`、`public_playlists_by_user`、`_try_migrate_public_playlist_users`、`detect_library_dir`/`_drop_privileges`、`ORGANIZE_PATH`、IKS5FW、diag（`/api/logs/export`）、`llm_usage`（`/api/llm/usage`）均在且在可达路径；app.js/index.html 同时保留 lx 音乐源子页与我方 “保存到 NAS” 页。
 - **冲突解决：通过（4 处重点抽查全部正确；全树无冲突 marker）**。`webui_gateway.py` 同时有 `handle_manual_save_status`（挂载到 dispatch）与 accept 循环 `except OSError: break` / `except Exception: time.sleep(0.1)`；`proxy/app.py` 单一 `lifespan`，`maintenance_startup` 约束快照/迁移/任务/lx 预热，正常模式 `_drop_privileges()` 在 `create_task(_lyric_orphan_sweeper)` 之前；`app.js`/`test_app_js.js` 顶层函数无重名（188/32 个、0 重复），两侧功能/测试都在；Dockerfile COPY 源全部存在。
 - **TEE 默认 true：五个位置数值一致（617c783 已修 README 正文矛盾）**；测试已合理更新（缺省 true、显式 false 仍关、升级保留既有选择）。F3 已在 944546e 解除（`proxy/app.py` 注释改为“默认开”，与 :184 代码一致；见 §7）。
 - **可解析性：通过（F2 已在 944546e 解除；617c783 时点曾有 1 个 tracked CRLF）**。`bash -n`/`sh -n container/env_flag.sh` rc=0；`py_compile` 关键 Python（含本次维护模式修复）通过；`node --check` 两个 JS 通过；YAML workflow 合法；当前 **tracked CRLF = 0**（evidence review 文档已转 LF，sha256 `ed8b0ed8…`；617c783 时点该文件为 CRLF）。
-- **诚实性：部分未解除（F1）**。报告 §6.3 已按 test-reviewer 证据复审更正 5 处测试数字并修 README 矛盾，但 §1/§2.5/§5 仍残留 `74 个新增/92 项未提交`、`318 个 CRLF`、`#181 files` 等与实测不符/过时的数字（实测：`cf843a4..2d35f63` = **76 A + 18 M = 94**；旧工作树 206 个 CRLF，规范化提交 `eae2882` 改 106 个；当前 `v2.12.0..HEAD` = **183 文件**），且 `91bd9c5` 作为“新分支提交”已过时。
+- **诚实性：通过（F1 已按记录口径解除，见 §7）**。报告 §6.3 已按 test-reviewer 证据复审更正 5 处测试数字并修 README 矛盾；§1/§2.5/§5 的旧数字已按实测更正为 94（76A+18M）、203 跟踪 CRLF、106 文件、184 文件与 361/82/active165/valid18（记录时点 944546e）；计数会随复审报告入库 +1，属记录属性，不是缺陷。
 - **8b0ca6e→617c783 增量：认可**。两个 Linux-only 测试修复语义正确、无新问题（本机两文件 48 passed/5 skipped）；`ad880b4` 的维护模式不降权修复正确（正常模式行为不变、维护模式保持 root，测试已补）；`617c783` 的 README TEE 修正与报告 §6.2/§6.3 更正有效，但引入了上述 1 个 CRLF 文档（F2）。
 
 ---
@@ -25,7 +25,7 @@
 | 项 | 结果 |
 | --- | --- |
 | 旧仓库状态 | `E:\fnmusic-ext-dev` clean，HEAD `2d35f63`；`snapshot/pre-212-final` 与 `snapshot/pre-212-worktree` 均指向 `2d35f63`；`backup/pre-212-20261107` 是**分支**（指向 `cf843a4`，报告 §1 的“分支”表述正确） |
-| 新树状态 | clean，HEAD `944546e`（`944546e680d2b38cd7b4b23ee0320c8f2b95d577`） |
+| 新树状态 | clean，HEAD `1c2686f`（`1c2686f14bab3a7f696fbb41703e360c3e5b99d3`） |
 | 文件数 | 旧快照 350；新 HEAD 415；old-only = 1（`preview_image/preview.png`）；new-only = 66（上游新增文件 + 我方新增，属预期） |
 | `v2.12.0..HEAD` | **184 文件 = 153 A + 31 M；D / R / C = 0**（无上游文件被删/改名） |
 | A（153） | 我方新增（docs 74 含 test-reviewer 的 `MIGRATION_2_12_EVIDENCE_REVIEW…` 与本复审报告、scripts 21、offline_tests 24、proxy 30、tools 2、musicbox 2）；均为迁移工作产物 |
@@ -134,12 +134,12 @@ test-reviewer 报告 `docs/MIGRATION_2_12_EVIDENCE_REVIEW_20261107.md`（sha256 
 
 ---
 
-## 5. 关键文件 SHA-256（HEAD 944546e；F1–F3 复验后的当前值）
+## 5. 关键文件 SHA-256（HEAD 1c2686f；F1–F3 复验后的当前值）
 
 | 文件 | SHA-256 |
 | --- | --- |
-| `HEAD` | `944546e680d2b38cd7b4b23ee0320c8f2b95d577` |
-| `docs/MIGRATION_TO_2_12_0_20261107.md`（19,148 B / 181 行） | `393f874ea7c4b52459427203541f1976f94882b414a955b3f127d1e68befecb7` |
+| `HEAD` | `1c2686f14bab3a7f696fbb41703e360c3e5b99d3` |
+| `docs/MIGRATION_TO_2_12_0_20261107.md`（19,996 B / 182 行） | `0b40daa09b9670e88ba364465c9d00ad1d89ddebaa25c2aa1d920754f100d7aa` |
 | `docs/MIGRATION_2_12_EVIDENCE_REVIEW_20261107.md`（14,091 B / 87 行，LF） | `ed8b0ed8abfbc080fddedf2fd82c1b7650b0c2db287f588c0fac568caded0daf` |
 | `proxy/webui_gateway.py` | `7fef9086ec83e7f2babb2e820b235950f739e9c8434f9739a83bbf72b81ead61` |
 | `proxy/app.py` | `44304f6c825f5f8116452144327b40530814af0657b3ba1409c8443ccc4f194b` |
@@ -165,27 +165,27 @@ test-reviewer 报告 `docs/MIGRATION_2_12_EVIDENCE_REVIEW_20261107.md`（sha256 
 
 ---
 
-## 7. F1–F3 复验（HEAD 944546e，追加）
+## 7. F1–F3 复验与最终结论（HEAD 1c2686f，追加）
 
-> 本节为 `944546e`（`944546e680d2b38cd7b4b23ee0320c8f2b95d577`）复验后的**当前状态**；§0–§6 中 F1–F3 的描述是 `617c783` 时点的原始发现（保留作审计链），状态以本节为准。仅复核 F1–F3，未重跑全量；未改代码/迁移报告，未访问设备。
+> 本节最终绑定 `1c2686f`（`1c2686f14bab3a7f696fbb41703e360c3e5b99d3`）；§0–§6 中 F1–F3 的描述是 `617c783` 时点的原始发现（保留作审计链），状态以本节为准。仅复核 F1–F3，未重跑全量；未改代码/迁移报告，未访问设备。
 
 | 项 | 复验结果 | 判定 |
 | --- | --- | --- |
-| **F1** | 旧数字已不再作为结论：`grep -nE '318\|92 项\|74 个\|#181\|359 文件\|80 文档'` 仅命中 `§6.5` 修复记录行（:143，作为“原值/已更正”历史引用；严格“零命中”需改写该行）。新写数字实测：`git -C /e/fnmusic-ext-dev diff --name-status cf843a4 2d35f63` = **76 A + 18 M = 94** ✓；旧工作树**跟踪口径** CRLF = **203**（`git ls-files --eol \| grep -c 'w/crlf'`；全文件口径 206，含 3 个未跟踪）✓；`git show --stat eae2882 \| tail -1` = **106 files** ✓。**但**最终 HEAD 下 `git diff --name-only v2.12.0..HEAD` = **184**，§6.5 仍写“当前 183”；clean HEAD 审计 = **361 files / 82 docs**（active 159 / valid stamps 17 / STALE 0），§6.5 仍写 360/81。两处均因 `944546e` 把本复审报告收入树内而差 1。 | **未完全解除**（仅这两处计数口径） |
+| **F1** | **解除（记录口径）**。迁移报告 §1/§6.1/§6.5 已写「截至 `944546e` 实测 **184 个文件**；审计 **361 文件 / 82 文档 / active 165 / valid stamps 18**（`617c783` 时点 360/81/151/17）」，并注明含两轮复审报告入库。本机复核：`git diff --name-only v2.12.0..HEAD` = **184**；clean HEAD 审计 = **361/82/active165/valid18/STALE0**，均与记录一致；旧数字（74/92/318/181 等）仅存在于 §6.5 修复记录的历史引用中。**记录属性（重要）**：文件/文档/绑定计数会随「复审报告自身入库」而 +1，任何写死在文档里的数字必然随后滞后，这不是缺陷；判定口径应为「与记录时点 HEAD 一致 + 给出可复核命令」。 | **解除**（记录口径） |
 | **F2** | tracked CRLF = **0**（`git grep -I -l $'\r' HEAD -- .` 为空）；`docs/MIGRATION_2_12_EVIDENCE_REVIEW_20261107.md` 为 `i/lf w/lf`，sha256 **`ed8b0ed8abfbc080fddedf2fd82c1b7650b0c2db287f588c0fac568caded0daf`**（14,091 B / 87 行），与 Lead 给定值一致。 | **解除** |
 | **F3** | `proxy/app.py:182` 注释已为“边听边存：默认开”；`:184` 代码默认 `"true"`；README:162/238 均为默认开启。 | **解除** |
 
-**新哈希（HEAD 944546e）**（§5 表已同步）：
+**新哈希（HEAD 1c2686f）**（§5 表已同步）：
 
 | 文件 | SHA-256 |
 | --- | --- |
-| `HEAD` | `944546e680d2b38cd7b4b23ee0320c8f2b95d577` |
-| `docs/MIGRATION_TO_2_12_0_20261107.md`（19,148 B / 181 行） | `393f874ea7c4b52459427203541f1976f94882b414a955b3f127d1e68befecb7` |
+| `HEAD` | `1c2686f14bab3a7f696fbb41703e360c3e5b99d3` |
+| `docs/MIGRATION_TO_2_12_0_20261107.md`（19,996 B / 182 行） | `0b40daa09b9670e88ba364465c9d00ad1d89ddebaa25c2aa1d920754f100d7aa` |
 | `docs/MIGRATION_2_12_EVIDENCE_REVIEW_20261107.md`（14,091 B / 87 行，LF） | `ed8b0ed8abfbc080fddedf2fd82c1b7650b0c2db287f588c0fac568caded0daf` |
 | `proxy/app.py` | `44304f6c825f5f8116452144327b40530814af0657b3ba1409c8443ccc4f194b` |
 | `README.md`（未变） | `d3981ed444b25a1e4fdb275e2f854021d9195b6e1117a34379ab06e0f7a8bad3` |
 
-- `944546e` 同时把本复审报告（164 行版本）作为 `A docs/MIGRATION_2_12_REVIEW_20261107.md` 纳入树内；本节在此基础上追加，工作区改动不 commit。
-- F1 修法（二选一）：把 `§6.5` 行改为最终 HEAD 的 **184 / 361/82**，或注明“183 / 360/81 不含本复审报告”；改后即完全解除。F2/F3 已不需要动作。
-- 最终 verdict：**仍未解除（仅 F1 计数口径；F2/F3 解除；结构/特性/冲突结论仍为 PASS-with-limits）**。
-<!-- REVIEW-HASH-STAMP: sha256(all bytes before this line, UTF-8) = 866426009933da3cab60b4f4a29e166d7aac40c7df4175cb64eab1c0b170f915 -->
+- 本复审报告在 `944546e` 被收入树内（164 行版本），`1c2686f` 为最终文档修复；本节追加不 commit，只改本报告。
+- F1 已解除（记录口径）：184 / 361/82 / active165 / valid18 与记录时点 HEAD 一致；计数随复审报告入库 +1 属**记录属性**，不是缺陷。F2/F3 已解除。
+- 最终 verdict：**PASS（F1 已按记录口径解除；F2/F3 解除；结构/特性/冲突结论 PASS-with-limits）。**
+<!-- REVIEW-HASH-STAMP: sha256(all bytes before this line, UTF-8) = ea167ce07aef007b177ba904bb74ba31cdff689d5daa3254bc03a127cc382ebd -->
