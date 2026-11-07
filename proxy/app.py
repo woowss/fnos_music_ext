@@ -179,7 +179,7 @@ CONF = {
     "music_db": os.environ.get(
         "FNMUSIC_MUSIC_DB", "/usr/local/apps/@appdata/trim.music/db/music.db"
     ),
-    # 边听边存：默认关；仅显式开启后，保存路径空才自动探测飞牛共享曲库；
+    # 边听边存：默认开；仅显式开启后，保存路径空才自动探测飞牛共享曲库；
     # tee_cache_max 仅在关闭边听边存时生效（滚动保留最新 N 首试听缓存）
     "tee_save_enabled": os.environ.get("FNMUSIC_TEE_SAVE_ENABLED", "true").lower() in ("true", "1", "yes"),
     "tee_save_dir": os.environ.get("FNMUSIC_TEE_SAVE_DIR", ""),
