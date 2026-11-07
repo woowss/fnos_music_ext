@@ -77,6 +77,20 @@
 
 **硬性要求**：采集代码只读、异常必须被吞掉并标记 unknown；**采集失败不得改变保存结果**；采集开关默认关闭。
 
+### 4.1 已实现：落盘后独立观测器（`delivered_evidence`）
+
+- `scripts/observe_delivered_evidence.py`
+  sha256 `c43e30f5af6c88d3bd6b0f708d8f418107c3eb4bfea81577cfdbd8f13e4752b9`
+  - 只读：`O_RDONLY|O_NOFOLLOW` + `fstat` + 单遍流式 `sha256/md5`；`ffprobe`/`ffmpeg` 只读调用
+  - 产出 schema §2.4.3 的 `delivered_evidence`：`basename/basename_ref`（basename 写入受控 `basename.txt` 并绑哈希）、`stat`、`sha256/size/md5`、`audio`（format/codec/sample_rate/channels/sample_fmt/bits_per_raw_sample/duration/bit_rate/stream_count）、`decode`（`-xerror -f null`）、`tags`（白名单 + raw_keys）、`cover`（内嵌 attached_pic 或侧车 jpg/png/webp + 字节哈希）、`lyric`（侧车 .lrc 的编码/字节/行数/文本哈希）、可选 `mode_owner`（目标目录采样）
+  - **缺 ffprobe/ffmpeg 时显式失败**（exit 3，固定码），不产出「看似有效的 unknown 证据」
+  - 证据文件全部落在 `--evidence-dir` 受控目录，ref 的 sha256/bytes 对实际文件重算
+- `offline_tests/test_observe_delivered_evidence.py`
+  sha256 `5b20d3827263ec92732819e51c00f4ea30d7290c0f04dc8bb3f957e9b8d24b0b`
+  - 纯函数与失败路径（Windows 可跑）：**10 passed / 3 skipped**（skip 为缺 ffprobe 的端到端用例）
+  - NAS 真机（ffprobe/ffmpeg 可用）：**31 passed**（含 18 项 capture 合同测试），端到端覆盖 WAV（pcm_s16le/8000/1ch/decode ok/侧车歌词 2 行）与带标签 MP3（mp3/44100/2ch/bit_rate/title·artist·album·track 解析）
+  - 结构契约：把观测结果嵌入 EvidenceSet 后，`_structure_issues` 对 `delivered_evidence` 零违规
+
 ## 5. 验收与测试
 
 - 生产者契约：新模块输出必须能通过 G-X3 `verify_document`（当前 18/18 通过，含「语义校验通过 ≠ 验收通过」断言）。
