@@ -5384,8 +5384,11 @@ async def lifespan(fastapi_app: FastAPI):
     # root-only 初始化已完成：先以 root 探测曲库目录（music.db 可能仅 root 可读），
     # 再降权；_drop_privileges 会把暂存 socket 目录交给目标用户，uvicorn 在
     # lifespan 结束后 bind --uds 才不会 EACCES。
-    detect_library_dir()
-    _drop_privileges()
+    # 维护模式（FNMUSIC_MAINTENANCE_STARTUP=1）必须保持 root 身份只做一次维护操作：
+    # 此处若降权，后续特权维护请求会因权限不足而失败。
+    if not maintenance_startup:
+        detect_library_dir()
+        _drop_privileges()
 
     # 后台任务在降权之后创建，避免首个 await 期间以 root 写用户目录。
     if background_jobs_enabled:

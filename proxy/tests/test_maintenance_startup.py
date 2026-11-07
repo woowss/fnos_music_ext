@@ -121,6 +121,11 @@ def recommend_sync():
 def detect_library_dir():
     return operation("library_directory_detection", str(root / "music-library"))
 
+def drop_privileges():
+    # 探针子进程不得真的降权（会影响后续断言的环境），只记录调用；
+    # 维护模式下 operation() 会抛 sentinel，用来证明「维护模式绝不能降权」。
+    return operation("privilege_drop", None)
+
 def sweep_orphan_lyrics(*_args, **_kwargs):
     return operation("orphan_lyric_sweep", [])
 
@@ -137,6 +142,7 @@ app.env_snapshot_lines = snapshot_collect
 app.write_env_snapshot = snapshot_write
 app._sync_recommend_version_marker = recommend_sync
 app.detect_library_dir = detect_library_dir
+app._drop_privileges = drop_privileges
 app.sweep_orphan_lyrics = sweep_orphan_lyrics
 app.purge_stale = log_retention_purge
 app._env_watch_stat = env_watch_stat
@@ -351,6 +357,7 @@ def test_fresh_import_and_lifespan_mode_matrix(
         assert not {
             "file_logging_setup", "file_logging_purge", "host_snapshot_collect",
             "host_snapshot_write", "recommend_version_sync", "library_directory_detection",
+            "privilege_drop",
             "orphan_lyric_sweep", "log_retention_purge_task", "orphan_lyric_sweeper_started",
             "log_retention_started", "env_watch_stat", "env_watch_started",
             "lx_warmup_http_sentinel", "liked_scheduler_started",
@@ -365,6 +372,9 @@ def test_fresh_import_and_lifespan_mode_matrix(
     assert result["old_marker_hex"] != b"fixture-old-version\n".hex()
     assert result["old_cache_hex"] is None
     assert result["fallback_cache_hex"] == b'{"fixture":"old-daily-cache"}\n'.hex()
+    # 2.12 基线：库目录探测与降权是启动必经步骤（上游安全修复），
+    # 不随 FNMUSIC_BACKGROUND_JOBS 关闭而跳过。
+    assert {"library_directory_detection", "privilege_drop"}.issubset(events)
     jobs_enabled = (
         background_jobs.lower() in ("1", "true", "yes")
         and not expected_maintenance
@@ -378,6 +388,7 @@ def test_fresh_import_and_lifespan_mode_matrix(
         assert "liked_scheduler_cancelled" in events
         assert "maintenance_socket_stopped" in events
         assert "library_directory_detection" in events
+        assert "privilege_drop" in events
         assert "orphan_lyric_sweep" in events
         assert "log_retention_purge_task" in events
         if env_watch.lower() in ("1", "true", "yes"):
@@ -389,7 +400,7 @@ def test_fresh_import_and_lifespan_mode_matrix(
     else:
         assert not {
             "orphan_lyric_sweeper_started", "log_retention_started", "env_watch_started",
-            "library_directory_detection", "orphan_lyric_sweep", "log_retention_purge_task",
+            "orphan_lyric_sweep", "log_retention_purge_task",
             "env_watch_stat", "liked_scheduler_started", "maintenance_socket_started",
             "maintenance_socket_stopped",
         }.intersection(events)
