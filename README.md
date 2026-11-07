@@ -235,7 +235,7 @@ native 模式会探测 Node.js、ffmpeg / ffprobe 等依赖；补装及降级行
 | 洛雪自动切源 / 平台优选 | `FNMUSIC_LX_AUTO_SWITCH` / `FNMUSIC_LX_PLATFORM_PREFERRED` | 分别为 `true` / `false` |
 | 洛雪脚本顺序 | `FNMUSIC_LX_SOURCE_ORDER` | 稳定脚本 ID 的 JSON 数组，建议在管理页排序 |
 | 三类音源直连 | `FNMUSIC_NETEASE_DIRECT_PLAY` / `FNMUSIC_MUSICDL_DIRECT_PLAY` / `FNMUSIC_LX_DIRECT_PLAY` | 均为 `false`，Beta |
-| 边听边存 | `FNMUSIC_TEE_SAVE_ENABLED` | 默认关闭；显式开启后，歌曲下载完整即自动保存到曲库，不必听完整首 |
+| 边听边存 | `FNMUSIC_TEE_SAVE_ENABLED` | 默认开启（与上游 2.12 一致）；关闭后，歌曲下载完整即自动保存到曲库，不必听完整首 |
 | 下载 / 缓存目录 | `FNMUSIC_TEE_SAVE_DIR` / `FNMUSIC_CACHE_DIR` | 留空自动选择且必须分离：分别自动探测共享曲库 / 使用安装目录 `cache` |
 | 目录布局 / 文件名 | `FNMUSIC_DOWNLOAD_LAYOUT` / `FNMUSIC_LIBRARY_NAME_PATTERN` | `flat` / `{artist} - {title}` |
 | 封面 / 歌词落盘 | `FNMUSIC_AUTO_COVER` / `FNMUSIC_LYRIC_AUTO_DL` | 分别为 `true` / `false`（默认开启封面、关闭歌词） |

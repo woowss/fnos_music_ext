@@ -32,10 +32,10 @@ from proxy.app import (
 
 @pytest.mark.parametrize(
     "configured, expected",
-    [(None, "False"), ("true", "True"), ("1", "True"), ("yes", "True"), ("false", "False")],
+    [(None, "True"), ("true", "True"), ("1", "True"), ("yes", "True"), ("false", "False")],
 )
-def test_tee_save_is_opt_in_when_environment_key_is_missing(configured, expected, tmp_path):
-    """缺省关闭；显式真值仍可开启，显式 false 仍关闭。"""
+def test_tee_save_is_on_by_default_when_environment_key_is_missing(configured, expected, tmp_path):
+    """2.12 基线：缺省开启；显式 false 仍关闭（我方旧分支曾默认关闭）。"""
     env = os.environ.copy()
     env.pop("FNMUSIC_TEE_SAVE_ENABLED", None)
     if configured is not None:
@@ -54,18 +54,18 @@ def test_tee_save_is_opt_in_when_environment_key_is_missing(configured, expected
     assert result.stdout.strip().endswith(expected)
 
 
-def test_installer_tee_save_default_is_opt_in_and_preserves_existing_choice():
-    """fresh env 得到 false；升级时只补缺失项并保留已有用户选择。"""
+def test_installer_tee_save_default_is_on_and_preserves_existing_choice():
+    """fresh env 得到 true（2.12 基线）；升级时只补缺失项并保留已有用户选择。"""
     from proxy.env_merge import merge_env
 
     root = Path(__file__).resolve().parents[2]
     install = (root / "install.sh").read_text(encoding="utf-8")
-    assert 'echo "FNMUSIC_TEE_SAVE_ENABLED=\'false\'"' in install
+    assert 'echo "FNMUSIC_TEE_SAVE_ENABLED=\'true\'"' in install
     explicit_start = install.index('ENV_EXPLICIT="')
     explicit_end = install.index('\nif [ -f "${ENV_PATH}" ]', explicit_start)
     assert "FNMUSIC_TEE_SAVE_ENABLED" not in install[explicit_start:explicit_end]
 
-    desired = [("FNMUSIC_TEE_SAVE_ENABLED", "false")]
+    desired = [("FNMUSIC_TEE_SAVE_ENABLED", "true")]
     for previous in ("true", "false"):
         merged, summary = merge_env(
             [("FNMUSIC_TEE_SAVE_ENABLED", previous)], desired, explicit=set()
@@ -73,8 +73,8 @@ def test_installer_tee_save_default_is_opt_in_and_preserves_existing_choice():
         assert dict(merged)["FNMUSIC_TEE_SAVE_ENABLED"] == previous
         assert summary["preserved"] == ["FNMUSIC_TEE_SAVE_ENABLED"]
     merged, summary = merge_env([], desired, explicit=set())
-    assert dict(merged)["FNMUSIC_TEE_SAVE_ENABLED"] == "false"
-    assert summary["added"] == ["FNMUSIC_TEE_SAVE_ENABLED"]
+    assert dict(merged)["FNMUSIC_TEE_SAVE_ENABLED"] == "true"
+    assert "FNMUSIC_TEE_SAVE_ENABLED" in summary["added"]  # 2.12 基线还会新增 PLAY_QUALITY 等键
 
 
 @pytest.fixture(autouse=True)
@@ -240,7 +240,7 @@ def test_env_hot_reload_whitelist_updates_conf_and_environ(tmp_path, conf_guard)
         "FNMUSIC_MUSICDL_ENABLED=false\n"
         "FNMUSIC_LX_ENABLED=true\n"
         "FNMUSIC_QUALITY_MODE=balanced\n"
-        "FNMUSIC_TEE_SAVE_ENABLED=false\n"
+        "FNMUSIC_TEE_SAVE_ENABLED=true\n"
         "FNMUSIC_TEE_CACHE_MAX=999\n"
         "FNMUSIC_RECOMMEND_HOT=false\n"
         "LX_SOURCES=kw,kg\n"
@@ -254,7 +254,7 @@ def test_env_hot_reload_whitelist_updates_conf_and_environ(tmp_path, conf_guard)
     assert "musicdl_enabled" in changed and CONF["musicdl_enabled"] is False
     assert CONF["lx_enabled"] is True
     assert CONF["quality_mode"] == "balanced"
-    assert CONF["tee_save_enabled"] is False
+    assert CONF["tee_save_enabled"] is True
     assert CONF["tee_cache_max"] == 100  # 钳制到 1-100
     assert CONF["recommend_hot"] is False
     assert CONF["lx_sources"] == ["kw", "kg"]

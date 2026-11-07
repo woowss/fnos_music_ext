@@ -160,7 +160,7 @@ def test_config_view_merges_defaults(env_file):
         assert f"app.js?build={webui.STATIC_BUILD_ID}" in page
 
 
-def test_config_view_defaults_tee_save_off_when_key_is_missing(env_file):
+def test_config_view_defaults_tee_save_on_when_key_is_missing(env_file):
     env_file.write_text(
         BASE_ENV.replace("FNMUSIC_TEE_SAVE_ENABLED='true'\n", ""), encoding="utf-8"
     )
@@ -168,8 +168,8 @@ def test_config_view_defaults_tee_save_off_when_key_is_missing(env_file):
         response = client.get("/api/config")
         assert response.status_code == 200
         body = response.json()
-        assert body["values"]["FNMUSIC_TEE_SAVE_ENABLED"] == "false"
-        assert body["schema"]["FNMUSIC_TEE_SAVE_ENABLED"]["default"] == "false"
+        assert body["values"]["FNMUSIC_TEE_SAVE_ENABLED"] == "true"
+        assert body["schema"]["FNMUSIC_TEE_SAVE_ENABLED"]["default"] == "true"
 
 
 # ------------------------------------------------------------------ PUT 校验 ---

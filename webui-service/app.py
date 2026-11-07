@@ -185,7 +185,7 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_PUBLIC_PLAYLISTS_ENABLED": {"kind": "bool", "default": "false", "group": "recommend", "reload": "hot", "label": "公共歌单"},
     "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": {"kind": "str", "default": "[]", "group": "recommend", "reload": "hot", "label": "公共歌单选择"},
     "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER": {"kind": "str", "default": "", "group": "recommend", "reload": "hot", "label": "各用户公共歌单"},
-    "FNMUSIC_TEE_SAVE_ENABLED": {"kind": "bool", "default": "false", "group": "tee", "reload": "hot", "label": "边听边存"},
+    "FNMUSIC_TEE_SAVE_ENABLED": {"kind": "bool", "default": "true", "group": "tee", "reload": "hot", "label": "边听边存"},
     "FNMUSIC_TEE_SAVE_DIR": {"kind": "dir", "default": "", "group": "storage", "reload": "hot", "label": "下载目录（留空自动探测共享曲库）"},
     "FNMUSIC_DOWNLOAD_LAYOUT": {"kind": "enum", "values": ["flat", "artist", "album", "artist_album"], "default": "flat", "group": "storage", "reload": "hot", "label": "存放方式（beta）"},
     "FNMUSIC_TEE_SAVE_MODE": {"kind": "enum", "values": ["auto", "direct", "staged"], "default": "auto", "group": "storage", "reload": "hot", "label": "落盘方式"},
