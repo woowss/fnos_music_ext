@@ -326,14 +326,16 @@ NoNewPrivs:\t1
                 mock.patch.object(restore.os, "close"), \
                 mock.patch.object(restore, "_reject_posix_acls"), \
                 mock.patch.object(restore, "_hash_fd", return_value="0" * 64):
+            # 期望值必须在 patch 生效期间取样：O_NOFOLLOW/O_CLOEXEC 被置 0，
+            # 离开 with 后 os 会恢复真实常量（Linux 上非 0），断言就会假失败。
+            expected_flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                              | getattr(os, "O_CLOEXEC", 0))
             with self.assertRaises(restore.FixtureError) as caught:
                 restore._verify_file_at(7, "settings.json", info,
                                         (3, "1" * 64))
         self.assertEqual(caught.exception.code, "fixture_readback_mismatch")
         self.assertEqual(open_file.call_args.kwargs["dir_fd"], 7)
-        self.assertEqual(open_file.call_args.args[1],
-                         os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-                         | getattr(os, "O_CLOEXEC", 0))
+        self.assertEqual(open_file.call_args.args[1], expected_flags)
 
     def test_actual_readback_detects_changed_bytes_on_linux_as_root(self):
         if (sys.platform != "linux" or os.geteuid() != 0

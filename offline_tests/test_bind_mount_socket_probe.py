@@ -64,7 +64,8 @@ class BindMountSocketProbeTests(unittest.TestCase):
             try:
                 identity = probe._identity(os.fstat(fd))
                 held_path.rename(replacement_path)
-                replacement_path.mkdir()
+                # 原路径重建为「新目录」，验证 /proc/self/fd 仍指向被持有的旧目录
+                held_path.mkdir()
                 resolved = probe._fd_directory_path(fd, identity)
                 self.assertEqual(resolved, f"/proc/self/fd/{fd}")
                 self.assertEqual(os.stat(resolved), os.fstat(fd))
