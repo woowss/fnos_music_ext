@@ -72,6 +72,7 @@ def _published_result():
             "lyric_status": "unavailable",
             "published_size": 34,
             "published_md5": "b" * 32,
+            "published_sha256": "c" * 64,
             "signed_url": SIGNED_URL,
             "cookie": "SECRETCOOKIE",
         },
@@ -351,7 +352,7 @@ def test_track_success_returns_sanitized_engine_result():
         "quality_actual", "quality_actual_status", "quality_fallback",
         "source_type", "format", "size", "md5", "basename",
         "target_dir", "tagged", "cover_embedded", "published_size",
-        "published_md5", "title_status", "artist_status", "album_status",
+        "published_md5", "published_sha256", "title_status", "artist_status", "album_status",
         "lyricist", "lyricist_status", "composer", "composer_status",
         "cover_status", "cover_error", "lyric_status",
     }
@@ -366,11 +367,36 @@ def test_track_success_returns_sanitized_engine_result():
     assert payload["data"]["basename"] == "歌手A - 测试歌曲.flac"
     assert payload["data"]["published_size"] == 34
     assert payload["data"]["published_md5"] == "b" * 32
+    assert payload["data"]["published_sha256"] == "c" * 64
     assert engine.save_calls == [SONG_ID]
     rendered = client.data.decode("utf-8", "replace")
     assert SIGNED_URL not in rendered
     assert "SECRETCOOKIE" not in rendered
     assert client.closed is True
+
+
+def test_published_file_sha256_is_whitelisted_only_for_valid_success():
+    published = gw._sanitize_manual_save_data({
+        "status": "published", "published_size": 12,
+        "published_sha256": "A" * 64, "secret": "must be dropped",
+    })
+    assert published["published_size"] == 12
+    assert published["published_sha256"] == "a" * 64
+    assert "secret" not in published
+
+    malformed = gw._sanitize_manual_save_data({
+        "status": "published", "published_size": True,
+        "published_sha256": "z" * 64,
+    })
+    assert malformed["published_size"] == 0
+    assert malformed["published_sha256"] == ""
+
+    conflict = gw._sanitize_manual_save_data({
+        "status": "conflict", "published_size": 12,
+        "published_sha256": "a" * 64,
+    })
+    assert conflict["published_size"] == 0
+    assert conflict["published_sha256"] == ""
 
 
 def test_track_accepts_extra_json_fields():

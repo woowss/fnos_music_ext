@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import errno
 import importlib
+import json
 import multiprocessing
 import os
 from pathlib import Path
 import queue
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -16,6 +18,11 @@ from unittest import mock
 
 core = importlib.import_module("proxy.manual_save_core")
 anonymous = importlib.import_module("proxy.manual_save_anonymous")
+
+from offline_tests._audit_support import WriteAudit  # noqa: E402 - after proxy imports
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_NAMESPACE_SCENARIO_HELPER = Path(__file__).with_name("_anonymous_ns_scenario.py")
 
 _ISOLATION_ENV = "FNMUSIC_OFFLINE_TEST_ISOLATION"
 _ROOT_ENV = "FNMUSIC_OFFLINE_TEST_ROOT"
@@ -127,6 +134,27 @@ def _same_name_race_worker(destination: str, staging: str, payload: bytes, barri
                 pass
 
 
+def _tree_entries(root: Path) -> tuple[tuple[str, str, int, int], ...]:
+    """Snapshot a fixture tree without following symlinks or changing it."""
+    entries = []
+    for current, directories, files in os.walk(root):
+        for name in sorted(directories + files):
+            full = Path(current) / name
+            info = os.lstat(full)
+            if stat.S_ISDIR(info.st_mode):
+                kind = "dir"
+            elif stat.S_ISREG(info.st_mode):
+                kind = "file"
+            elif stat.S_ISLNK(info.st_mode):
+                kind = "symlink"
+            else:
+                kind = "other"
+            entries.append(
+                (os.fspath(full.relative_to(root)), kind, stat.S_IMODE(info.st_mode), info.st_size)
+            )
+    return tuple(sorted(entries))
+
+
 class AnonymousStorePlatformTests(unittest.TestCase):
     def test_linux_file_runner_is_refused_without_explicit_isolation_marker(self):
         with mock.patch.dict(
@@ -172,6 +200,41 @@ class AnonymousStorePlatformTests(unittest.TestCase):
         self.assertEqual(caught.exception.reason, "at_empty_path_capability_required")
         libc.linkat.assert_called_once_with(51, b"", 52, b"track.mp3", anonymous._AT_EMPTY_PATH)
         self.assertFalse(anonymous.PIPELINE_INTEGRATION_ALLOWED)
+
+    def test_unreachable_errno_mappings_are_mock_only_and_fixed(self):
+        """MOCK ONLY: fixed errno-to-reason mapping for paths a real kernel
+        cannot produce for this adapter.
+
+        The adapter verifies ``st_nlink == 0`` immediately before its single
+        ``linkat`` and both directory descriptors must share one device, so:
+
+        * ``EMLINK`` is unreachable: reaching a link limit requires pre-existing
+          links, while the source inode must have zero links before publication
+          (a conforming filesystem with a link limit >= 1 cannot return EMLINK
+          for a 0-link inode's first link).
+        * ``EXDEV`` is unreachable: the constructor rejects directories on
+          different devices before any publication attempt.
+
+        This exercises the fixed reason table only; it is not real kernel
+        failure-path coverage. The real EROFS and EACCES publications are
+        covered by the isolated Linux tests below.
+        """
+        cases = {
+            errno.EMLINK: ("filesystem_link_limit", "filesystem_link_limit"),
+            errno.EXDEV: ("staging_and_destination_not_linkable", "staging_and_destination_not_linkable"),
+            errno.EINVAL: ("at_empty_path_unsupported", "at_empty_path_unsupported"),
+            errno.EOPNOTSUPP: ("at_empty_path_unsupported", "at_empty_path_unsupported"),
+            errno.ENOSYS: ("at_empty_path_unsupported", "at_empty_path_unsupported"),
+        }
+        for error_number, (expected_reason, _label) in cases.items():
+            with self.subTest(errno=errno.errorcode.get(error_number, error_number)):
+                libc = mock.Mock()
+                libc.linkat = mock.Mock(return_value=-1)
+                with mock.patch.object(anonymous.ctypes, "CDLL", return_value=libc), \
+                     mock.patch.object(anonymous.ctypes, "get_errno", return_value=error_number):
+                    with self.assertRaises(anonymous.UnsupportedAnonymousStaging) as caught:
+                        anonymous._linkat_empty_path(61, 62, "track.mp3")
+                self.assertEqual(caught.exception.reason, expected_reason)
 
 
 @unittest.skipUnless(sys.platform == "linux", "Linux O_TMPFILE/linkat integration only")
@@ -258,6 +321,57 @@ class AnonymousStoreLinuxTests(unittest.TestCase):
             self._force_close_after_ambiguous_for_test()
             return
         self.store.close()
+
+    def _run_namespace_scenario(self, scenario: str, base: Path) -> dict:
+        """Run one real-kernel failure scenario in a private user+mount namespace.
+
+        The helper mounts its own tmpfs inside the fresh mount namespace, so no
+        device mount, service, configuration, or global mount is touched; the
+        mounts disappear when the helper process exits. The scenario test is a
+        failure (not a skip) when the host forbids unprivileged user namespaces,
+        because such a host cannot validate the required kernel path.
+        """
+        command = [
+            "unshare",
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "--propagation",
+            "private",
+            sys.executable,
+            "-I",
+            "-B",
+            str(_NAMESPACE_SCENARIO_HELPER),
+            scenario,
+            str(base),
+            str(_REPO_ROOT),
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=180,
+            )
+        except FileNotFoundError:
+            self.fail("real failure-path test requires the 'unshare' utility (util-linux)")
+        except subprocess.TimeoutExpired:
+            self.fail(f"namespace scenario {scenario} exceeded 180 seconds")
+        if completed.returncode != 0:
+            self.fail(
+                f"namespace scenario {scenario} failed (rc={completed.returncode}): "
+                f"stdout={completed.stdout[-2000:]!r} stderr={completed.stderr[-3000:]!r}"
+            )
+        lines = [line for line in completed.stdout.splitlines() if line.strip()]
+        self.assertTrue(
+            lines,
+            f"namespace scenario {scenario} produced no JSON: {completed.stderr[-2000:]!r}",
+        )
+        try:
+            return json.loads(lines[-1])
+        except json.JSONDecodeError:
+            self.fail(f"namespace scenario {scenario} returned non-JSON output: {lines[-1][:1000]!r}")
 
     def test_missing_libc_linkat_fails_before_descriptor_duplication(self):
         with mock.patch.object(anonymous.ctypes, "CDLL", return_value=object()), \
@@ -810,6 +924,126 @@ class AnonymousStoreLinuxTests(unittest.TestCase):
         self.assertEqual(conflict, core.StoreResult.CONFLICT)
         self.assertEqual(published.read_bytes(), payload)
         self.store.abort_owned_stage(conflict_handle)
+
+    def test_real_destination_permission_denied_is_frozen_without_publication(self):
+        """Real EACCES from linkat: destination directory mode 0555, non-root UID."""
+        if os.geteuid() == 0:
+            self.fail(
+                "real EACCES requires a non-root effective UID; root bypasses directory "
+                "write permission (run the anonymous suite as the dedicated runner owner)"
+            )
+        os.chmod(self.destination, 0o555)
+        self.addCleanup(os.chmod, self.destination, 0o700)
+        baseline = _tree_entries(self.root)
+        handle = self._begin_required_stage()
+        payload = b"synthetic destination permission denial"
+        self.store.append(handle, payload)
+        self.store.seal(handle)
+        stage = self.store._stages[handle]
+        audit = WriteAudit()
+        audit.active = True
+        try:
+            with self.assertRaises(anonymous.PublicationUncertain) as caught:
+                self.store.publish_noreplace(handle, "permission-denied.mp3")
+        finally:
+            audit.active = False
+        self.assertEqual(caught.exception.reason, "destination_permission_denied")
+        self.assertEqual(str(caught.exception), "destination_permission_denied")
+        self.assertTrue(stage.publication_attempted)
+        self.assertFalse(stage.link_created)
+        self.assertFalse(stage.publication_confirmed)
+        self.assertIs(stat.S_ISREG(os.fstat(stage.fd).st_mode), True)
+        self.assertEqual(
+            _tree_entries(self.root), baseline,
+            "a denied publication must create no directory entry or temporary file",
+        )
+        self.assertEqual(audit.violations(), [])
+        for operation in (
+            lambda: self.store.publish_noreplace(handle, "permission-denied.mp3"),
+            lambda: self.store.abort_owned_stage(handle),
+            lambda: self.store.begin_owned_stage("target-1"),
+        ):
+            with self.assertRaisesRegex(
+                anonymous.PublicationUncertain, "store_blocked_after_unknown_publication"
+            ):
+                operation()
+        with self.assertRaises(anonymous.PublicationUncertain) as close_error:
+            self.store.close()
+        self.assertEqual(
+            close_error.exception.reason, "ambiguous_stage_retained_until_process_exit"
+        )
+
+    def test_real_read_only_destination_is_a_frozen_erofs_publication(self):
+        """Real EROFS: read-only bind mount of the destination on the same tmpfs."""
+        base = self.root / "namespace-erofs-destination"
+        base.mkdir(mode=0o700)
+        baseline = _tree_entries(self.root)
+        result = self._run_namespace_scenario("erofs-destination", base)
+        self.assertIs(result["ok"], True, result)
+        self.assertIs(result["devices_equal"], True)
+        self.assertIs(result["read_only_view_is_read_only"], True)
+        self.assertEqual(result["adapter_reason"], "destination_filesystem_read_only")
+        self.assertTrue(result["adapter_publication_attempted"])
+        self.assertFalse(result["adapter_link_created"])
+        self.assertFalse(result["adapter_publication_confirmed"])
+        self.assertEqual(
+            result["adapter_close_reason"], "ambiguous_stage_retained_until_process_exit"
+        )
+        self.assertEqual(result["adapter_audit_write_violations"], [])
+        self.assertEqual(result["core_outcome"], "commit_unknown")
+        self.assertEqual(result["core_reason"], "commit_unknown")
+        self.assertTrue(result["core_cleanup_pending"])
+        self.assertEqual(result["core_stage_retained"], 1)
+        self.assertEqual(
+            result["core_store_close_reason"], "ambiguous_stage_retained_until_process_exit"
+        )
+        self.assertEqual(result["core_audit_write_violations"], [])
+        self.assertEqual(result["staging_entries"], [])
+        self.assertEqual(result["destination_entries"], [])
+        self.assertEqual(result["read_only_view_entries"], [])
+        self.assertEqual(_tree_entries(self.root), baseline)
+
+    def test_real_read_only_staging_rejects_o_tmpfile_without_fallback(self):
+        """Real EROFS at O_TMPFILE: read-only staging bind mount on the same tmpfs."""
+        base = self.root / "namespace-erofs-staging"
+        base.mkdir(mode=0o700)
+        baseline = _tree_entries(self.root)
+        result = self._run_namespace_scenario("erofs-staging", base)
+        self.assertIs(result["ok"], True, result)
+        self.assertIs(result["staging_view_is_read_only"], True)
+        self.assertIs(result["devices_equal"], True)
+        self.assertEqual(result["begin_reason"], "o_tmpfile_unavailable")
+        self.assertIs(result["begin_error_text_is_fixed"], True)
+        self.assertEqual(result["stage_registered"], 0)
+        self.assertEqual(result["store_close_reason"], None)
+        self.assertEqual(result["audit_write_violations"], [])
+        self.assertEqual(result["staging_entries"], [])
+        self.assertEqual(result["destination_entries"], [])
+        self.assertEqual(_tree_entries(self.root), baseline)
+
+    def test_real_no_space_write_failure_is_fail_closed_and_abortable(self):
+        """Real ENOSPC: 64 KiB tmpfs exhausted by the staging write."""
+        base = self.root / "namespace-enospc"
+        base.mkdir(mode=0o700)
+        baseline = _tree_entries(self.root)
+        result = self._run_namespace_scenario("enospc", base)
+        self.assertIs(result["ok"], True, result)
+        self.assertEqual(result["append_reason"], "stage_write_failed")
+        self.assertIs(result["append_reason_is_fixed"], True)
+        self.assertFalse(result["stage_sealed_after_failure"])
+        self.assertFalse(result["stage_publication_attempted"])
+        self.assertEqual(result["stage_link_count_after_failure"], 0)
+        self.assertEqual(result["audit_write_violations"], [])
+        self.assertIs(result["abort_succeeded"], True)
+        self.assertIs(result["store_close_succeeded"], True)
+        self.assertEqual(result["core_outcome"], "failed")
+        self.assertEqual(result["core_reason"], "staging_failed")
+        self.assertFalse(result["core_cleanup_pending"])
+        self.assertEqual(result["core_store_close_reason"], None)
+        self.assertEqual(result["core_audit_write_violations"], [])
+        self.assertEqual(result["staging_entries"], [])
+        self.assertEqual(result["destination_entries"], [])
+        self.assertEqual(_tree_entries(self.root), baseline)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,65 @@
+{
+  "probe_root": "/vol1/1000/fnmusic-btrfs-barrier-probe-20261107",
+  "time": "2026-11-07T10:10:08+0800",
+  "kernel": "6.18.18.c1168-trim",
+  "tests": {
+    "A_plain_read_after_rename": {
+      "before": 1692642,
+      "after": 1692643,
+      "changed": true
+    },
+    "B_O_NOATIME_read": {
+      "before": 1692644,
+      "after": 1692644,
+      "changed": false
+    },
+    "D_syncfs_barrier": {
+      "before_write": 1692644,
+      "after_write_before_syncfs": 1692644,
+      "after_syncfs": 1692645,
+      "syncfs_rc_ok": true,
+      "changed_by_write": false,
+      "changed_after_syncfs": true
+    },
+    "E_concurrent_writer_bracket": {
+      "before": 1692645,
+      "after": 1692646,
+      "changed": true,
+      "writer_stdout": "writer-done",
+      "writer_stderr": ""
+    },
+    "C_noatime_rw_mount_read": {
+      "subvolid": "695",
+      "before": 1692647,
+      "after": 1692647,
+      "changed": false,
+      "mount_cmd_rc": 0,
+      "stdout": "read-all",
+      "stderr": "",
+      "target_atime_before": 1
+    }
+  },
+  "create_src": {
+    "rc": 0,
+    "out": "Create subvolume '/vol1/1000/fnmusic-btrfs-barrier-probe-20261107/src'",
+    "err": ""
+  },
+  "create_snapshot": {
+    "rc": 0,
+    "out": "Create a readonly snapshot of '/vol1/1000/fnmusic-btrfs-barrier-probe-20261107/src' in '/vol1/1000/fnmusic-btrfs-barrier-probe-20261107/snapshot-ro'",
+    "err": ""
+  },
+  "cleanup": [
+    {
+      "rc": 0,
+      "out": "Delete subvolume (no-commit): '/vol1/1000/fnmusic-btrfs-barrier-probe-20261107/snapshot-ro'",
+      "err": ""
+    },
+    {
+      "rc": 0,
+      "out": "Delete subvolume (no-commit): '/vol1/1000/fnmusic-btrfs-barrier-probe-20261107/src'",
+      "err": ""
+    }
+  ],
+  "probe_root_removed": true
+}

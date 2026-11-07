@@ -3215,18 +3215,49 @@ function plCalls(suffix) { return fetchCalls.filter((call) => call.path === PL_P
 function plPostBody(call) { return JSON.parse(call.body || "{}"); }
 function plAdvanceOk(run, job) { enqueue(PL_PATH + "/advance", plOk({ run, job })); }
 function plAdvanceErr(status, body) { plEnqueueRaw(PL_PATH + "/advance", status, body); }
+function plBusyErr(data = {}) {
+  return { ok: false, code: "busy", message: "已有保存任务进行中", data };
+}
 function plJobResp(job, positions = []) { enqueue(PL_PATH + "/job", plOk({ job, positions })); }
 function plRun(status, overrides = {}) {
   return Object.assign({
     status, disposition: "continue", position: null, outcome: null, reason: null, detail: null,
   }, overrides);
 }
-function plRow(position, state, reason, reasonMessage, sourceId = "") {
+function plRow(position, state, reason, reasonMessage, sourceId = "", detail = null) {
   return {
     position, source_id: sourceId || null, state, reason: reason || null,
     reason_message: reasonMessage || "", cleanup_pending: false,
+    detail,
   };
 }
+function plDetail(overrides = {}) {
+  return Object.assign({
+    status: "published", title: "曲目🎵 <img src=x>", artist: "歌手", album: "专辑",
+    quality_actual: "", quality_actual_status: "unknown", format: "flac",
+    cover_status: "unavailable", cover_embedded: false, lyric_status: "error",
+  }, overrides);
+}
+
+plTest("歌单逐位置展示已提交字节指纹，旧记录明确显示未知", async () => {
+  await plEnable();
+  const digest = "c".repeat(64);
+  await plPrimeJob(
+    plJob({ state: "completed_bytes_reported", positions_total: 2 }),
+    [
+      plRow(1, "published", "bytes_published", "已发布", "1", plDetail({
+        published_sha256: digest, published_size: 12345, quality_actual: "jymaster",
+        quality_actual_status: "reported",
+      })),
+      plRow(2, "published", "bytes_published", "已发布", "1", plDetail()),
+    ],
+  );
+  const html = els.get("#playlist-positions").innerHTML;
+  assert.ok(html.includes(digest), "新记录的 SHA-256 可供逐项文件核对");
+  assert.ok(html.includes("已提交字节 12345 B"));
+  assert.ok(html.includes("已提交字节指纹未知"), "旧记录不伪造文件指纹");
+  assert.ok(html.includes("jymaster"), "文件指纹不覆盖实际音质档位");
+});
 
 async function plEnable(playlists = [{ playlist_id: 7, name: "测试歌单", track_count: 3 }]) {
   enqueue("/app/fnmusic-ext/api/manual-save/status", {
@@ -3456,7 +3487,7 @@ plTest("推进 disposition=abort：立即停止且只跑一首", async () => {
   await plEnable();
   await plPrimeJob(plJob({ state: "running", positions_total: 2 }), []);
   plAdvanceOk(
-    plRun("completed", { disposition: "abort", position: 1, outcome: "rejected", reason: "busy" }),
+    plRun("completed", { disposition: "abort", position: 1, outcome: "failed", reason: "busy" }),
     plJob({ state: "running", counts: { rejected: 1 }, positions_total: 2 }),
   );
   plJobResp(plJob({ state: "running", counts: { rejected: 1 }, positions_total: 2 }),
@@ -3524,7 +3555,7 @@ plTest("no_work 连续 5 次非终态：停止并提示另一窗口", async () =
 plTest("busy：退避递增到上限 3s，恢复后继续", async () => {
   await plEnable();
   await plPrimeJob(plJob({ state: "running", counts: { queued: 3 }, positions_total: 3 }), []);
-  for (let i = 0; i < 4; i += 1) plAdvanceErr(409, plErr("busy"));
+  for (let i = 0; i < 4; i += 1) plAdvanceErr(409, plBusyErr());
   for (let i = 0; i < 4; i += 1) {
     plJobResp(plJob({ state: "running", counts: { queued: 3 }, positions_total: 3 }));
   }
@@ -3539,7 +3570,33 @@ plTest("busy：退避递增到上限 3s，恢复后继续", async () => {
   assert.ok(els.get("#playlist-run-message").textContent.includes("已发布"));
 });
 
-plTest("504 超时：先查 job 再决定，不重放 advance", async () => {
+plTest("busy 信封含已完成 run：只读核对后停止，不重发 advance", async () => {
+  await plEnable();
+  await plPrimeJob(plJob({ state: "running", positions_total: 2 }), []);
+  plAdvanceErr(409, plBusyErr({ run: {
+    status: "completed", disposition: "continue", position: 1,
+    outcome: "published", reason: "bytes_published",
+  } }));
+  plJobResp(plJob({ state: "queued", counts: { queued: 2 }, positions_total: 2 }));
+  await global.playlistAdvanceLoop(PL_JOB);
+  assert.strictEqual(plCalls("/advance").length, 1, "非空 data 不得被当成无副作用 busy 并重试");
+  assert.strictEqual(plCalls("/job").length, 2, "异常 busy 信封只允许只读观察一次");
+  assert.deepStrictEqual(sleepCalls, []);
+  assert.ok(els.get("#playlist-run-message").textContent.includes("已停止本页推进"));
+});
+
+plTest("busy 信封缺少固定 message：停止且不重试", async () => {
+  await plEnable();
+  await plPrimeJob(plJob({ state: "running", positions_total: 2 }), []);
+  plAdvanceErr(409, { ok: false, code: "busy", data: {} });
+  plJobResp(plJob({ state: "queued", counts: { queued: 2 }, positions_total: 2 }));
+  await global.playlistAdvanceLoop(PL_JOB);
+  assert.strictEqual(plCalls("/advance").length, 1);
+  assert.strictEqual(plCalls("/job").length, 2);
+  assert.deepStrictEqual(sleepCalls, []);
+});
+
+plTest("504 超时：只查 job 并停止，不依据 GET 自动继续", async () => {
   await plEnable();
   await plPrimeJob(plJob({ state: "running", positions_total: 3 }), []);
   plAdvanceErr(504, plErr("timeout"));
@@ -3548,7 +3605,19 @@ plTest("504 超时：先查 job 再决定，不重放 advance", async () => {
   await global.playlistAdvanceLoop(PL_JOB);
   assert.strictEqual(plCalls("/advance").length, 1, "504 后不得立即重放 advance");
   assert.strictEqual(plCalls("/job").length, 2, "504 后必须先 GET job");
-  assert.ok(els.get("#playlist-run-message").textContent.includes("任务仍在执行"));
+  assert.ok(els.get("#playlist-run-message").textContent.includes("无法确认旧请求结束"));
+});
+
+plTest("504 body 错误码为 busy：超时优先，只观察一次并停止", async () => {
+  await plEnable();
+  await plPrimeJob(plJob({ state: "running", positions_total: 3 }), []);
+  plAdvanceErr(504, plErr("busy"));
+  plJobResp(plJob({ state: "queued", counts: { queued: 3 }, positions_total: 3 }));
+  await global.playlistAdvanceLoop(PL_JOB);
+  assert.strictEqual(plCalls("/advance").length, 1, "504 不得进入 busy 自动重试分支");
+  assert.strictEqual(plCalls("/job").length, 2, "504 后只 GET 一次观察");
+  assert.deepStrictEqual(sleepCalls, []);
+  assert.ok(els.get("#playlist-run-message").textContent.includes("超时"));
 });
 
 plTest("504 超时且任务已终态：停止推进", async () => {
@@ -3575,14 +3644,83 @@ plTest("未知错误码：通用 internal 文案，不回显服务端 message/�
   }
 });
 
-plTest("网络错误：退避重试后停止，不向调用方抛异常", async () => {
+plTest("推进响应丢失：只读对账一次，绝不重发 advance", async () => {
   await plEnable();
   await plPrimeJob(plJob({ state: "running" }), []);
-  for (let i = 0; i < 5; i += 1) plEnqueueThrow(PL_PATH + "/advance", new Error("socket hang up"));
+  plEnqueueThrow(PL_PATH + "/advance", new Error("socket hang up"));
+  plJobResp(plJob({ state: "paused", counts: { published: 1, failed: 1, queued: 1 }, positions_total: 3 }),
+    [plRow(1, "published", "bytes_published", "已发布", "1"),
+      plRow(2, "failed", "config_invalid", "配置无效", "2"), plRow(3, "queued", null, "", "3")]);
   await global.playlistAdvanceLoop(PL_JOB);  // 不得抛
-  assert.strictEqual(plCalls("/advance").length, 5);
-  assert.deepStrictEqual(sleepCalls, [600, 1200, 2400, 3000]);
-  assert.ok(els.get("#playlist-run-message").textContent.includes("网络错误"));
+  assert.strictEqual(plCalls("/advance").length, 1);
+  assert.strictEqual(plCalls("/job").length, 2, "异常后只 GET 一次观察状态");
+  assert.deepStrictEqual(sleepCalls, []);
+  assert.strictEqual(global.playlistUiState().jobState, "paused");
+  assert.ok(els.get("#playlist-run-message").textContent.includes("核对位置"));
+});
+
+plTest("成功结果响应丢失：GET 观察成功位置后不自动推进下一首", async () => {
+  await plEnable();
+  await plPrimeJob(plJob({ state: "running" }), []);
+  plEnqueueThrow(PL_PATH + "/advance", new Error("connection reset after commit"));
+  plJobResp(plJob({ state: "queued", counts: { published: 1, queued: 2 }, positions_total: 3 }),
+    [plRow(1, "published", "bytes_published", "已发布", "1"),
+      plRow(2, "queued", null, "", "2"), plRow(3, "queued", null, "", "3")]);
+  await global.playlistAdvanceLoop(PL_JOB);
+  assert.strictEqual(plCalls("/advance").length, 1);
+  assert.strictEqual(plCalls("/job").length, 2);
+  assert.strictEqual(global.playlistUiState().jobState, "queued");
+});
+
+plTest("畸形推进响应：只 GET 观察并停止，不发第二个 POST", async () => {
+  await plEnable();
+  await plPrimeJob(plJob({ state: "running" }), []);
+  plEnqueueRaw(PL_PATH + "/advance", 200, { ok: true, code: "ok", message: "", data: {} });
+  plJobResp(plJob({ state: "queued", counts: { queued: 3 }, positions_total: 3 }));
+  await global.playlistAdvanceLoop(PL_JOB);
+  assert.strictEqual(plCalls("/advance").length, 1);
+  assert.strictEqual(plCalls("/job").length, 2);
+});
+
+plTest("成功信封含空 run：视为 malformed，GET 后停止不再推进", async () => {
+  await plEnable();
+  await plPrimeJob(plJob({ state: "running" }), []);
+  plEnqueueRaw(PL_PATH + "/advance", 200, {
+    ok: true, code: "ok", message: "",
+    data: { run: {}, job: plJob({ state: "queued", positions_total: 3 }) },
+  });
+  plJobResp(plJob({ state: "queued", counts: { queued: 3 }, positions_total: 3 }));
+  await global.playlistAdvanceLoop(PL_JOB);
+  assert.strictEqual(plCalls("/advance").length, 1, "缺少 run.status 时必须 fail closed");
+  assert.strictEqual(plCalls("/job").length, 2, "畸形响应后仅查询状态一次");
+  assert.strictEqual(global.playlistUiState().jobState, "queued");
+});
+
+plTest("矛盾的 completed tuple 不推进：GET 失败仍不重发 POST", async () => {
+  await plEnable();
+  await plPrimeJob(plJob({ state: "running", positions_total: 2 }), []);
+  plAdvanceOk(
+    plRun("completed", { disposition: "continue", position: 1, outcome: "failed", reason: "config_invalid" }),
+    plJob({ state: "queued", counts: { queued: 2 }, positions_total: 2 }),
+  );
+  plEnqueueThrow(PL_PATH + "/job", new Error("job query unavailable"));
+  await global.playlistAdvanceLoop(PL_JOB);
+  assert.strictEqual(plCalls("/advance").length, 1, "矛盾 outcome/reason/disposition 后不得重发 POST");
+  assert.strictEqual(plCalls("/job").length, 2, "malformed 响应后只做一次观察 GET，即使 GET 失败也停止");
+  assert.strictEqual(global.playlistUiState().running, false);
+});
+
+plTest("原型属性 run.status 安全拒绝且不抛、不重发", async () => {
+  await plEnable();
+  await plPrimeJob(plJob({ state: "running", positions_total: 2 }), []);
+  plAdvanceOk(
+    plRun("toString", { disposition: "continue" }),
+    plJob({ state: "queued", counts: { queued: 2 }, positions_total: 2 }),
+  );
+  plJobResp(plJob({ state: "queued", counts: { queued: 2 }, positions_total: 2 }));
+  await assert.doesNotReject(global.playlistAdvanceLoop(PL_JOB));
+  assert.strictEqual(plCalls("/advance").length, 1, "未知/prototype status 必须 fail closed");
+  assert.strictEqual(plCalls("/job").length, 2, "未知 status 后仅观察一次");
 });
 
 plTest("串行守卫：已在推进时不发第二个并行 advance", async () => {
@@ -3617,7 +3755,102 @@ plTest("失败逐首可见：位置状态中文 + reason_message + 重复位置�
   }
 });
 
-plTest("刷新恢复：localStorage 命中未完成任务 → 恢复进度并继续推进", async () => {
+plTest("已发布详情：每位置展示实际音质/格式/封面/歌词且转义标题", async () => {
+  await plEnable();
+  const row = plRow(1, "published", "bytes_published", "已发布", "101");
+  row.detail = plDetail({ title: "曲目🎵 / <img src=x>" });
+  await plPrimeJob(
+    plJob({ state: "completed_bytes_reported", counts: { published: 1 }, positions_total: 1 }),
+    [row],
+  );
+  const html = els.get("#playlist-positions").innerHTML;
+  assert.ok(html.includes("曲名 曲目🎵 / &lt;img src=x&gt;"));
+  assert.ok(html.includes("歌手 歌手"));
+  assert.ok(html.includes("专辑 专辑"));
+  assert.ok(html.includes("曲目🎵 / &lt;img src=x&gt;"));
+  assert.ok(!html.includes("<img src=x>"), "详情必须按纯文本渲染");
+  assert.ok(html.includes("音质 未知"), "unknown 不得回填请求档位");
+  assert.ok(html.includes("格式 FLAC"));
+  assert.ok(html.includes("封面 未获取，未内嵌"));
+  assert.ok(html.includes("歌词 保存失败"));
+});
+
+plTest("歌单详情：内嵌任意绝对路径逐字段隐藏，质量和正常斜杠标题保留", async () => {
+  await plEnable();
+  const pathRow = plRow(1, "published", "bytes_published", "已发布", "101");
+  pathRow.detail = plDetail({
+    title: "saved in /secrets.flac",
+    artist: "保存于\u00a0/vault",
+    album: "archive (//server/share/private.flac)",
+    quality_actual: "jymaster", quality_actual_status: "reported",
+  });
+  const slashRow = plRow(2, "published", "bytes_published", "已发布", "102");
+  slashRow.detail = plDetail({ title: "A/B", artist: "Artist / Choir", album: "片头 / 片尾主题" });
+  await plPrimeJob(
+    plJob({ state: "completed_bytes_reported", counts: { published: 2 }, positions_total: 2 }),
+    [pathRow, slashRow],
+  );
+  const html = els.get("#playlist-positions").innerHTML;
+  for (const banned of ["secrets.flac", "vault", "server", "private.flac"]) {
+    assert.ok(!html.includes(banned), "绝对路径片段不得渲染：" + banned);
+  }
+  assert.ok(html.includes("曲名 未知"));
+  assert.ok(html.includes("歌手 未知"));
+  assert.ok(html.includes("专辑 未知"));
+  assert.ok(html.includes("音质 jymaster"), "文本字段清空不能丢掉服务端确认的档位");
+  assert.ok(html.includes("格式 FLAC"));
+  assert.ok(html.includes("曲名 A/B"));
+  assert.ok(html.includes("歌手 Artist / Choir"));
+  assert.ok(html.includes("专辑 片头 / 片尾主题"));
+});
+
+plTest("歌单详情：隐藏 Unicode 和中文前缀不能暴露敏感字段且保留音质", async () => {
+  const makeRow = (position, overrides) => {
+    const row = plRow(position, "published", "bytes_published", "已发布", String(100 + position));
+    row.detail = plDetail(Object.assign({
+      quality_actual: "jymaster", quality_actual_status: "reported",
+    }, overrides));
+    return row;
+  };
+  const rows = [
+    makeRow(1, { title: "Cookie\ufe0f: secret-value" }),
+    makeRow(2, { artist: "曲Cookie: cjk-secret" }),
+    makeRow(3, { album: "ｈｔｔｐｓ：／／private.invalid/hidden" }),
+    makeRow(4, { title: "/vo\ufe0fl1/1000/private/hidden.flac" }),
+    makeRow(5, { title: "夏の冒険🎵", artist: "山田タマル", album: "Summer Adventure" }),
+  ];
+  await plPrimeJob(
+    plJob({ state: "completed_bytes_reported", counts: { published: rows.length }, positions_total: rows.length }),
+    rows,
+  );
+
+  const html = els.get("#playlist-positions").innerHTML;
+  for (const banned of ["Cookie", "secret-value", "cjk-secret", "private.invalid", "hidden.flac"]) {
+    assert.ok(!html.includes(banned), "Unicode 变体隐藏的敏感字段不得渲染：" + banned);
+  }
+  assert.strictEqual((html.match(/音质 jymaster/g) || []).length, rows.length,
+    "文本字段清空不能丢掉每首歌服务端确认的档位");
+  assert.ok(html.includes("曲名 夏の冒険🎵"));
+  assert.ok(html.includes("歌手 山田タマル"));
+  assert.ok(html.includes("专辑 Summer Adventure"));
+});
+
+plTest("已发布详情缺失的文本字段明确显示未知", async () => {
+  await plEnable();
+  const row = plRow(1, "published", "bytes_published", "已发布", "101");
+  row.detail = plDetail({ title: "", artist: "", album: "" });
+  await plPrimeJob(
+    plJob({ state: "completed_bytes_reported", counts: { published: 1 }, positions_total: 1 }),
+    [row],
+  );
+  const html = els.get("#playlist-positions").innerHTML;
+  assert.ok(html.includes("曲名 未知"));
+  assert.ok(html.includes("歌手 未知"));
+  assert.ok(html.includes("专辑 未知"));
+  assert.ok(html.includes("音质 未知"));
+});
+
+plTest("刷新恢复：localStorage 命中未完成任务 → 只恢复状态，不自动推进", async () => {
   plSetStorage(plStorage({
     prefill: {
       playlist_id: 7, job_id: PL_JOB, source_fingerprint: PL_FP,
@@ -3633,17 +3866,12 @@ plTest("刷新恢复：localStorage 命中未完成任务 → 恢复进度并继
   plJobResp(plJob({ state: "running", counts: { published: 1, queued: 2 }, positions_total: 3 }),
     [plRow(1, "published", "bytes_published", "已发布", "1"),
       plRow(2, "queued", null, "", "2"), plRow(3, "queued", null, "", "3")]);
-  plAdvanceOk(
-    plRun("completed", { position: 2, outcome: "published", reason: "bytes_published" }),
-    plJob({ state: "completed_bytes_reported", counts: { published: 3 }, positions_total: 3 }),
-  );
-  plJobResp(plJob({ state: "completed_bytes_reported", counts: { published: 3 }, positions_total: 3 }));
   await global.loadSaveStatus();
-  await tick(20);
   assert.strictEqual(global.playlistUiState().jobId, PL_JOB);
   assert.strictEqual(els.get("#playlist-job-panel").hidden, false);
-  assert.ok(els.get("#playlist-progress").textContent.includes("已处理 3/3"));
-  assert.strictEqual(plCalls("/advance").length, 1, "恢复后应继续推进");
+  assert.ok(els.get("#playlist-progress").textContent.includes("已处理 1/3"));
+  assert.strictEqual(plCalls("/advance").length, 0, "GET 状态不能证明旧 worker 已停止，因此不自动 POST");
+  assert.ok(els.get("#playlist-run-message").textContent.includes("不会自动继续"));
 });
 
 plTest("刷新恢复：命中的任务已结束 → 清理存储且不再推进", async () => {
@@ -3663,6 +3891,46 @@ plTest("刷新恢复：命中的任务已结束 → 清理存储且不再推进"
   assert.strictEqual(plCalls("/advance").length, 0);
   assert.strictEqual(store._saved.has(PL_STORAGE_KEY), false, "终态任务应清理缓存");
   assert.ok(els.get("#playlist-run-message").textContent.includes("任务已结束"));
+});
+
+plTest("刷新恢复：paused 任务保留位置快照，不自动推进或清理 job id", async () => {
+  const store = plStorage({
+    prefill: { playlist_id: 7, job_id: PL_JOB, source_fingerprint: PL_FP },
+  });
+  plSetStorage(store);
+  enqueue("/app/fnmusic-ext/api/manual-save/status", {
+    ok: true, data: { enabled: true, target_dir: "/library" },
+  });
+  enqueue(PL_PATH + "/playlists", plOk({
+    account_uid: 1, playlists: [{ playlist_id: 7, name: "测试歌单", track_count: 3 }],
+  }));
+  plJobResp(plJob({ state: "paused", counts: { published: 1, failed: 1, queued: 1 }, positions_total: 3 }),
+    [plRow(1, "published", "bytes_published", "已发布", "1"),
+      plRow(2, "failed", "config_invalid", "配置无效", "2"), plRow(3, "queued", null, "", "3")]);
+  await global.loadSaveStatus();
+  assert.strictEqual(global.playlistUiState().jobId, PL_JOB);
+  assert.strictEqual(global.playlistUiState().jobState, "paused");
+  assert.strictEqual(plCalls("/advance").length, 0);
+  assert.strictEqual(store._saved.has(PL_STORAGE_KEY), true, "刷新后应保留暂停任务以便查看位置");
+  assert.ok(els.get("#playlist-run-message").textContent.includes("不支持自动恢复"));
+});
+
+plTest("paused 任务可取消剩余队列，但不能开始或自动推进", async () => {
+  await plEnable();
+  await plPrimeJob(
+    plJob({ state: "paused", counts: { published: 1, failed: 1, queued: 1 }, positions_total: 3 }),
+    [plRow(1, "published", "bytes_published", "已发布", "1"),
+      plRow(2, "failed", "config_invalid", "配置无效", "2"), plRow(3, "queued", null, "", "3")],
+  );
+  assert.strictEqual(els.get("#playlist-start-btn").disabled, true);
+  assert.strictEqual(els.get("#playlist-cancel-btn").disabled, false);
+  enqueue(PL_PATH + "/cancel", plOk({
+    job: plJob({ state: "completed_with_issues", cancel_requested: true,
+      counts: { published: 1, failed: 1, cancelled: 1 }, positions_total: 3 }),
+  }));
+  assert.strictEqual(await global.playlistCancelJob(), true);
+  assert.strictEqual(plCalls("/cancel").length, 1);
+  assert.strictEqual(plCalls("/advance").length, 0);
 });
 
 plTest("刷新恢复：无缓存（存储可用）→ 不请求 job、不报错", async () => {

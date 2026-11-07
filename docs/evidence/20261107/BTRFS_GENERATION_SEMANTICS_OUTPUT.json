@@ -1,0 +1,221 @@
+{
+  "probe_root": "/vol1/1000/fnmusic-btrfs-gen-probe-20261107",
+  "time": "2026-11-07T10:08:54+0800",
+  "kernel": "6.18.18.c1168-trim",
+  "steps": [
+    {
+      "name": "create_file_no_sync",
+      "before": 1692619,
+      "after_immediate": 1692619,
+      "changed_immediately": false,
+      "after_wait": null,
+      "changed_after_wait": null,
+      "after_sync": null,
+      "changed_after_sync": null,
+      "action_result": "created"
+    },
+    {
+      "name": "create_file_then_sync",
+      "before": 1692620,
+      "after_immediate": 1692620,
+      "changed_immediately": false,
+      "after_wait": null,
+      "changed_after_wait": null,
+      "after_sync": 1692621,
+      "changed_after_sync": true,
+      "action_result": "created"
+    },
+    {
+      "name": "write_fsync_only_no_os_sync",
+      "before": 1692621,
+      "after_immediate": 1692621,
+      "changed_immediately": false,
+      "after_wait": null,
+      "changed_after_wait": null,
+      "after_sync": null,
+      "changed_after_sync": null,
+      "action_result": "written+fsynced"
+    },
+    {
+      "name": "chmod_metadata_only",
+      "before": 1692622,
+      "after_immediate": 1692622,
+      "changed_immediately": false,
+      "after_wait": null,
+      "changed_after_wait": null,
+      "after_sync": 1692623,
+      "changed_after_sync": true,
+      "action_result": "chmod"
+    },
+    {
+      "name": "truncate_file",
+      "before": 1692623,
+      "after_immediate": 1692623,
+      "changed_immediately": false,
+      "after_wait": null,
+      "changed_after_wait": null,
+      "after_sync": 1692624,
+      "changed_after_sync": true,
+      "action_result": "truncated"
+    },
+    {
+      "name": "rename_file",
+      "before": 1692624,
+      "after_immediate": 1692624,
+      "changed_immediately": false,
+      "after_wait": null,
+      "changed_after_wait": null,
+      "after_sync": 1692625,
+      "changed_after_sync": true,
+      "action_result": "renamed"
+    },
+    {
+      "name": "append_bytes",
+      "before": 1692625,
+      "after_immediate": 1692625,
+      "changed_immediately": false,
+      "after_wait": null,
+      "changed_after_wait": null,
+      "after_sync": 1692626,
+      "changed_after_sync": true,
+      "action_result": "appended"
+    },
+    {
+      "name": "rewrite_identical_bytes",
+      "before": 1692626,
+      "after_immediate": 1692626,
+      "changed_immediately": false,
+      "after_wait": null,
+      "changed_after_wait": null,
+      "after_sync": 1692627,
+      "changed_after_sync": true,
+      "action_result": "rewritten"
+    },
+    {
+      "name": "create_then_unlink",
+      "before": 1692627,
+      "after_immediate": 1692627,
+      "changed_immediately": false,
+      "after_wait": null,
+      "changed_after_wait": null,
+      "after_sync": 1692628,
+      "changed_after_sync": true,
+      "action_result": "unlinked"
+    },
+    {
+      "name": "read_only_noop",
+      "before": 1692628,
+      "after_immediate": 1692628,
+      "changed_immediately": false,
+      "after_wait": null,
+      "changed_after_wait": null,
+      "after_sync": 1692629,
+      "changed_after_sync": true,
+      "action_result": "read"
+    },
+    {
+      "name": "aba_write_A",
+      "before": 1692630,
+      "after_immediate": 1692630,
+      "changed_immediately": false,
+      "after_wait": null,
+      "changed_after_wait": null,
+      "after_sync": 1692631,
+      "changed_after_sync": true,
+      "action_result": "wrote-A"
+    },
+    {
+      "name": "aba_restore_original",
+      "before": 1692631,
+      "after_immediate": 1692631,
+      "changed_immediately": false,
+      "after_wait": null,
+      "changed_after_wait": null,
+      "after_sync": 1692632,
+      "changed_after_sync": true,
+      "action_result": "restored"
+    },
+    {
+      "name": "utimensat_touch",
+      "before": 1692632,
+      "after_immediate": 1692632,
+      "changed_immediately": false,
+      "after_wait": null,
+      "changed_after_wait": null,
+      "after_sync": 1692633,
+      "changed_after_sync": true,
+      "action_result": "touched"
+    },
+    {
+      "name": "unsynced_write_then_wait",
+      "before": 1692633,
+      "after_immediate": 1692633,
+      "changed_immediately": false,
+      "after_wait": 1692634,
+      "changed_after_wait": true,
+      "after_sync": null,
+      "changed_after_sync": null,
+      "action_result": "written-no-sync"
+    },
+    {
+      "name": "ro_snapshot_bypass_write_sync",
+      "before": 1692636,
+      "after_immediate": 1692636,
+      "changed_immediately": false,
+      "after_wait": null,
+      "changed_after_wait": null,
+      "after_sync": 1692637,
+      "changed_after_sync": true,
+      "action_result": "written"
+    },
+    {
+      "name": "ro_snapshot_bypass_write_no_sync_wait",
+      "before": 1692637,
+      "after_immediate": 1692637,
+      "changed_immediately": false,
+      "after_wait": 1692638,
+      "changed_after_wait": true,
+      "after_sync": null,
+      "changed_after_sync": null,
+      "action_result": "written"
+    }
+  ],
+  "create_source_subvolume": {
+    "rc": 0,
+    "out": "Create subvolume '/vol1/1000/fnmusic-btrfs-gen-probe-20261107/src'",
+    "err": ""
+  },
+  "base": {
+    "treeid": 693,
+    "generation": 1692619,
+    "flags": 0
+  },
+  "snapshot": {
+    "rc": 0,
+    "out": "Create a readonly snapshot of '/vol1/1000/fnmusic-btrfs-gen-probe-20261107/src' in '/vol1/1000/fnmusic-btrfs-gen-probe-20261107/snapshot-ro'",
+    "err": ""
+  },
+  "snapshot_base": {
+    "treeid": 694,
+    "generation": 1692636,
+    "flags": 1
+  },
+  "snapshot_after": {
+    "treeid": 694,
+    "generation": 1692639,
+    "flags": 1
+  },
+  "cleanup": [
+    {
+      "rc": 0,
+      "out": "Delete subvolume (no-commit): '/vol1/1000/fnmusic-btrfs-gen-probe-20261107/snapshot-ro'",
+      "err": ""
+    },
+    {
+      "rc": 0,
+      "out": "Delete subvolume (no-commit): '/vol1/1000/fnmusic-btrfs-gen-probe-20261107/src'",
+      "err": ""
+    }
+  ],
+  "probe_root_removed": true
+}

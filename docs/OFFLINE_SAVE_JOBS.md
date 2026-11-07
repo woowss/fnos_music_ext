@@ -2,7 +2,7 @@
 
 > 合同：`FNMEXT-OFFLINE-SAVE-JOBS-20261024-02`。这是纯离线 SQLite 任务记录与显式同步派发组件；它不接入现有保存、下载、导入或管理页流程，也不代表媒体已保存、已转换、可播放或已入库。
 >
-> 2026-11-01 修订（-02）：`rejected`/`failed` 的 `reason` 固定白名单扩展到管理页保存路由的失败码（10 个 CONTINUE 拒绝码 + `disabled`/`config_invalid`/`busy` 三个中止码），依据 `docs/MANUAL_SAVE_PLAYLIST_JOB.md` §5.5。**只扩展字符串白名单，不改 DB schema/表结构**；旧库旧行继续合法，重开校验通过；未知 reason 仍 fail-closed（执行器返回 → `commit_unknown`）。
+> 2026-11-04 修订（FNMEXT-PLAYLIST-DETAIL-20261104）：新增精确版本 2 schema 的 `position_details` 表，保存成功发布后通过 allowlist 核验的每位置详情，并与 `positions` 的 claim-token CAS 在同一 SQLite 事务提交。全新账本用 v2；v1 账本不会自动改写，当前没有可证明旧 worker 全部退出的迁移机制，因此旧库升级 **BLOCKED**，不能把 v2 版本部署到使用 v1 账本的运行实例。
 
 ## 范围与信任边界
 
@@ -56,7 +56,11 @@
 
 ## 数据库拒绝与恢复边界
 
-首次打开空 SQLite 文件时创建本模块唯一标识和版本 1 schema。已有数据库必须有匹配的应用 ID、schema 版本、表、索引、外键、数据完整性和可校验的规范 manifest。未知版本、外部 schema、损坏或非法内容会固定报错；模块不迁移、清空、覆盖或自动重建已有数据。容量上限也在重新打开时验证。
+首次打开空 SQLite 文件时创建本模块唯一标识和版本 2 schema（原 jobs/positions/index 加上精确 `position_details` 表）。已有数据库必须有匹配的应用 ID、schema 版本、全部表/索引/外键、数据完整性和可校验的规范 manifest。v1 会 fail-closed 报 `unknown_schema_version`，不会自动迁移、清空、覆盖或重建；v1 记录及运行中的 claim 保持原样。当前跨进程旧 worker 停止条件无法由进程内代码证明，因此没有可执行的 v1→v2 迁移入口。不得在 v1 ledger 上启动 v2 worker；迁移/部署必须等独立的停写协调、可验证备份及迁移方案完成后重新审查。容量上限也在重新打开时验证。
+
+`position_details` 仅能对应一个 `published` 位置，并使用 `(job_id, position)` 复合主键/外键。旧记录的精确键集保持 `status,title,artist,album,quality_actual,quality_actual_status,format,cover_status,cover_embedded,lyric_status`；新记录可额外包含 `published_sha256,published_size`。兼容两种完整精确键集，禁止混合或额外字段。SHA-256 是在 tagged bytes 传给 staging store 时计算的内容指纹，不是最终曲库文件的重新读取校验；缺失/非法证据仍保留旧格式详情，UI 明确显示指纹未知。详情提取要求 route 响应 `ok=true`、`code=ok`、`data.status=published` 且整数 `song_id` 与 claim 的十进制 `source_id` 完全相同。音质只有上游显式 `quality_actual_status=reported` 且实际 token 合法时才记录；否则为 `unknown`/空字符串，不回填请求音质。冲突、失败、错误身份、过期 claim、非 published 和提交结果未知均不由运行响应返回可信详情。重复 source_id 依位置分别存储，不合并。
+
+旧版账本迁移仍 **BLOCKED**：即使数据库里没有 `running` 行，也不能据此证明其他进程没有已打开连接或未到达的旧 worker。当前实现不接受 operator 布尔断言作为停止证明，也不暴露迁移命令/API；调用方必须先在外部确认停写机制、备份和恢复流程，并形成新的可审方案。该阻断意味着不能将 v2代码直接用于已有 v1任务数据库。
 
 SQLite 事务保证账本内的原子更新，但不让执行器副作用与数据库提交形成分布式事务。因此，`commit_unknown` 和 `completion_unknown` 都需要人工按独立证据处理；账本不基于目标文件是否存在来猜测执行结果。
 

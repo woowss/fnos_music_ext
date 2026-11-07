@@ -395,12 +395,13 @@ def test_success_publishes_tagged_bytes_and_hides_signed_url(tmp_path):
     assert data["lyric_status"] == "unavailable"
     assert data["published_size"] == len(b"TAGGED:" + PAYLOAD)
     assert data["published_md5"] == hashlib.md5(b"TAGGED:" + PAYLOAD).hexdigest()
+    assert data["published_sha256"] == hashlib.sha256(b"TAGGED:" + PAYLOAD).hexdigest()
     assert set(data) == {
         "status", "song_id", "title", "artist", "album", "quality_requested",
         "quality_actual", "quality_actual_status", "quality_fallback",
         "source_type", "format", "size", "md5", "basename",
         "target_dir", "tagged", "cover_embedded", "published_size",
-        "published_md5", "title_status", "artist_status", "album_status",
+        "published_md5", "published_sha256", "title_status", "artist_status", "album_status",
         "lyricist", "lyricist_status", "composer", "composer_status",
         "cover_status", "cover_error", "lyric_status",
     }
@@ -1096,6 +1097,9 @@ def test_conflict_returns_fixed_conflict_without_overwrite(tmp_path):
     assert result["code"] == "conflict"
     assert result["data"]["status"] == "conflict"
     assert result["data"]["basename"] == store.published_basename
+    assert "published_size" not in result["data"]
+    assert "published_md5" not in result["data"]
+    assert "published_sha256" not in result["data"]
     assert store.published_basename == "歌手A_歌手B - 测试歌曲.flac"
     assert store.closed is True
     _assert_no_signed_url(result)

@@ -82,6 +82,7 @@ PLAYLIST_ITEM_FIELDS = (
     "md5",
     "published_size",
     "published_md5",
+    "published_sha256",
     "cover_status",
     "cover_error",
     "lyric_status",
@@ -256,7 +257,8 @@ def _clean_text(value: object, field: str) -> str:
 
 
 def _clean_size(value: object, *, minimum: int) -> int:
-    if type(value) is int and not isinstance(value, bool) and value >= minimum:
+    if (type(value) is int and not isinstance(value, bool)
+            and minimum <= value <= (2**63 - 1)):
         return value
     return 0
 
@@ -291,6 +293,14 @@ def _copy_success_fields(item: dict, data: Mapping, *, published: bool) -> None:
     if published:
         item["published_size"] = _clean_size(data.get("published_size"), minimum=1)
         item["published_md5"] = _clean_md5(data.get("published_md5"))
+        digest = data.get("published_sha256")
+        item["published_sha256"] = (
+            digest.casefold()
+            if type(digest) is str and re.fullmatch(r"[0-9a-fA-F]{64}", digest)
+            else ""
+        )
+        if item["published_size"] <= 0 or not item["published_sha256"]:
+            item["published_sha256"] = ""
     cover_status = data.get("cover_status")
     if type(cover_status) is str and cover_status in _COVER_STATUSES:
         item["cover_status"] = cover_status
@@ -325,6 +335,7 @@ def _item_skeleton(
         "md5": "",
         "published_size": 0,
         "published_md5": "",
+        "published_sha256": "",
         "cover_status": "not_attempted",
         "cover_error": "",
         "lyric_status": "not_attempted",

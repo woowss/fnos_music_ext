@@ -765,7 +765,11 @@ def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
             raise _SaveFailure("staging_unavailable") from None
         try:
             handle = store.begin_owned_stage(TARGET_ID)
+            # Fingerprint the exact tagged bytes handed to the no-replace
+            # staging store. This is content evidence for later reconciliation;
+            # it is not a re-read of the final filesystem entry.
             published_digest = hashlib.md5()
+            published_sha256 = hashlib.sha256()
             published_size = 0
             with tagged_path.open("rb") as tagged_file:
                 while True:
@@ -773,6 +777,7 @@ def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
                     if not chunk:
                         break
                     published_digest.update(chunk)
+                    published_sha256.update(chunk)
                     published_size += len(chunk)
                     store.append(handle, chunk)
             store.seal(handle)
@@ -780,10 +785,6 @@ def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
             raise
         except Exception:
             raise _SaveFailure("staging_unavailable") from None
-        # size/md5 above are the verified download; published_* describe the
-        # tagged bytes that are actually handed to the no-replace publish call.
-        data["published_size"] = published_size
-        data["published_md5"] = published_digest.hexdigest()
         try:
             published = store.publish_noreplace(handle, basename)
         except _SaveFailure:
@@ -792,6 +793,12 @@ def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
             raise _SaveFailure("publish_failed") from None
         outcome = _store_outcome(published)
         if outcome == "published":
+            # Publish evidence is only exposed after a successful no-replace
+            # commit. The digest covers the exact tagged chunks submitted via
+            # store.append, not a later filesystem reread.
+            data["published_size"] = published_size
+            data["published_md5"] = published_digest.hexdigest()
+            data["published_sha256"] = published_sha256.hexdigest()
             if lyric_bytes is not None:
                 lyric_basename = basename.rsplit(".", 1)[0] + ".lrc"
                 data["lyric_status"] = _publish_sidecar(store, lyric_basename, lyric_bytes)

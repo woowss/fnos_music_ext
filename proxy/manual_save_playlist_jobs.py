@@ -45,10 +45,14 @@ from urllib.parse import urlsplit
 
 try:  # Imported as ``proxy.manual_save_playlist_jobs`` (repository test style).
     from .manual_save_core import Outcome, SaveResult
-    from .manual_save_jobs import ManualSaveJobsLedger, PositionSnapshot
+    from .manual_save_jobs import (
+        ManualSaveJobsLedger, PositionExecution, PositionSnapshot, validate_position_detail,
+    )
 except ImportError:  # pragma: no cover - flat import style (PYTHONPATH=proxy).
     from manual_save_core import Outcome, SaveResult
-    from manual_save_jobs import ManualSaveJobsLedger, PositionSnapshot
+    from manual_save_jobs import (
+        ManualSaveJobsLedger, PositionExecution, PositionSnapshot, validate_position_detail,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -382,7 +386,7 @@ def _resolve_default_engine() -> object:
     return route
 
 
-def make_executor(engine: object | None = None) -> Callable[[object, object], SaveResult]:
+def make_executor(engine: object | None = None) -> Callable[[object, object], object]:
     """Return the ``run_next`` executor (contract §5.1).
 
     The executor passes only the numeric ``source_id`` to ``engine.save_track``,
@@ -401,7 +405,10 @@ def make_executor(engine: object | None = None) -> Callable[[object, object], Sa
         try:
             raw = save_track(song_id)
             outcome, reason, _disposition = map_save_result(raw)
-            return build_save_result(outcome, reason)
+            result = build_save_result(outcome, reason)
+            if outcome is Outcome.PUBLISHED and reason == "bytes_published":
+                return PositionExecution(result, raw)
+            return result
         except Exception:
             # Engine exceptions cannot rule out side effects: fail closed.
             return build_save_result(Outcome.COMMIT_UNKNOWN, "commit_unknown")
@@ -962,6 +969,12 @@ class AdvanceReport:
     position: PositionSnapshot | None = None
     result: SaveResult | None = None
     disposition: str | None = None
+    detail: dict[str, object] | None = None
+
+
+def position_detail_for_wire(value: object) -> dict[str, object] | None:
+    """Re-check the exact details whitelist at the HTTP serialization boundary."""
+    return validate_position_detail(value)
 
 
 def _default_idempotency_key(playlist_id: int, manifest: Mapping) -> str:
@@ -1030,7 +1043,9 @@ class PlaylistJobService:
         key = idempotency_key
         if key is None:
             key = _default_idempotency_key(value, manifest)
-        return self._get_ledger().create_job(actor_scope, key, manifest)
+        return self._get_ledger().create_job(
+            actor_scope, key, manifest, pause_on_non_continue=True,
+        )
 
     def create_from_producer(
         self,
@@ -1048,7 +1063,9 @@ class PlaylistJobService:
 
     def get_job(self, actor_scope: object, job_id: object) -> object:
         self._require_enabled()
-        return self._get_ledger().get_job(actor_scope, job_id)
+        return self._get_ledger().get_job(
+            actor_scope, job_id, pause_on_non_continue=True,
+        )
 
     def cancel_job(self, actor_scope: object, job_id: object) -> object:
         self._require_enabled()
@@ -1064,7 +1081,9 @@ class PlaylistJobService:
         try:
             ledger = self._get_ledger()
             executor = self._get_executor()
-            run_report = ledger.run_next(actor_scope, job_id, executor)
+            run_report = ledger.run_next(
+                actor_scope, job_id, executor, pause_on_non_continue=True,
+            )
         finally:
             MANUAL_SAVE_PLAYLIST_LOCK.release()
         return _advance_report(run_report)
@@ -1080,7 +1099,11 @@ def _advance_report(run_report: object) -> AdvanceReport:
             position=position,
             result=result,
             disposition=disposition_for_save_result(result),
+            detail=getattr(run_report, "detail", None),
         )
+    if status == "paused":
+        return AdvanceReport("paused", position=position, result=result,
+                             disposition=DISPOSITION_ABORT)
     if status in {"no_work", "stale_completion"}:
         return AdvanceReport(status, position=position, result=result, disposition=None)
     if status in {"commit_unknown", "completion_unknown"}:
@@ -1102,6 +1125,7 @@ __all__ = [
     "map_save_result",
     "build_save_result",
     "disposition_for_save_result",
+    "position_detail_for_wire",
     "make_executor",
     "ROUTE_CONTINUE_CODES",
     "ROUTE_ABORT_CODES",

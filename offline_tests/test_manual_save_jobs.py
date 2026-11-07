@@ -587,13 +587,13 @@ class ManualSaveJobsTests(unittest.TestCase):
         created = self.ledger.create_job("actor-A", "recovery", manifest())
         complete = jobs.ManualSaveJobsLedger._complete
 
-        def recover_before_completion(ledger, actor_scope, job_id, position, claim_token, result):
+        def recover_before_completion(ledger, actor_scope, job_id, position, claim_token, result, detail=None):
             # The synchronous executor has returned. Simulate explicit recovery
             # winning immediately before its delayed completion compare-and-set.
             self.assertEqual(job_id, created.job_id)
             snapshot = ledger.recover_stale_running(actor_scope, job_id, worker_stopped=True)
             self.assertEqual(snapshot.positions[0].state, "commit_unknown")
-            return complete(ledger, actor_scope, job_id, position, claim_token, result)
+            return complete(ledger, actor_scope, job_id, position, claim_token, result, detail)
 
         with mock.patch.object(jobs.ManualSaveJobsLedger, "_complete", recover_before_completion):
             report = self.ledger.run_next("actor-A", created.job_id, lambda _p, _c: published_result())

@@ -1,13 +1,15 @@
 # 管理页整歌单保存合同（任务账本 + 按请求推进）
 
 > 合同编号：`FNMEXT-MANUAL-SAVE-PLAYLIST-JOB-20261101-01`
-> 状态：**P1/P2/P4 已实现，独立审查 FAIL 项已修正（2026-11-01）；P5/P6 待实现**。本文定义规格，实现状态见 §14。
+> 状态：**有离线候选；P3 真实 producer 观察和 P7 歌单端到端验收未完成，不能上线**。阶段细节见 §14；下列行为勘误优先于历史设计草案。
 > 仓库：`E:\fnmusic-ext-dev`　分支：`codex/fnmusic-prelaunch-20261025`　基线 HEAD：`15d7a42`　仓库 VERSION：2.10.2
 > **行号基线声明**：本文所有 `文件:行号` 以 `15d7a42` 为准；P1 的 reason 枚举扩展落地后 `proxy/manual_save_jobs.py` 在 `_OUTCOME_REASONS` 之后整体后移约 12 行、`offline_tests/test_manual_save_jobs.py` 后移约 36 行，复核时按符号定位。
 > 执行形态：**B（后端任务账本 + 按请求推进）**；快照来源：**A（固定 musicbox artifact + 先做一次只读集成测试观察副作用，再实施接线）**
 > 读者：implementer（唯一写者）、final-reviewer（独立审查）、Lead（验收/决策）
 
 本文所有事实性断言都带 `文件:行号` 或交接文档章节引用；无法确证的写"待核实"，不编造行号。引用路径均相对仓库根目录，唯一例外是桌面仓库交接文档 `E:\fnmusic\PROJECT_HANDOFF_20261101.md`。
+
+> **运行语义勘误（2026-11-04）**：`GET` 端点只观察，不证明旧 worker 已停止，也不提供写请求重放幂等保证。网络异常、超时或未知/畸形响应后不得自动重发 `POST /advance`。非继续结果会使账本持久 `paused`，当前实现不会自动恢复或自动重新 claim。除 job 创建接口自身明确的 key 去重外，不得把 claim/CAS 或 GET 查询说成请求重试安全。整歌单路径尚未完成真机端到端验收，本文不表示可上线。
 
 ---
 
@@ -53,7 +55,7 @@
 | 对账 API / 自动重试 / 自动恢复 | 本轮不开放，见 §3.8；账本契约要求外部核对由单独授权流程完成（`docs/OFFLINE_SAVE_JOBS.md:45,57`） |
 | 任务列表 / 历史浏览 / 删除任务 | 账本无 `list_jobs`/`delete_job` API（`proxy/manual_save_jobs.py` 公开方法清单见 `:541,601,619,655,809`），本轮不扩展 |
 | 常驻 worker、后台线程、调度器 | 执行形态 B 已拍板；账本明确"没有后台 worker"（`docs/OFFLINE_SAVE_JOBS.md:35-45`） |
-| 修改 `.env`、部署、重启服务、NAS 写入 | 交接 §9.2 纪律：功能默认关闭，未经用户明确同意不改 `.env`、不部署、不重启（`E:\fnmusic\PROJECT_HANDOFF_20261101.md:219-228`） |
+| 修改 `.env`、部署、重启服务、NAS 写入 | 功能默认关闭；本会话已授权在安全门全部通过后自主执行受控操作，不应逐步重复索要同一授权。授权不替代生命周期/身份/备份/回滚门，也不涵盖权益不明音源、无关数据清理或超出授权范围的动作。 |
 | 修改 `webui-service/app.py` 的 501 收口 | WebUI 不是信任边界，`/api/manual-save*` 必须继续 501（`webui-service/app.py:1749-1758`，`docs/G0_TRUSTED_INGRESS.md:87-92`） |
 
 ### 1.3 与既有交付物的关系
@@ -153,7 +155,7 @@
 | 文案 | 新码一律进固定文案表；`message` 不插值、不回显输入、不回显异常文本（同 `proxy/manual_save_playlist.py:94-121` 的纪律） |
 | 引擎开关 | 需同时满足 `FNMUSIC_MANUAL_SAVE_ENABLED=true`（既有）与 `FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED=true`（新增，默认 false）；否则 403 且无副作用——**总开关关闭 → `disabled`，仅整歌单开关关闭 → `playlist_disabled`**（两码都在 §3.9.1） |
 | 账本可用 | DB 路径配置非法/不可写 → 500 `config_invalid`（与 §3.9.1 一致；不新增 403 版本），不得创建空 DB 后继续 |
-| 幂等 | 创建按 `(actor_scope, idempotency_key)` + 规范 manifest 字节幂等（`docs/OFFLINE_SAVE_JOBS.md:13-22`）；查询/取消天然幂等；推进**不是**幂等操作但**每个位置至多执行一次**（§7.4） |
+| 请求重放 | 创建接口有明确 key 去重；查询只观察；取消可重复读取最终快照；推进不是请求重放幂等。账本的单个 running/CAS 约束不保证客户端重放安全（§7.4） |
 
 **开关取值来源（P5 实现）**：`fnmusic-ext.service` 没有 `EnvironmentFile=`，所以网关优先从 `<repo>/.env` 读取两个已复核的键（`FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED`、`FNMUSIC_MANUAL_SAVE_JOBS_DB`），进程环境只补缺键；**只保留这两个键**，不把 `.env` 其余内容留在内存。文件缺失/不可读 → 视为全部未设置（fail-closed）。这是已审 route 模块 `read_env_file()` 的既有先例，属部署便利而非新增信任边界。
 
@@ -314,14 +316,21 @@ MANUAL_SAVE_PLAYLIST_LOCK = threading.Lock()  # 模块级，单曲端点与推�
 {"job": { …JobSummary… },
  "positions": [
    {"position": 1, "source_id": "1901371647", "state": "published",
-    "reason": "bytes_published", "cleanup_pending": false},
+    "reason": "bytes_published", "cleanup_pending": false,
+    "detail": {"status": "published", "title": "曲名", "artist": "歌手",
+      "album": "专辑", "quality_actual": "jymaster",
+      "quality_actual_status": "reported", "format": "flac",
+      "cover_status": "embedded", "cover_embedded": true,
+      "lyric_status": "published", "published_sha256": "<64位小写十六进制>",
+      "published_size": 12345678}},
    {"position": 2, "source_id": "1901371647", "state": "conflict",
-    "reason": "destination_conflict", "cleanup_pending": false}
+    "reason": "destination_conflict", "cleanup_pending": false, "detail": null}
  ]}
 ```
 
 - `positions` 顺序 = manifest 位置顺序，长度 ≤ 1000；`source_id` 为十进制字符串或 `null`（账本允许 `null`，`docs/OFFLINE_SAVE_JOBS.md:31`）。
 - **附加字段 `reason_message`**（P5 实现，本轮加入）：每个位置行另带一个**固定中文**文案，由 §6.3 的 reason 文案表生成、不做插值；未知 reason 回落固定兜底文案。它服务 UI 直接渲染，不改变上面的字段语义。
+- 每个位置行含 `detail`（对象或 `null`），只有对应位置 `state=published` 且账本存有经核验的同源详情时为对象。旧 detail 精确键维持旧格式；新 detail 可额外含 `published_sha256,published_size`。此 SHA-256 仅是 tagging 后传给 staging store 的字节指纹，不能证明对发布路径重新读取成功。缺少或非法指纹时旧格式详情仍可读，文件指纹显示未知。质量未知必须为 `quality_actual_status="unknown"` 且 `quality_actual=""`；不得从 `quality_requested` 补值。重复歌曲按各自位置分别存储，冲突位置 `detail=null`，不描述既有同名文件的属性。
 - **不得包含**：任何本地路径、签名 URL、Cookie、token、执行器原始返回（§8）。
 - `JobSummary` 见 §3.7.1。
 
@@ -335,16 +344,20 @@ MANUAL_SAVE_PLAYLIST_LOCK = threading.Lock()  # 模块级，单曲端点与推�
   4. worker 内：`report = ledger.run_next(actor_scope, job_id, executor)`（`proxy/manual_save_jobs.py:655`）。`run_next` 自己完成"选最早 queued → 写 claim token → 提交 → 事务外同步执行 → CAS 写回"（`docs/OFFLINE_SAVE_JOBS.md:35-45`）。
   5. worker 内 finally 释放锁。
   6. 主线程 `join(MANUAL_SAVE_PLAYLIST_TIMEOUT)`；仍存活 → 504 `timeout`（**worker 继续跑完并释放锁**，超时不是取消，见 §7.3）。
-- **`executor` 契约**：见 §5.1；只返回 `manual_save_core.SaveResult`，绝不抛异常（抛了也由账本转 `commit_unknown`，`proxy/manual_save_jobs.py:675-679`）。
+- **`executor` 契约**：普通结果仍为 `manual_save_core.SaveResult`；成功发布时适配器短暂返回 `PositionExecution(SaveResult, raw_route_response)`，原始响应只交账本做严格白名单提取，不直接序列化或持久化。执行器异常仍由账本转 `commit_unknown`。
 - **响应 `data`**：
 
 ```json
-{"run": {"status": "completed|commit_unknown|no_work|completion_unknown|stale_completion",
+{"run": {"status": "completed|commit_unknown|no_work|paused|completion_unknown|stale_completion",
          "disposition": "continue|abort|freeze",
          "position": 7,
          "outcome": "published",
          "reason": "bytes_published",
-         "detail": { …单曲已脱敏 data，仅 published/conflict 时存在… }},
+         "detail": {"status":"published", "title":"曲名", "artist":"歌手",
+                    "album":"专辑", "quality_actual":"jymaster",
+                    "quality_actual_status":"reported", "format":"flac",
+                    "cover_status":"embedded", "cover_embedded":true,
+                    "lyric_status":"published"}},
  "job": { …JobSummary… }}
 ```
 
@@ -352,14 +365,18 @@ MANUAL_SAVE_PLAYLIST_LOCK = threading.Lock()  # 模块级，单曲端点与推�
 | --- | --- | --- | --- |
 | `completed` | 200 | `continue` 或 `abort`（按 `reason` 查 §5.2） | 继续下一首；`abort` 时停止循环并提示 |
 | `commit_unknown` | 200 | `freeze` | 停止循环，转"需要对账"（job 会被账本自动冻结，`proxy/manual_save_jobs.py:711-716`） |
-| `no_work` | 200 | `continue` | 重新 GET job：终态则停；`running` 说明另一请求/标签页在跑 → 退避重试（§7.2） |
+| `no_work` | 200 | `continue` | GET 仅观察；按实现的有限次数策略观察/重试，耗尽后停止，不推断旧 worker 已退出（§7.2） |
+| `paused` | 200 | `abort` | 已有持久化 abort/未知终态阻止后续 claim；停止推进并保留排队位置 |
 | `completion_unknown` | 500 | `freeze` | 停止并提示"结果写入失败，不得自动重试"（`docs/OFFLINE_SAVE_JOBS.md:35-45`） |
 | `stale_completion` | 409 | `freeze` | 停止并提示"迟到的结果未覆盖记录" |
-| （锁被占用） | 409 `busy` | — | 退避重试 |
-| （超时） | 504 `timeout` | — | **先 GET job 再决定**是否重试（§7.3） |
+| （锁被占用） | 精确固定 409 `busy` | — | 按实现的有界 busy 策略；非精确 envelope 按未知响应处理并停止 |
+| （超时） | 504 `timeout` | — | 最多 GET 一次观察，然后停止；不得据此重发 advance（§7.3） |
 | 其它 | 4xx/5xx | — | 按 §3.9 固定文案展示，停止循环 |
 
-- **`detail`**：仅当 `run.status=="completed"` 且 `outcome∈{published}` 或 `reason=="destination_conflict"` 时出现；内容必须走**既有** `_sanitize_manual_save_data`（`proxy/webui_gateway.py:658-724`）白名单（`signed_url`/`cookie` 等未知键在被丢弃方面已有测试，`proxy/tests/test_manual_save_gateway.py` 的 `_published_result` 用例）。`detail` **不落账本、不落日志**。
+- **详情信任链**：P4 executor 只将 route 原始响应短暂带到账本适配层。账本只在 `ok=true/code=ok/data.status=published/data.song_id` 与 claim source_id 完全相符时抽取固定白名单；字段限长并拒绝控制字符、URL/凭据样式、未知枚举。详情不持久化原始响应、路径、URL、cookie 或 token。质量按实际明确报告值记录；缺失或非法时为 unknown，不用请求档位补齐。
+- **原子性与读取**：新增 detail 与 `positions` 完成行在同一 `(actor_scope, job_id, position, claim_token)` CAS `BEGIN IMMEDIATE` 事务提交。冲突、失败、source 不匹配、过期 claim、错误/未知提交不在 advance 响应提供详情；查询在同一个 SQLite 读取事务内加载 job、positions 和 details，避免跨版本拼接。UI 对对象使用精确键和枚举校验，所有动态文本经 `escapeHtml` 后展示。
+- **schema / 迁移边界**：全新 ledger 使用 schema v2 精确 sqlite_master 定义。v1 ledger 不自动迁移；当前进程内实现无法证明所有旧 worker/连接均已退出，故不存在凭 operator 布尔声明放行的迁移入口。v1 数据保持原样，但使用 v1 ledger 的实例不能部署 v2 worker。旧库迁移/部署目前 **BLOCKED**，须另行建立可外部验证的停写、备份与迁移方案后复审。
+- **未满足的产品要求**：整歌单验收仍须能逐位置核实 NAS basename、实际选中的音质档位、实际音频格式、标题/歌手/专辑/音轨标签、封面和歌词状态，并能与落盘文件对应。音质须遵守已确定的用户策略：优先请求超清母带；只有当前账号明确无权且较低档明确可用时才降级到可获得的最高档，并报告实际选择档位。不能从请求的 quality、URL、扩展名、codec、文件标签或相邻位置推断实际档位/格式/封面/歌词。当前没有这些可信的逐位置证据，因此真实歌单验收 **BLOCKED**；不得宣称该合同已生产就绪。补齐经审查的响应/账本证据与回归测试后，才能执行并通过 §10 A4。
 
 ### 3.7 `POST .../playlist/cancel` — 请求取消
 
@@ -585,7 +602,7 @@ SOURCE_CHANGED_OR_RECHECK_FAILED
 
 依据：`docs/OFFLINE_PLAYLIST_MANIFEST.md` "Do not wire a live adapter until an exact release artifact and digest is selected and reviewed, and a separately authorized read-only integration test can safely observe its side effects"；Lead 已拍板"先做一次只读集成测试观察副作用，再实施接线"。
 
-**执行前提**：用户明确同意；维护窗口；`FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED=false`（保存侧全关）；只用 GET；不写 NAS 目标/暂存；不改 `.env`（临时开关由部署窗口按 §12 的清单操作，或由 Lead 授权的最小改动方式完成，**不在本合同授权范围内**）。
+**执行前提**：按本会话既有授权自主执行，但必须先确认安全门和可控维护窗口；`FNMUSIC_MANUAL_SAVE_ENABLED=false` 且 `FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED=false`（保存侧总开关均关闭）；只用 GET；不写 NAS 目标/暂存。若运行状态、窗口影响或授权范围不明确，则保持 BLOCKED 并报告，不通过反复询问同一例行授权来代替核验。
 
 **步骤**（记录到 `docs/MANUAL_SAVE_PLAYLIST_SOURCE_EVIDENCE.md`）：
 
@@ -668,13 +685,13 @@ route 失败码全集来自 `proxy/manual_save_route.py:162-183` 的 `_MESSAGES`
 - `outcome=commit_unknown` → `cleanup_pending=True`；其余全部 `cleanup_pending=False`（账本校验规则，`proxy/manual_save_jobs.py:268-284`）。
 - `published_cleanup_pending` / `cancelled` 两个 Outcome **执行器永不返回**：`cancelled` 只由 `cancel_job` 产生（`proxy/manual_save_jobs.py:629-638`），`published_cleanup_pending` 由单文件核心的清理语义产生，route 不产生。
 - **continue/abort 分类必须与批次引擎一致**，但 `publish_failed`/`internal` 在本合同上升级为 `freeze`（比 abort 更严格：停止推进且需人工对账）。测试断言：`ROUTE_CONTINUE_CODES == PLAYLIST_CONTINUE_CODES`；`ROUTE_ABORT_CODES ∪ FREEZE_CODES == PLAYLIST_ABORT_CODES`，且 `publish_failed`/`internal` 属 `freeze`（防止两份表漂移；不得要求 freeze 码也出现在 ABORT 集合里）。
-- `disposition=="abort"` 时**不自动取消任务**：剩余位置保持 `queued`，由前端停止循环；环境修复后可继续（这是执行形态 B 相比整批引擎的关键增益，§7.5）。
+- `disposition=="abort"` 时不自动取消任务：剩余位置保持 `queued`，账本持久汇总为 `paused` 并由前端停止循环。当前没有自动恢复/重新 claim，也没有经验证的恢复端点；不得描述为“可自动继续”（§7.5）。
 
 ### 5.3 逐位置结果的可持久化信息边界
 
-- 账本只存 `Outcome + reason + cleanup_pending`（`proxy/manual_save_jobs.py:60-92` 的表结构），**不存**标题/歌手/basename/quality/cover/lyric 等执行器 detail。
-- 因此：**刷新后**每个位置可见的信息 = 状态 + 固定原因（含失败码），不含单曲元数据。验收必须回到 NAS 文件系统核对（§10）。
-- 若要持久化逐位置元数据，需要账本 schema v2（新增列或附表），**不在本轮范围**（账本会拒绝未知 schema，`docs/OFFLINE_SAVE_JOBS.md:53-58`）。
+- 候选 schema v2 在 `position_details` 中按 `(job_id, position)` 保存严格字段白名单：发布状态、title/artist/album、实际音质及其报告状态、探测格式、封面状态/是否内嵌、歌词状态。重复 `source_id` 仍按各自位置独立保存。没有通过发布状态、正好匹配该位置 `source_id` 和 detail 字段校验的结果均不生成 detail。
+- `conflict`、失败、过期 claim、`commit_unknown`/`completion_unknown` 不得显示候选文件的 detail；未知实际质量显示 `quality_actual_status="unknown"` 与空 `quality_actual`，禁止用请求档位补齐。原始 route 响应、basename、目标/暂存路径、URL、cookie、token 和 MD5 不落入 detail 表。
+- 查询时 job、positions、details 在同一 SQLite 读取事务内读取；位置终态与 detail 在同一 claim-token CAS `BEGIN IMMEDIATE` 事务提交。候选代码已加入离线覆盖，但仍需独立审查、部署门和真机证据；离线 detail 不代表文件已索引或可播放。
 
 ### 5.4 `commit_unknown` / `completion_unknown` 的显式对账
 
@@ -804,44 +821,43 @@ route 失败码全集来自 `proxy/manual_save_route.py:162-183` 的 `_MESSAGES`
 
 ```
 start(playlistId):
-  snapshot = GET snapshot?playlist_id=…      # 失败→固定文案，结束
+  snapshot = GET snapshot?playlist_id=…      # GET 仅观察；失败→固定文案，结束
   if !snapshot.enumeration_complete: 禁用开始, 结束
-  job = POST jobs {playlist_id, source_fingerprint}   # 幂等：刷新后再点=同一个 job
+  job = POST jobs {playlist_id, source_fingerprint}   # 仅此创建 key 有显式去重语义
   renderJob(job)
   await advanceLoop(job.job_id)
 
 advanceLoop(jobId):
   while (running && !stopped):
     r = POST advance {job_id}
-    if HTTP 409 busy/no_work:               # 另一标签页/上一请求仍在跑
-        await sleep(backoff); refreshJob(); continue
-    if HTTP 504 timeout:                    # 不重试！先查真相
-        refreshJob(); 若该位置已不是 running/queued 状态变化则继续，否则停止
-    if HTTP 200:
+    if exact fixed HTTP 409 busy envelope:
+        await sleep(bounded backoff); GET job; continue only per implemented busy policy
+    if network error / timeout / non-exact busy / non-2xx / unknown or malformed response:
+        GET job at most once for observation; stop; never replay POST advance
+    if HTTP 200 valid envelope:
         renderRun(r.run); renderJob(r.job)
-        if r.job.state 终态: break
-        if r.run.disposition == "abort": 显示固定原因; break
-        if r.run.disposition == "freeze": 显示对账横幅; break
-        # continue：立刻进入下一首（无固定间隔）
+        if job paused / terminal or disposition abort/freeze: stop
+        # continue：仅在收到有效完成响应后才可进入下一首
   updateButtons()
 ```
 
-- **不在循环内做 `setInterval` 固定轮询**：推进是自驱动的"请求-响应"节奏；只有 `busy/no_work/超时/网络错误` 才退避（建议 1s→2s→4s→8s→15s 上限）。
-- "停止推进"只置前端标志，不发取消；下次进入页面/点"继续"可接着推进（账本无进度损失）。
-- 页面关闭/刷新：循环停止；账本状态保留；重新打开页面时若 `localStorage` 有 `{playlistId, jobId}` 则 `GET job` 恢复面板；没有也能靠"重新读取快照 → 创建（派生幂等键）"拿回同一个 job（§6.5）。
+- `POST /advance` **没有请求重放幂等保证**。响应丢失时，服务端可能仍在运行、已经 claim 或已经保存；不得从网络错误推断请求未生效。
+- 网络异常、504、非精确 busy、非 2xx、未知/畸形响应后最多 GET 一次观察，然后停止。GET 只读账本，不证明旧 worker 已退出，也不授权重发 POST。
+- 只有完全匹配的固定 `409 busy` 响应进入实现中的有界退避路径。有效 `no_work` 使用单独的有界观察次数；耗尽后停止。有效的 `completed + continue` 响应后才可发下一次 POST。
+- "停止推进"只停止当前页面循环，不取消已经到达服务器的请求。页面刷新后可通过 localStorage 取回 job ID 并 GET 展示当前账本状态；不承诺自动恢复或安全重建。
 
-### 6.5 刷新后进度不丢（两种恢复路径）
+### 6.5 刷新后观察状态（不是自动恢复）
 
-1. **localStorage 恢复**：保存 `{"playlist_id": int, "job_id": "<48hex>", "manifest_sha256": "..."}`，键 `fnmusic.save.playlist.job.v1`。`job_id` 不是访问凭据（`docs/OFFLINE_SAVE_JOBS.md:5-11`），但仍必须通过 L4；缓存只用于恢复 UI。
-2. **幂等重建**（不依赖 localStorage 的兜底）：重新选歌单 → `GET snapshot` 拿指纹 → `POST jobs`（不给 `idempotency_key`，服务端派生 `p<playlist_id>-<fingerprint>`）→ 账本"同 scope/key 且规范字节相同返回原任务"（`docs/OFFLINE_SAVE_JOBS.md:13-22`）→ 得到同一个 `job_id` 与原有进度。**这是本设计能"刷新不丢"的根本原因**，实现与测试都必须覆盖。
-3. 若歌单在刷新期间被改动：指纹变化 → 派生键变化 → 创建新任务；旧任务仍可查询（若 UI 保留了 job_id）。这是正确行为（用户确认的是旧清单），UI 提示"歌单已变化，上次任务仍在/已按新清单创建"。
-4. `localStorage` 在 fnOS 桌面 iframe 中是否可用**待核实**；不可用时走路径 2，功能不受影响（只多一次点击）。实现必须捕获 `localStorage` 异常（隐私模式/配额）并降级到路径 2。
+1. localStorage 保存 job ID 只用于重新打开 UI 面板；读取仍需通过 L4，GET 仅观察账本。
+2. 任务若持久为 `paused`，刷新/重启后不会自动恢复或重新 claim。当前没有经验证的恢复端点；UI 可展示和取消剩余队列，但不得自动推进。
+3. `POST /jobs` 对相同 scope/key 和规范 manifest 的去重只适用于 job 创建；它不是 `/advance` 的请求重放保障。快照变化后产生新 key/job 也不代表安全恢复旧任务。
+4. localStorage 不可用或 job 状态不可读取时，停止自动操作并报告；不得用重复 POST 试探状态。
 
 ### 6.6 多标签页/多客户端
 
 - 账本保证每任务至多一个 `running`（唯一局部索引，`proxy/manual_save_jobs.py:87`）：后到的推进请求得到 `no_work`，不会重复执行（`_claim_next` 在存在 running 时直接返回 None，`:717-720`）。
 - 网关执行锁保证跨任务也只有一首在飞：后到的推进请求在**不 claim** 的前提下得到 409 `busy`（§7.1）。
-- UI 对 `busy/no_work` 显示固定提示"另一窗口正在保存，本页稍后自动继续"并退避；不得并行发起第二个 advance。
+- UI 只对精确固定 `busy` 响应按有界策略退避；`no_work` 有单独的有界观察策略。GET 只观察；未知/网络异常必须停止，不得并行或盲目重放 advance。
 
 ---
 
@@ -856,34 +872,33 @@ advanceLoop(jobId):
   - 既有 `/api/manual-save/track` 的 worker 也必须获取同一把锁（非阻塞，失败 → 409 `busy`，不调引擎）。这样 route 内部的 `_SAVE_LOCK`（`proxy/manual_save_route.py:158,562-568`）在单进程内不再可能被并发争用，`busy` 在映射表里成为**防御性不可达分支**。
 - 跨进程：单进程假设来自部署纪律"不启动第二个 gateway"（交接 `E:\fnmusic\PROJECT_HANDOFF_20261101.md:219-228`）；如果被违反，route `_SAVE_LOCK` 仍是最后防线（返回 `busy` → 按 §5.2 记为 `failed/busy` 并 `abort`，不 freeze）。
 
-### 7.2 轮询/退避建议
+### 7.2 推进与观察节奏
 
 | 场景 | 节奏 |
 | --- | --- |
 | 刚完成一首（`run.status=completed`, `disposition=continue`） | 立即发下一次 advance（不留空转延迟） |
-| `no_work` 且 job 非终态 | 2s 后重试（最多连续 5 次；仍 `no_work` 则停并提示"另一窗口正在推进或状态异常"） |
-| `busy` | 1s→2s→4s→8s→15s 上限 |
-| 网络错误/非 2xx | 同上退避；**不重放非幂等语义之外的推断**（advance 可安全重试，因为每位置至多执行一次） |
+| `no_work` 且 job 非终态 | GET 观察并使用实现中的有界策略；耗尽后停止，GET 不证明 worker 已退出。 |
+| 完全匹配的固定 `409 busy` | 按实现的有界退避路径。 |
+| 网络异常、504、非精确 busy、非 2xx、未知/畸形响应 | 最多 GET 一次观察，然后停止；**绝不重放 advance**。 |
 | 用户点"停止推进" | 立即停止循环，不再发请求 |
 | 任务终态 | 停止 |
 
 ### 7.3 单次请求超时与 1200s 的关系
 
 - 推进请求超时 = `MANUAL_SAVE_TIMEOUT = 1200`（`proxy/webui_gateway.py:106`），**不得**为整单设置更长的请求超时，**不得**为推进新增超过 1200 的预算。
-- 超时的正确语义（本合同的明确取舍）：**504 不是取消**。worker 继续执行并最终 CAS 写回；前端收到 504 后**必须** `GET job` 再判定，不能盲目重试造成误判。原因：账本用 `running + claim_token` 做完成 CAS，迟到的完成会正常写入；错过 504 响应的客户端通过查询收敛（`docs/OFFLINE_SAVE_JOBS.md:35-45`）。
+- 超时语义：**504 不是取消**，worker 可能仍在执行并迟到写回。前端可以 GET 一次用于显示，但查询不能证明 worker 已停止或为 POST 提供幂等确认；之后停止，不自动重试。claim token/CAS 是账本内部并发保护，不代表外部请求可安全重放。
 - 引擎内部预算不变：info ≤31s、lyric ≤62s、下载子进程 ≤580s、probe 30s、decode 300s、tag 120s（`proxy/manual_save_route.py:51-83`）。**本事务不新增/不放宽任何引擎预算**。
 
-### 7.4 推进的幂等/重试语义（强性质）
+### 7.4 claim/CAS 不等于请求幂等
 
-- `run_next` 的 claim 在 `BEGIN IMMEDIATE` 事务内完成（`proxy/manual_save_jobs.py:702-766`）：并发连接不会重复 claim、不会跳过最早位置（`docs/OFFLINE_SAVE_JOBS.md:35-45`）。
-- 完成写入用 `running + claim_token` CAS（`:767-806`）；旧 claim 的迟到完成不覆盖（`stale_completion`）。
-- 结论：**任何重试都不会使同一位置执行两次**；推进请求可安全重试，最坏后果是"多推进了一首"（响应丢失时），UI 以 job 快照为准。这条必须写进实现注释与测试（并发/重试用例）。
+- `run_next` 在 `BEGIN IMMEDIATE` 中 claim 当前最早位置，账本约束同时最多一个 `running` 位置；完成写入用 claim token/CAS 防止旧 claim 覆盖账本结果。
+- 这些约束不保证重复 HTTP `POST /advance` 安全。响应丢失时原请求可能仍运行；后续 POST 可能在它完成后 claim 下一位置。网络/超时/未知响应后必须停止，不自动重发。创建接口自身的 key 去重语义不外推到推进接口。
 
 ### 7.5 预算/取消的传递方式
 
 - 账本**没有**批量预算概念；本轮预算 = 每请求一首 + 1200s 请求上限 + 前端循环策略（§7.2）。
 - 取消只在位置边界生效（`docs/OFFLINE_PLAYLIST_SAVE.md:119,287`）：`cancel_job` 只改 queued（`proxy/manual_save_jobs.py:629-638`），running 跑完按真实结果记录；`run_next` 的 `cancellation_check` 在当前一首执行期间不会被引擎消费（`save_track` 无取消钩子）。
-- `disposition=abort` 与取消的区别：abort **不**改任务状态、不 cancel 剩余位置（可恢复）；取消是用户意图、不可逆地取消 queued。
+- `disposition=abort` 与取消的区别：abort 会停止派发，并按账本策略将任务持久化为 `paused`；当前没有自动恢复或重新 claim。取消会取消 queued 位置但不回滚已发布文件。两者都不构成重放先前未知请求的许可。
 
 ---
 
@@ -966,7 +981,7 @@ fnmusic-manual-save-playlist code=<固定码> job=<job_id> position=<int> state=
 | 幂等 | 同 body 两次 POST → 同一 job（fake ledger 或真账本临时目录） |
 | 执行锁 | 先占锁再调 advance → 409 `busy` 且 `run_next` 未被调用 |
 | 超时 | fake executor 阻塞 → 504 `timeout`，网关仍可响应下一个请求（对齐 `test_track_timeout_returns_504_and_gateway_stays_responsive`，`:497`） |
-| 脱敏 | executor 返回含 `signed_url/cookie` 的 detail → 响应中不出现；job 响应不含路径/md5/URL |
+| 脱敏 | 用伪造 executor payload 注入 `signed_url/cookie`、目标/暂存路径等字段；只允许已发布且同源的白名单 detail 到达响应，断言响应和账本均不回显原始响应、路径、MD5、URL、cookie、token。异常、额外字段或不匹配 source 必须无 detail |
 | 状态映射 | `commit_unknown`/`completion_unknown`/`stale_completion`/`no_work` → 规定 HTTP + disposition |
 | 禁用 | 两个开关任一 false → 403，账本 0 次被构造/调用 |
 | 账本异常 | `LedgerUnavailable`→503、`CapacityExceeded`→409、`CorruptLedgerError`→500 `internal` 且无细节 |
@@ -987,10 +1002,10 @@ fnmusic-manual-save-playlist code=<固定码> job=<job_id> position=<int> state=
 
 - 扩展既有 DOM/fetch 桩（该文件用 `vm` 加载真实 `app.js`，`:1-30`）：
   - `advanceLoop` 遇到 `no_work`→退避→终态停止；遇到 `disposition=abort/freeze` 停止；
-  - 504 后**先 GET job** 再决定，不直接重试；
+  - 网络异常/504/非精确 busy/未知或畸形响应后只 GET 观察一次并停止；精确 busy 与有效 no_work 才覆盖各自有界策略；
   - `busy` 退避序列（可用假时钟）；
   - 固定文案表：新错误码 → 固定中文，未知码 → `internal` 文案；
-  - `localStorage` 抛异常时降级到"幂等重建"路径；
+  - `localStorage` 抛异常时不重发创建/推进请求，显示状态无法恢复并停止自动操作；
   - 禁用态矩阵（§6.3）逐个断言按钮 disabled。
 - 运行：`cd webui-service && node test_app_js.js`，基线 102/102 不得下降。
 
@@ -1008,25 +1023,25 @@ fnmusic-manual-save-playlist code=<固定码> job=<job_id> position=<int> state=
 
 ## 10. 验收标准
 
-前置：G0 已就绪（`docs/G0_TRUSTED_INGRESS.md:8-22`；真机证据同文档 §4）；单曲链路已通过验收（`docs/MANUAL_IMPORT_PLAN.md:191-205`）；用户明确同意该次真实写入；`FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED=true`、`FNMUSIC_MANUAL_SAVE_ENABLED=true`；目标/暂存目录沿用已验收配置（交接 `E:\fnmusic\PROJECT_HANDOFF_20261101.md:151-184`）。**验收本身不授权改 `.env`/部署/重启**。
+前置：G0 已就绪（`docs/G0_TRUSTED_INGRESS.md:8-22`；真机证据同文档 §4）；单曲链路已通过验收；按当前会话授权仅在安全门全部 PASS 后执行隔离测试写入。两个保存开关须按已验证流程启用。授权不替代身份、生命周期、备份和回滚验证，也不涵盖权益不明音源或无关数据清理；无法确定时停止并报告，不逐项重复索取同一常规授权。
 
-用例：**一张包含重复曲目、成员数 ≥5 的测试歌单**（用户选定）。
+用例：**一张包含重复曲目、成员数 ≥5 的权益明确的测试歌单**（执行者在当前授权范围内从隔离测试候选中选择；权益不明则停止）。
 
 | # | 验收项 | 判定 |
 | --- | --- | --- |
 | A1 | 只读预检 | `GET snapshot` 返回 `track_count == position_count`、`enumeration_complete=true`、指纹稳定（连续两次一致） |
 | A2 | 创建幂等 | 同歌单连续两次创建 → 同一个 `job_id`；不消耗额外容量 |
 | A3 | 逐首推进 | 每次 advance 至多执行一首；进度单调；前端展示"已处理 x/N" |
-| A4 | 逐首核对 | 对每个 `published` 位置：NAS 上存在目标文件、basename 与响应一致、`ffprobe` 可解码、标签（title/artist/album/track）与封面/LRC 状态符合 route 报告、`mode` 与目标目录既有文件一致、staging 目录**清空**（无残留 `fnmusic-manual-save-*`） |
+| A4 | 逐首核对 | **真实验收仍 BLOCKED**：候选代码现可返回可信白名单中的逐位置 detail，但尚待独立审查、受控部署和 NAS 真机验收。detail 不含 basename、track/disc、路径或 MD5；应在隔离测试库用独立文件证据核对实际文件、可解码性、完整标签、封面/LRC、mode 和 staging。不得把请求档位或扩展名/codec当作实际 route 报告，也不得在部署或索引/播放验证之前判通过。 |
 | A5 | 重复位置 | 重复 `source_id` 的每个位置都在列表里；第 2 个通常 `conflict`（不覆盖）；若两条都 `published` 需解释为 basename 不同（允许） |
 | A6 | 失败逐首可见 | 制造至少一个可复现失败位置（如 VIP/无版权曲目 → `no_quality_available`/`trial_only`）；刷新页面后该位置仍显示具体固定原因；整单不标成功 |
 | A7 | 部分完成语义 | 若有失败，job `state∈{partial,completed_with_issues}`；`ok=True` 的 HTTP 响应**不得**被 UI 表述为"整单成功" |
-| A8 | 刷新不丢 | 中途刷新/关闭页面再打开：进度与位置结果不变（§6.5 两条恢复路径至少一条可用） |
+| A8 | 刷新后仅观察 | 刷新后可 GET 展示账本状态；验证持久 `paused` 不会自动推进。GET 不证明旧 worker 已停止，不能据此重放 advance。 |
 | A9 | 取消 | 推进中途取消：queued → `cancelled`，已发布保留，running 跑完后如实记录；无文件回滚 |
 | A10 | 开关关闭 | `FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED=false` 时：列表/快照/创建/推进全部 403（仅整歌单开关关 → `playlist_disabled`；总开关关 → `disabled`）；**无账本写入、无引擎调用、无 NAS 写**（检查日志与 DB mtime） |
 | A11 | 直连 8774 | `curl 127.0.0.1:8774/api/manual-save/playlist/...` → 501（`webui-service/app.py:1749-1758` 收口）；不得出现执行路径 |
 | A12 | 越权与伪造 | 无 CSRF 头/非 admin/缺 userid/普通用户直连 socket → 403 或被 L2 关闭；跨 `actor_scope` 用他人 `job_id` → 404 |
-| A13 | 脱敏（**限定新增 playlist 链路**）| 新增端点的响应/新日志/DB 中无签名 URL、Cookie、token、**目标目录或暂存路径**；DB 只含 §4.3.2 的 manifest 与状态列。既有 `status` 端点回显 `target_dir/staging_dir` 属已验收行为，不在本条范围 |
+| A13 | 脱敏（**限定新增 playlist 链路**）| 新增端点的响应/新日志/DB 中无签名 URL、Cookie、token、**目标目录或暂存路径**；DB 仅含 manifest、位置状态及 §5.3 固定 detail 白名单。既有 `status` 端点回显 `target_dir/staging_dir` 属已验收行为，不在本条范围 |
 | A14 | 容量/上限 | 1001 首/1001 个成员位置以上 → 409 `playlist_too_large`（1000 首合法，不要求跑完）；账本容量（1000 任务/10000 位置）打满时创建 → 409 `capacity_exceeded` |
 | A15 | 测试基线 | 五套手动保存 + `offline_tests` + node 全部只增不减；新增测试全绿；无真实网络/NAS 参与离线测试 |
 | A16 | `commit_unknown` 冻结 | 构造一个 `commit_unknown` 位置后：job 变 `reconciliation_required`、后续 advance 返回 `no_work`（HTTP 200）、UI 显示"需要对账"固定横幅、取消仍可用；**不得**自动重试、不得按文件是否存在判定成功（§5.4） |
@@ -1077,7 +1092,7 @@ fnmusic-manual-save-playlist code=<固定码> job=<job_id> position=<int> state=
 | `proxy/tests/test_manual_save_playlist_gateway.py` | §9.2 网关契约测试 |
 | `musicbox-service/netease_playlist_snapshot.py` | 新调用方：两次独立观测 + `snapshot_from_responses`/`compare_snapshots` + payload 组装；**不修改** `playlist_manifest.py` |
 | `proxy/tests/test_musicbox_playlist_snapshot.py` | 新调用方纯函数测试（注入响应对象，不联网；参照 `proxy/tests/test_musicbox_playlist_manifest.py:383-390` 的按路径加载方式） |
-| `tools/netease_playlist_observe.py` | §4.7 只读观察脚本（**已交付（离线），仅在用户授权后运行**；默认 dry-run 自检，`--confirm-observe` 才读取网络） |
+| `tools/netease_playlist_observe.py` | §4.7 只读观察脚本（**已交付（离线），只在当前授权范围内且安全门通过后运行**；默认 dry-run 自检，`--confirm-observe` 才读取网络） |
 | `docs/MANUAL_SAVE_PLAYLIST_SOURCE_EVIDENCE.md` | §4.7 观察记录模板（**已交付模板**；执行后填数才成为证据） |
 
 ### 12.2 修改文件
@@ -1116,11 +1131,11 @@ fnmusic-manual-save-playlist code=<固定码> job=<job_id> position=<int> state=
 | P0 | 本合同的独立审查（reviewer 绑定哈希 PASS） | 本文；**P0 PASS 是所有后续阶段的严格前置**。本轮实际执行偏差：P1/P2/P4 在 P0 结论出来前已并发落地，后以"绑定哈希 diff 审查 + P0 发现项回改"补救（见 §14），此偏差不重复 |
 | P1 | 账本 reason 扩展 + `offline_tests` 更新（纯离线） | Q1 批准（§11） |
 | P2 | `netease_playlist_snapshot.py` + 纯函数测试 + `member-snapshot` 端点（flag 默认关）+ `requirements.txt` 钉版本 | 无 NAS 写入 |
-| P3 | **§4.7 只读观察测试**（部署 producer、开只读 flag、跑 `tools/netease_playlist_observe.py`、写证据文档） | **用户授权 + 维护窗口**；artifact 证据齐备；`FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED=false`。**离线准备已完成**（脚本 + 证据模板 + 10 例自检）；剩余：授权、维护窗口、一次性只读执行 |
+| P3 | **§4.7 只读观察测试**（部署 producer、开只读 flag、跑 `tools/netease_playlist_observe.py`、写证据文档） | 当前会话授权范围内执行；安全门 PASS、artifact 证据齐备、两个保存开关关闭且影响可控；任何条件未知则 BLOCKED |
 | P4 | `proxy/manual_save_playlist_jobs.py` 适配层 + 单元/集成测试（fake producer payload） | 可与 P2/P3 并行编写；接线需 P3 PASS |
 | P5 | 网关 6 端点 + 契约测试 | P3 PASS + P1 完成 + **P4 适配层完成**（P5 import 它；P4 自身只需单测，不依赖 P3） |
 | P6 | 前端卡片 + node 测试 | P5 完成 |
-| P7 | 真实 NAS 整歌单验收（§10） | 用户明确同意写库 + 选定测试歌单 + P5/P6 完成 |
+| P7 | 真实 NAS 整歌单验收（§10） | 当前会话授权覆盖隔离测试写入 + 权益明确的测试歌单 + P5/P6 完成 + 安全门 PASS |
 | P8 | 交付评审/提交（由 Lead 执行；implementer 不 commit） | P7 记录 |
 
 ---
@@ -1225,10 +1240,10 @@ fnmusic-manual-save-playlist code=<固定码> job=<job_id> position=<int> state=
 | P1 账本 reason 扩展 | ✅ 完成 | `proxy/manual_save_jobs.py`（+13 reason，未改 DB schema）、`offline_tests/test_manual_save_jobs.py`、`docs/OFFLINE_SAVE_JOBS.md`（-02） | 该测试文件 21 passed / 29 subtests |
 | P2 快照 producer | ✅ 完成（默认关闭） | `musicbox-service/netease_playlist_snapshot.py`、`proxy/tests/test_musicbox_playlist_snapshot.py`、`musicbox-service/app.py` 只读端点、`requirements.txt` 钉 `==0.5.3`、`docs/NETEASE_DELIVERY_EVIDENCE.md` | 新增 41 例；开关与保存开关解耦 |
 | P4 适配层 | ✅ 完成（零生产接线） | `proxy/manual_save_playlist_jobs.py`、`proxy/tests/test_manual_save_playlist_jobs.py` | 207 例 |
-| P3 只读 artifact 观察 | ⏳ 待用户授权 + 维护窗口 | — | 需真实 NAS 只读观察（§4.7） |
+| P3 只读 artifact 观察 | ⏳ 未执行 | — | 需按当前授权范围完成真实 NAS 只读观察（§4.7）；安全门未通过前保持 BLOCKED |
 | P5 网关 6 端点 | ✅ 完成（离线） | `proxy/webui_gateway.py`（+1478）、`proxy/tests/test_manual_save_playlist_gateway.py` | 独立审查 PASS；7 套 1029/2（新 196） |
 | P6 管理页入口 | ✅ 完成（前端离线） | `webui-service/static/{index.html,app.js}` + `webui-service/test_app_js.js` | node 135/135（既有 102 + 新增 33）；未联调真实浏览器 |
-| P7 真实整歌单验收 | ⏳ 待用户同意写库 | — | 依赖 P5/P6 |
+| P7 真实整歌单验收 | ⏳ 未执行 | — | 依赖 P3/P5/P6 与部署/身份安全门；当前会话已授权范围内执行隔离测试 |
 
 **审查记录**
 
@@ -1248,8 +1263,8 @@ fnmusic-manual-save-playlist code=<固定码> job=<job_id> position=<int> state=
   8. advance 的**五类** run status（`completed`/`commit_unknown`/`no_work`/`stale_completion`/`completion_unknown`）HTTP 映射——P4 的 `_advance_report` 对 `no_work`/`stale_completion` 的 disposition 仍为 `None`，须按 §3.6 表补 `continue`/`freeze`；
   9. gateway 契约测试文件 `proxy/tests/test_manual_save_playlist_gateway.py`；
   10. 部署侧导出键（见下）。
-- **P3 只读观察**：⏳ 待用户授权 + 维护窗口。**离线准备已完成**：`tools/netease_playlist_observe.py`（默认 dry-run；`--confirm-observe` 才读网络；只 stat Cookie、只统计禁止日志路径次数、报告纯哈希/计数/耗时；保存侧开关为真时在任何读取前拒绝）+ `offline_tests/test_netease_playlist_observe.py`（10 例自检，实跑 10 passed）+ `docs/MANUAL_SAVE_PLAYLIST_SOURCE_EVIDENCE.md`（模板）。执行方式：容器 `/tmp` 临时目录 + 只读导入，**不部署、不改 `.env`、不重启**。
-- **P7 真实整歌单验收**：⏳ 待用户同意写库 + 选定测试歌单。**离线准备已完成**：`docs/MANUAL_SAVE_PLAYLIST_ACCEPTANCE_RUNBOOK.md`（A1–A16 命令化步骤、证据清单、失败/回滚、飞牛音乐侧确认）与 `docs/MANUAL_SAVE_PLAYLIST_DEPLOY_CHECKLIST.md`（打包范围、构建/安装/G3 验证、部署后顺序、回滚）；执行前须确认部署侧已包含 P1/P2/P4/P5/P6 代码。
+- **P3 只读观察**：⏳ 未执行。Producer 离线测试不代表 NAS 真实观察；运行仍受本次窗口安全门约束，两个保存开关须关闭。
+- **P7 真实整歌单验收**：⏳ 未执行，当前不是生产就绪。依赖 P3/P5/P6、身份与生命周期门、回滚验证及权益明确的隔离测试歌单；离线手册和测试不能替代真实下载、落盘、索引及播放验收。
 - **环境变量落盘限制（本轮实测）**：`.env.example` 在 DSH 工具层属于凭据围栏路径（`.env*`），任何文件工具读写均被拒绝，因此本轮的 `.env.example` 增补未被执行。**必须由操作者在外部编辑器补入**，或在 P5 用不含凭据的示例文档替代。
   需补的三个键（按 `.env.example` 既有注释风格）：
   ```dotenv

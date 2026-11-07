@@ -269,6 +269,7 @@ MANUAL_SAVE_PLAYLIST_TASK_STATES = frozenset({
     "completed_with_issues",
     "completed_bytes_reported",
     "reconciliation_required",
+    "paused",
 })
 _MANUAL_SAVE_PLAYLIST_REASON_FALLBACK = "未保存（原因未登记）"
 # §6.2 position reason -> fixed Chinese text. Texts mirror the route message
@@ -885,7 +886,13 @@ def _sanitize_manual_save_data(data: object) -> dict:
     sanitized["md5"] = (
         md5 if type(md5) is str and re.fullmatch(r"[0-9a-fA-F]{32}", md5) else ""
     )
-    sanitized["published_size"] = _manual_save_int(source.get("published_size"))
+    published_size = source.get("published_size")
+    sanitized["published_size"] = (
+        published_size
+        if type(published_size) is int and not isinstance(published_size, bool)
+        and 0 <= published_size <= (2**63 - 1)
+        else 0
+    )
     published_md5 = source.get("published_md5")
     sanitized["published_md5"] = (
         published_md5
@@ -893,6 +900,18 @@ def _sanitize_manual_save_data(data: object) -> dict:
         and re.fullmatch(r"[0-9a-fA-F]{32}", published_md5)
         else ""
     )
+    published_sha256 = source.get("published_sha256")
+    sanitized["published_sha256"] = (
+        published_sha256.casefold()
+        if type(published_sha256) is str
+        and re.fullmatch(r"[0-9a-fA-F]{64}", published_sha256)
+        else ""
+    )
+    if sanitized["status"] != "published":
+        sanitized["published_size"] = 0
+        sanitized["published_sha256"] = ""
+    elif sanitized["published_size"] <= 0 or not sanitized["published_sha256"]:
+        sanitized["published_sha256"] = ""
     sanitized["tagged"] = source.get("tagged") is True
     sanitized["cover_embedded"] = source.get("cover_embedded") is True
     for name in ("lyricist", "composer"):
@@ -1950,6 +1969,9 @@ def _manual_save_playlist_positions(job: object) -> list:
                 "reason": safe_reason,
                 "reason_message": _manual_save_playlist_reason_message(safe_reason),
                 "cleanup_pending": getattr(item, "cleanup_pending", None) is True,
+                "detail": manual_save_playlist_jobs.position_detail_for_wire(
+                    getattr(item, "detail", None)
+                ),
             })
     return rows
 
@@ -2003,6 +2025,12 @@ def _manual_save_playlist_run_block(report: object) -> "dict | None":
         # §3.6 table: no_work -> 200 + continue (refresh/recheck the job).
         disposition = manual_save_playlist_jobs.DISPOSITION_CONTINUE
         position_number, outcome, reason = None, None, None
+    elif status == "paused":
+        # A prior persisted ABORT or unknown terminal result blocks further
+        # claims. Keep this explicit so the caller cannot mistake it for an
+        # ordinary empty queue and poll/retry past the failed position.
+        disposition = manual_save_playlist_jobs.DISPOSITION_ABORT
+        position_number, outcome, reason = None, None, None
     elif status == "stale_completion":
         disposition = manual_save_playlist_jobs.DISPOSITION_FREEZE
     elif status == "completion_unknown":
@@ -2010,18 +2038,20 @@ def _manual_save_playlist_run_block(report: object) -> "dict | None":
         outcome, reason = "commit_unknown", "commit_unknown"
     else:
         return None
+    safe_detail = None
+    if status == "completed" and outcome == "published" and reason == "bytes_published":
+        safe_detail = manual_save_playlist_jobs.position_detail_for_wire(
+            getattr(report, "detail", None)
+        )
     return {
         "status": status,
         "disposition": disposition,
         "position": position_number,
         "outcome": outcome,
         "reason": reason,
-        # §3.6 detail gap (P5 item 6): the P4 executor returns only a
-        # SaveResult and never the raw route data, so P5 must not invent a
-        # detail payload from untrusted input. The field stays null until a
-        # later phase persists/reconstructs a sanitized detail from a fixed
-        # whitelist. Never echo the raw save_track response here.
-        "detail": None,
+        # Only detail recovered through the ledger's published whitelist is
+        # exposed. Raw save_track responses never reach this boundary.
+        "detail": safe_detail,
     }
 
 
@@ -2048,7 +2078,7 @@ def _manual_save_playlist_advance_result(active: "_ManualSavePlaylistDeps",
         if run is None:
             return _manual_save_playlist_error("internal")
         data = {"run": run, "job": _manual_save_playlist_job_summary(job)}
-        if status in ("completed", "commit_unknown", "no_work"):
+        if status in ("completed", "commit_unknown", "no_work", "paused"):
             return _manual_save_playlist_result(data)
         if status == "stale_completion":
             return _manual_save_playlist_error("stale_completion", data)

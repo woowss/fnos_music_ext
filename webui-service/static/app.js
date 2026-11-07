@@ -3479,8 +3479,176 @@ const PLAYLIST_FINGERPRINT_RE = /^[0-9a-f]{64}$/;
 const PLAYLIST_RECONCILE_TEXT = "存在结果未知的位置，已停止推进。请核对 NAS 上是否已出现该文件后再人工处理。";
 const PLAYLIST_TERMINAL_STATES = new Set([
   "cancelled", "partial", "completed_with_issues",
-  "completed_bytes_reported", "reconciliation_required",
+  "completed_bytes_reported", "reconciliation_required", "paused",
 ]);
+const PLAYLIST_JOB_STATES = new Set([
+  "queued", "running", "cancelling", "cancelled", "partial",
+  "completed_with_issues", "completed_bytes_reported", "reconciliation_required", "paused",
+]);
+const PLAYLIST_ADVANCE_DISPOSITIONS = new Map([
+  ["completed", new Set(["continue", "abort"])],
+  ["commit_unknown", new Set(["freeze"])],
+  ["no_work", new Set(["continue"])],
+  ["paused", new Set(["abort"])],
+]);
+// Contract §5.2: a completed run may continue only for an exact persisted
+// outcome/reason/disposition triple. A contradictory tuple must stop the UI
+// loop before another advance POST. JSON tuple keys avoid delimiter collisions.
+const PLAYLIST_ADVANCE_RESULT_DISPOSITIONS = new Map([
+  [JSON.stringify(["published", "bytes_published"]), "continue"],
+  [JSON.stringify(["conflict", "destination_conflict"]), "continue"],
+  [JSON.stringify(["rejected", "service_unavailable"]), "continue"],
+  [JSON.stringify(["rejected", "no_quality_available"]), "continue"],
+  [JSON.stringify(["rejected", "quality_unverified"]), "continue"],
+  [JSON.stringify(["rejected", "quality_identity_mismatch"]), "continue"],
+  [JSON.stringify(["rejected", "trial_only"]), "continue"],
+  [JSON.stringify(["rejected", "download_target_untrusted"]), "continue"],
+  [JSON.stringify(["rejected", "download_failed"]), "continue"],
+  [JSON.stringify(["rejected", "integrity_mismatch"]), "continue"],
+  [JSON.stringify(["rejected", "invalid_audio"]), "continue"],
+  [JSON.stringify(["rejected", "tag_failed"]), "continue"],
+  [JSON.stringify(["failed", "disabled"]), "abort"],
+  [JSON.stringify(["failed", "config_invalid"]), "abort"],
+  [JSON.stringify(["failed", "busy"]), "abort"],
+  [JSON.stringify(["failed", "stage_unavailable"]), "abort"],
+  [JSON.stringify(["rejected", "invalid_target"]), "abort"],
+  [JSON.stringify(["commit_unknown", "commit_unknown"]), "freeze"],
+]);
+
+function playlistIsRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function playlistHasExactKeys(value, expected) {
+  if (!playlistIsRecord(value)) return false;
+  const keys = Object.keys(value);
+  return keys.length === expected.length
+    && expected.every((key) => Object.prototype.hasOwnProperty.call(value, key));
+}
+
+const PLAYLIST_DETAIL_LEGACY_KEYS = [
+  "status", "title", "artist", "album", "quality_actual", "quality_actual_status",
+  "format", "cover_status", "cover_embedded", "lyric_status",
+];
+const PLAYLIST_DETAIL_KEYS = PLAYLIST_DETAIL_LEGACY_KEYS.concat(["published_sha256", "published_size"]);
+const PLAYLIST_DETAIL_COVER_STATUSES = new Set([
+  "preserved", "embedded", "unavailable", "unsupported", "error",
+  "not_published", "not_attempted", "unknown",
+]);
+const PLAYLIST_DETAIL_LYRIC_STATUSES = new Set([
+  "published", "unavailable", "error", "conflict", "not_attempted", "unknown",
+]);
+
+function playlistDetailDetectionProbe(value) {
+  return value.replace(/[\p{Cf}\p{M}]/gu, "").normalize("NFKC");
+}
+
+function playlistHasUnsafeDetailText(value) {
+  if (/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(value)) return true;
+  for (const character of value) {
+    const point = character.codePointAt(0);
+    if (point >= 0xd800 && point <= 0xdfff) return true;
+  }
+  const probe = playlistDetailDetectionProbe(value);
+  return /(?:https?:\/\/|ftp:\/\/|www\.)/i.test(probe)
+    || /(?:^|[^A-Za-z0-9_])(?:authorization|set-cookie|cookie|api[_ -]?key|access[_ -]?token|refresh[_ -]?token|password|secret)\s*[:=]/i.test(probe);
+}
+
+function playlistHasAbsolutePathText(value) {
+  const pathProbe = playlistDetailDetectionProbe(value);
+  return /(^|[^A-Za-z0-9_.-])\/(?!\s)[^/\s]+(?:\s+[^/\s]+)*(?:\/[^/\s]+(?:\s+[^/\s]+)*)*/u.test(pathProbe)
+    || /^\s*\/(?!\s)[^/]+(?:\/[^/]*)?\s*$/u.test(pathProbe)
+    || /(?:^|[\s([{;,])(?:path|file|directory|folder|location|路径|文件路径|目录|位置)\s*[:=：]\s*\/(?!\s)[^/]+(?:\/[^/]*)*/iu.test(pathProbe)
+    || /(^|[^A-Za-z0-9_.-])\/(?:vol(?:ume)?\d+|home|users?|tmp|var|mnt|media|root|etc|opt|srv|proc|sys|dev|run|boot|data|storage|shares?|private|workspace|downloads?|documents?)(?:\/|$)/iu.test(pathProbe)
+    || /(^|[^A-Za-z0-9_])[a-z]:[\\/][^\r\n]*/iu.test(pathProbe)
+    || /(^|[^\\/])(?:\\\\|\/\/)[^\\/\s]+[\\/][^\\/\s]+/u.test(pathProbe);
+}
+
+function playlistValidPositionDetail(detail) {
+  const legacy = playlistHasExactKeys(detail, PLAYLIST_DETAIL_LEGACY_KEYS);
+  const hasFileEvidence = playlistHasExactKeys(detail, PLAYLIST_DETAIL_KEYS);
+  if ((!legacy && !hasFileEvidence) || detail.status !== "published") return false;
+  for (const key of ["title", "artist", "album"]) {
+    if (typeof detail[key] !== "string" || detail[key].length > 512) {
+      return false;
+    }
+  }
+  if (detail.quality_actual_status === "reported") {
+    if (typeof detail.quality_actual !== "string"
+        || !/^[a-z0-9][a-z0-9._-]{0,63}$/.test(detail.quality_actual)) return false;
+  } else if (detail.quality_actual_status !== "unknown" || detail.quality_actual !== "") {
+    return false;
+  }
+  if (hasFileEvidence && (typeof detail.published_sha256 !== "string"
+      || !/^[0-9a-f]{64}$/.test(detail.published_sha256)
+      || !Number.isSafeInteger(detail.published_size) || detail.published_size <= 0)) return false;
+  return ["flac", "mp3", "unknown"].includes(detail.format)
+    && PLAYLIST_DETAIL_COVER_STATUSES.has(detail.cover_status)
+    && (detail.cover_embedded === null || typeof detail.cover_embedded === "boolean")
+    && PLAYLIST_DETAIL_LYRIC_STATUSES.has(detail.lyric_status);
+}
+
+function playlistValidPositionRows(positions) {
+  if (!Array.isArray(positions)) return false;
+  for (let index = 0; index < positions.length; index += 1) {
+    const row = positions[index];
+    if (!playlistHasExactKeys(row, [
+      "position", "source_id", "state", "reason", "reason_message", "cleanup_pending", "detail",
+    ]) || row.position !== index + 1 || !Number.isInteger(row.position)
+        || (row.source_id !== null && (typeof row.source_id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(row.source_id)))
+        || !PLAYLIST_POSITION_LABELS[row.state]
+        || (row.reason !== null && (typeof row.reason !== "string" || !/^[a-z][a-z0-9_]{0,63}$/.test(row.reason)))
+        || typeof row.reason_message !== "string"
+        || typeof row.cleanup_pending !== "boolean"
+        || (row.detail !== null && (!playlistValidPositionDetail(row.detail) || row.state !== "published"))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function playlistIsFixedBusyResponse(response) {
+  if (!playlistHasExactKeys(response, ["status", "ok", "body"])
+      || response.status !== 409 || response.ok !== false) return false;
+  const body = response.body;
+  if (!playlistHasExactKeys(body, ["ok", "code", "message", "data"])
+      || body.ok !== false || body.code !== "busy"
+      || body.message !== PLAYLIST_CODE_MESSAGES.busy) return false;
+  return playlistHasExactKeys(body.data, []);
+}
+
+function playlistValidAdvanceResponse(response, expectedJobId) {
+  if (!response || response.status !== 200 || response.ok !== true) return false;
+  const body = response.body;
+  if (!playlistIsRecord(body) || body.ok !== true || body.code !== "ok"
+      || !playlistIsRecord(body.data)) return false;
+  const run = body.data.run;
+  const job = body.data.job;
+  if (!playlistIsRecord(run) || !playlistIsRecord(job)
+      || job.job_id !== expectedJobId || !PLAYLIST_JOB_STATES.has(job.state)) return false;
+  const allowedDispositions = PLAYLIST_ADVANCE_DISPOSITIONS.get(run.status);
+  if (!allowedDispositions || !allowedDispositions.has(run.disposition)) return false;
+  const runKeys = ["detail", "disposition", "outcome", "position", "reason", "status"];
+  if (Object.keys(run).length !== runKeys.length || runKeys.some((key) => !Object.prototype.hasOwnProperty.call(run, key))) {
+    return false;
+  }
+  if (run.position !== null && (!Number.isInteger(run.position) || run.position < 1)) return false;
+  if (run.outcome !== null && typeof run.outcome !== "string") return false;
+  if (run.reason !== null && typeof run.reason !== "string") return false;
+  if (run.detail !== null && !playlistValidPositionDetail(run.detail)) return false;
+  if (run.detail !== null && (run.outcome !== "published" || run.reason !== "bytes_published")) return false;
+  if (run.status === "completed") {
+    if (run.position === null || typeof run.outcome !== "string" || typeof run.reason !== "string") return false;
+    return PLAYLIST_ADVANCE_RESULT_DISPOSITIONS.get(JSON.stringify([run.outcome, run.reason]))
+      === run.disposition;
+  }
+  if (run.status === "commit_unknown") {
+    return run.position !== null && run.outcome === "commit_unknown" && run.reason === "commit_unknown"
+      && PLAYLIST_ADVANCE_RESULT_DISPOSITIONS.get(JSON.stringify([run.outcome, run.reason]))
+        === run.disposition;
+  }
+  return run.position === null && run.outcome === null && run.reason === null && run.detail === null;
+}
 
 // §3.9.1 固定 code → 固定中文（与网关逐字一致）。未登记的 code 一律回落 internal。
 const PLAYLIST_CODE_MESSAGES = {
@@ -3607,6 +3775,7 @@ function playlistJobStateText(job) {
     case "completed_with_issues": return "已完成但有失败项";
     case "completed_bytes_reported": return "已完成（仅表示字节已发布，不表示可播放/已入库）";
     case "reconciliation_required": return "需要对账：存在结果未知的位置";
+    case "paused": return "已暂停：前一位置要求停止，需人工处理";
     default: return "状态未知";
   }
 }
@@ -3654,6 +3823,37 @@ function playlistRenderPositions(positions) {
     const metaParts = [reason, sourceId, duplicate ? "重复位置" : ""]
       .filter((part) => typeof part === "string" && part)
       .map((part) => escapeHtml(part));
+    if (playlistValidPositionDetail(raw.detail)) {
+      const detail = raw.detail;
+      const safeDetailText = (value) => playlistHasUnsafeDetailText(value)
+        || playlistHasAbsolutePathText(value) ? "" : value;
+      metaParts.push("曲名 " + escapeHtml(safeDetailText(detail.title) || "未知"));
+      metaParts.push("歌手 " + escapeHtml(safeDetailText(detail.artist) || "未知"));
+      metaParts.push("专辑 " + escapeHtml(safeDetailText(detail.album) || "未知"));
+      metaParts.push("音质 " + escapeHtml(
+        detail.quality_actual_status === "reported" ? detail.quality_actual : "未知",
+      ));
+      metaParts.push("格式 " + escapeHtml({ flac: "FLAC", mp3: "MP3", unknown: "未知" }[detail.format]));
+      const coverLabel = {
+        preserved: "已保留", embedded: "已写入", unavailable: "未获取",
+        unsupported: "格式不支持", error: "写入失败", not_published: "未发布",
+        not_attempted: "未尝试", unknown: "未知",
+      }[detail.cover_status] || "未知";
+      const embeddedLabel = detail.cover_embedded === true ? "已内嵌"
+        : detail.cover_embedded === false ? "未内嵌" : "内嵌状态未知";
+      metaParts.push("封面 " + escapeHtml(coverLabel + "，" + embeddedLabel));
+      const lyricLabel = {
+        published: "已保存", unavailable: "未获取", error: "保存失败",
+        conflict: "同名冲突", not_attempted: "未尝试", unknown: "未知",
+      }[detail.lyric_status] || "未知";
+      metaParts.push("歌词 " + escapeHtml(lyricLabel));
+      if (Object.prototype.hasOwnProperty.call(detail, "published_sha256")) {
+        metaParts.push("已提交字节 " + escapeHtml(String(detail.published_size)) + " B · SHA-256 "
+          + escapeHtml(detail.published_sha256));
+      } else {
+        metaParts.push("已提交字节指纹未知");
+      }
+    }
     return '<div class="lx-item"><div class="lx-item-main">'
       + '<div class="lx-item-header"><span class="lx-item-name">'
       + escapeHtml("#" + position + " " + stateText) + "</span></div>"
@@ -3667,7 +3867,8 @@ function playlistUpdateButtons() {
   const busy = playlistState.running === true;
   const job = playlistState.job;
   const state = job && typeof job.state === "string" ? job.state : "";
-  const blockedForStart = state === "reconciliation_required" || state === "cancelling";
+  const blockedForStart = state === "reconciliation_required" || state === "cancelling"
+    || state === "paused" || state === "running";
   const select = $("#playlist-select");
   if (select) select.disabled = !enabled || busy;
   const refreshBtn = $("#playlist-refresh-btn");
@@ -3689,7 +3890,8 @@ function playlistUpdateButtons() {
   if (cancelBtn) {
     // §3.8：reconciliation_required 保留取消；cancelling 不再可取消
     const canCancel = enabled && !!job
-      && (state === "queued" || state === "running" || state === "reconciliation_required");
+      && (state === "queued" || state === "running"
+          || state === "reconciliation_required" || state === "paused");
     cancelBtn.disabled = !canCancel;
   }
 }
@@ -3972,7 +4174,8 @@ async function playlistRefreshJob(jobId) {
   }
   const body = (response && response.body) || {};
   const data = (body && body.data) || {};
-  if (response && response.ok === true && body.ok === true && data.job && typeof data.job === "object") {
+  if (response && response.ok === true && body.ok === true && data.job && typeof data.job === "object"
+      && playlistValidPositionRows(data.positions)) {
     const jobId_ = typeof data.job.job_id === "string" && PLAYLIST_JOB_ID_RE.test(data.job.job_id)
       ? data.job.job_id : id;
     playlistState.jobId = jobId_;
@@ -4001,6 +4204,7 @@ function playlistRunMessage(run) {
   const where = position > 0 ? "位置 " + position + "：" : "";
   const reasonText = playlistReasonMessage(run && run.reason);
   if (status === "no_work") return "暂无待执行位置（可能另一窗口正在推进）。";
+  if (status === "paused") return "任务已暂停：此前位置要求停止，未继续处理后续歌曲。";
   if (status === "commit_unknown" || status === "completion_unknown") {
     return where + "执行结果未知，需要人工对账。";
   }
@@ -4089,22 +4293,61 @@ async function playlistAdvanceLoop(jobId) {
           body: JSON.stringify({ job_id: id }),
         });
       } catch (_) {
-        transient += 1;
-        if (transient >= PLAYLIST_MAX_TRANSIENT) {
-          playlistState.message = "推进失败：网络错误，已停止本页推进，请稍后刷新查看任务状态。";
+        // The request may have reached the server and completed even though
+        // its response was lost. A GET can display current state but cannot
+        // prove the old worker stopped; never issue another advance here.
+        playlistState.message = "推进请求连接中断：正在只读核对任务，暂不重试。";
+        playlistRenderJob();
+        const reconciled = await playlistRefreshJob(id);
+        playlistState.message = reconciled
+          ? "上次推进请求未收到结果。已读取当前状态，请人工核对位置与保存结果后再处理。"
+          : "上次推进请求未收到结果，且任务状态暂时无法读取；已停止，请手动刷新核对。";
+        playlistRenderJob();
+        break;
+      }
+      const body = playlistIsRecord(response && response.body) ? response.body : {};
+      const code = typeof body.code === "string" ? body.code : "";
+      // A 504 is ambiguous even if its body carries another error code (for
+      // example, a proxy-generated "busy"). Observe once, then stop.
+      if (code === "timeout" || (response && response.status === 504)) {
+        playlistState.message = "保存超时：正在核对任务状态…";
+        playlistRenderJob();
+        const refreshed = await playlistRefreshJob(id);
+        if (!refreshed || !playlistState.job) {
+          playlistState.message = "保存超时且未能读取任务状态，已停止推进，请稍后刷新。";
           break;
         }
-        playlistState.message = "网络错误，正在重试（第 " + transient + " 次）…";
+        playlistState.message = PLAYLIST_TERMINAL_STATES.has(playlistState.job.state)
+          ? "上次请求超时：任务已结束或暂停，状态已读取。"
+          : "上次请求超时：已读取当前状态，但无法确认旧请求结束；已停止，请人工核对后再操作。";
+        playlistRenderJob();
+        break;
+      }
+      // Retry only the exact fixed 409 busy envelope (including its empty
+      // data object). Any extra/malformed fields may describe a committed run;
+      // fail closed and observe with GET instead of issuing another POST.
+      if (playlistIsFixedBusyResponse(response)) {
+        transient += 1;
+        if (transient >= PLAYLIST_MAX_TRANSIENT) {
+          playlistState.message = "另一窗口长时间占用保存任务，已停止本页推进，请稍后刷新。";
+          break;
+        }
+        playlistState.message = "另一窗口正在保存，本页稍后自动继续…";
         playlistRenderJob();
         await playlistSleep(playlistBackoffDelay(transient - 1));
+        await playlistRefreshJob(id);
         continue;
       }
-      const body = (response && response.body) || {};
-      const code = body && typeof body.code === "string" ? body.code : "";
-      const data = (body && body.data) || {};
-      const okRun = response && response.ok === true && body.ok === true
-        && data.run && typeof data.run === "object" && data.job && typeof data.job === "object";
-      if (okRun) {
+      if (!playlistValidAdvanceResponse(response, id)) {
+        // Malformed or unrecognized responses may follow a committed call.
+        // GET is observational only; never issue another POST in this loop.
+        await playlistRefreshJob(id);
+        playlistState.message = "推进失败：" + playlistJobMessage(body, "内部错误") + "（已停止本页推进）";
+        playlistRenderJob();
+        break;
+      }
+      {
+        const data = response.body.data;
         transient = 0;
         const run = data.run;
         const runStatus = typeof run.status === "string" ? run.status : "";
@@ -4116,7 +4359,11 @@ async function playlistAdvanceLoop(jobId) {
         if (!refreshed) playlistRenderJob();
         const jobState = playlistState.job && typeof playlistState.job.state === "string"
           ? playlistState.job.state : "";
-        if (PLAYLIST_TERMINAL_STATES.has(jobState)) { playlistClearStoredJob(); break; }
+        if (PLAYLIST_TERMINAL_STATES.has(jobState)) {
+          if (jobState !== "paused") playlistClearStoredJob();
+          break;
+        }
+        if (runStatus === "paused" || run.disposition === "abort") break;
         // §3.6：freeze → 停止并转对账；abort → 停止并提示
         if (run.disposition === "freeze" || runStatus === "commit_unknown"
             || runStatus === "completion_unknown" || runStatus === "stale_completion") {
@@ -4139,42 +4386,6 @@ async function playlistAdvanceLoop(jobId) {
         }
         continue;  // completed + continue：立即进入下一首（不留空转延迟，§7.2）
       }
-      if (code === "busy") {
-        transient += 1;
-        if (transient >= PLAYLIST_MAX_TRANSIENT) {
-          playlistState.message = "另一窗口长时间占用保存任务，已停止本页推进，请稍后刷新。";
-          break;
-        }
-        playlistState.message = "另一窗口正在保存，本页稍后自动继续…";
-        playlistRenderJob();
-        await playlistSleep(playlistBackoffDelay(transient - 1));
-        await playlistRefreshJob(id);
-        continue;
-      }
-      if (code === "timeout" || (response && response.status === 504)) {
-        // §7.3：504 不是取消/失败——先 GET job 再判定，绝不盲目重放 advance
-        playlistState.message = "保存超时：正在核对任务状态…";
-        playlistRenderJob();
-        const refreshed = await playlistRefreshJob(id);
-        if (!refreshed || !playlistState.job) {
-          playlistState.message = "保存超时且未能读取任务状态，已停止推进，请稍后刷新。";
-          break;
-        }
-        if (PLAYLIST_TERMINAL_STATES.has(playlistState.job.state)) break;
-        const stillRunning = (playlistState.positions || []).some(
-          (row) => row && (row.state === "running" || row.state === "queued"));
-        if (stillRunning) {
-          playlistState.message = "上次保存请求超时：任务仍在执行，已停止本页推进，请稍后刷新查看进度。";
-          break;
-        }
-        playlistState.message = "上次保存请求超时，已按账本状态继续推进。";
-        playlistRenderJob();
-        await playlistSleep(playlistBackoffDelay(0));
-        continue;
-      }
-      playlistState.message = "推进失败：" + playlistJobMessage(body, "内部错误") + "（已停止本页推进）";
-      playlistRenderJob();
-      break;
     }
   } finally {
     playlistState.running = false;
@@ -4259,15 +4470,26 @@ async function playlistResumeFromStorage() {
     return { resumed: false, reason: "unavailable" };
   }
   if (PLAYLIST_TERMINAL_STATES.has(playlistState.job.state)) {
-    playlistClearStoredJob();
-    playlistState.message = "已恢复上次任务：任务已结束，可重新读取清单后新建任务。";
+    if (playlistState.job.state === "paused") {
+      // Keep the job id so a page refresh can still show why the ledger is
+      // paused. This stage intentionally has no resume/reconciliation API.
+      playlistState.message = "已恢复暂停任务；后续位置未执行，当前版本不支持自动恢复，请人工处理。";
+    } else {
+      playlistClearStoredJob();
+      playlistState.message = "已恢复上次任务：任务已结束，可重新读取清单后新建任务。";
+    }
     playlistRenderJob();
     return { resumed: false, reason: "terminal", jobId: playlistState.jobId };
   }
   playlistState.message = "已恢复上次未完成的任务进度，继续推进。";
   playlistRenderJob();
-  void playlistAdvanceLoop(playlistState.jobId);  // 恢复轮询推进
-  return { resumed: true, jobId: playlistState.jobId };
+  // A stored job may have an advance whose response was lost. GET is only an
+  // observation: it cannot prove that the old worker stopped, so page load
+  // must never issue another POST automatically. The user can inspect the
+  // refreshed position list and explicitly choose whether to continue.
+  playlistState.message = "已恢复任务状态；页面不会自动继续。请先核对位置结果，再手动操作。";
+  playlistRenderJob();
+  return { resumed: false, reason: "manual_confirmation", jobId: playlistState.jobId };
 }
 
 // 只读快照：诊断/测试用，不改变任何状态

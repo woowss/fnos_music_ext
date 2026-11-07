@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -60,8 +61,25 @@ def _disabled_status():
     return {"ok": False, "code": "disabled", "message": "手动保存未启用", "data": {}}
 
 
-def _published():
-    return {"ok": True, "code": "ok", "message": "", "data": {"status": "published"}}
+def _published(song_id=1901371647):
+    return {
+        "ok": True, "code": "ok", "message": "",
+        "data": {"status": "published", "song_id": song_id},
+    }
+
+
+def _published_with_detail(song_id, **overrides):
+    data = {
+        "status": "published", "song_id": song_id,
+        "title": "歌曲🎵 <img src=x>", "artist": "歌手", "album": "专辑",
+        "quality_requested": "jymaster", "quality_actual": "jymaster",
+        "quality_actual_status": "reported", "format": "flac",
+        "published_sha256": "b" * 64, "published_size": 4321,
+        "cover_status": "embedded", "cover_embedded": True, "lyric_status": "error",
+        "target_dir": "/vol1/private", "url": SIGNED_URL, "cookie": SECRET_COOKIE,
+    }
+    data.update(overrides)
+    return {"ok": True, "code": "ok", "message": "", "data": data}
 
 
 def _conflict():
@@ -153,7 +171,7 @@ class FakeEngine:
 
     def save_track(self, song_id):
         self.save_calls.append(song_id)
-        return _published()
+        return _published(song_id)
 
 
 class SaveEngine:
@@ -167,7 +185,7 @@ class SaveEngine:
         self.calls.append(song_id)
         if self.results:
             return self.results.pop(0)
-        return _published()
+        return _published(song_id)
 
 
 def _make_deps(tmp_path, producer, save_engine, *, enabled=True):
@@ -1062,17 +1080,187 @@ def test_job_query_returns_fixed_positions_and_summary(tmp_path):
     assert [row["position"] for row in data["positions"]] == [1, 2, 3]
     assert set(data["positions"][0]) == {
         "position", "source_id", "state", "reason", "reason_message",
-        "cleanup_pending",
+        "cleanup_pending", "detail",
     }
     assert data["positions"][0]["source_id"] == "1901371647"
     assert data["positions"][0]["state"] == "queued"
     assert data["positions"][0]["reason"] is None
     assert data["positions"][0]["reason_message"] == ""
     assert data["positions"][0]["cleanup_pending"] is False
+    assert data["positions"][0]["detail"] is None
     rendered = client.data.decode("utf-8", "replace")
     assert SIGNED_URL not in rendered
     assert SECRET_COOKIE not in rendered
     assert "/vol1/music" not in rendered
+
+
+def test_advance_and_job_query_return_only_persisted_safe_published_detail(tmp_path):
+    payload = _snapshot_payload(track_ids=(1901371647, 1901371647))
+    save_engine = SaveEngine([_published_with_detail(1901371647),
+                              _published_with_detail(1901371647)])
+    _ledger, _service, deps, job = _created_job(tmp_path, payload=payload, save_engine=save_engine)
+    client, status, body = _advance(tmp_path, deps, job_id=job.job_id)
+    assert status == 200
+    detail = body["data"]["run"]["detail"]
+    assert detail == {
+        "status": "published", "title": "歌曲🎵 <img src=x>", "artist": "歌手", "album": "专辑",
+        "quality_actual": "jymaster", "quality_actual_status": "reported", "format": "flac",
+        "cover_status": "embedded", "cover_embedded": True, "lyric_status": "error",
+        "published_sha256": "b" * 64, "published_size": 4321,
+    }
+    assert SIGNED_URL not in client.data.decode("utf-8", "replace")
+    assert SECRET_COOKIE not in client.data.decode("utf-8", "replace")
+    assert "/vol1/private" not in client.data.decode("utf-8", "replace")
+
+    raw = _job_raw(job.job_id)
+    client = FakeClient(raw)
+    gw.handle_manual_save_playlist_job(client, raw, engine=FakeEngine(), deps=deps)
+    query = _response(client)[1]
+    assert query["data"]["positions"][0]["detail"] == detail
+    assert query["data"]["positions"][1]["detail"] is None
+
+
+def test_advance_and_query_strip_path_like_metadata_but_preserve_source_evidence(tmp_path):
+    song_id = 1901371647
+    payload = _snapshot_payload(track_ids=(song_id,))
+    save_engine = SaveEngine([_published_with_detail(
+        song_id,
+        title="saved in /secrets.flac",
+        artist=r"stored at C:\Users\kurumi\Documents\private.flac",
+        album=r"\\server\share\private\song.flac",
+    )])
+    _ledger, _service, deps, job = _created_job(
+        tmp_path, payload=payload, save_engine=save_engine,
+    )
+    client, status, body = _advance(tmp_path, deps, job_id=job.job_id)
+    assert status == 200
+    safe_detail = body["data"]["run"]["detail"]
+    assert safe_detail == {
+        "status": "published", "title": "", "artist": "", "album": "",
+        "quality_actual": "jymaster", "quality_actual_status": "reported",
+        "format": "flac", "cover_status": "embedded", "cover_embedded": True,
+        "lyric_status": "error", "published_sha256": "b" * 64, "published_size": 4321,
+    }
+    response_bytes = client.data
+    for private_value in (
+        b"secrets.flac", b"C:\\\\Users\\\\kurumi", b"server",
+        b"private.flac",
+    ):
+        assert private_value not in response_bytes
+
+    query_client = FakeClient(_job_raw(job.job_id))
+    query_raw = query_client._chunks[0]
+    gw.handle_manual_save_playlist_job(query_client, query_raw, engine=FakeEngine(), deps=deps)
+    query_status, query = _response(query_client)
+    assert query_status == 200
+    assert query["data"]["positions"][0]["detail"] == safe_detail
+    for private_value in (b"secrets.flac", b"server", b"private.flac"):
+        assert private_value not in query_client.data
+
+    connection = sqlite3.connect(tmp_path / "jobs.db")
+    try:
+        persisted = connection.execute(
+            "SELECT detail_json FROM position_details WHERE job_id = ? AND position = 1",
+            (job.job_id,),
+        ).fetchone()[0]
+        for private_value in (
+            b"secrets.flac", b"C:\\\\Users\\\\kurumi", b"server",
+            b"private.flac",
+        ):
+            assert private_value not in persisted
+        assert b"jymaster" in persisted and b"flac" in persisted
+    finally:
+        connection.close()
+
+
+def test_unicode_formatting_and_compatibility_chars_cannot_hide_sensitive_metadata(tmp_path):
+    song_ids = (1901371647, 1901371648, 1901371649, 1901371650, 1901371651, 1901371652)
+    payload = _snapshot_payload(track_ids=song_ids)
+    save_engine = SaveEngine([
+        _published_with_detail(song_ids[0], title="Cookie\u200b: session-secret"),
+        _published_with_detail(song_ids[1], title="Cookie\ufe0f: variation-secret"),
+        _published_with_detail(song_ids[2], artist="曲Cookie: cjk-secret"),
+        _published_with_detail(song_ids[3], album="ｈｔｔｐｓ：／／private.invalid/hidden"),
+        _published_with_detail(song_ids[4], title="/vo\ufe0fl1/1000/private/hidden.flac"),
+        _published_with_detail(
+            song_ids[5], title="SUMMER ADVENTURE", artist="稗田寧々", album="SUMMER ADVENTURE",
+        ),
+    ])
+    _ledger, _service, deps, job = _created_job(
+        tmp_path, payload=payload, save_engine=save_engine,
+    )
+
+    response_bytes = []
+    details = []
+    for _song_id in song_ids:
+        client, status, body = _advance(tmp_path, deps, job_id=job.job_id)
+        assert status == 200
+        response_bytes.append(client.data)
+        details.append(body["data"]["run"]["detail"])
+
+    assert [detail["title"] for detail in details] == [
+        "", "", "歌曲🎵 <img src=x>", "歌曲🎵 <img src=x>", "", "SUMMER ADVENTURE",
+    ]
+    assert [detail["artist"] for detail in details] == [
+        "歌手", "歌手", "", "歌手", "歌手", "稗田寧々",
+    ]
+    assert [detail["album"] for detail in details] == [
+        "专辑", "专辑", "专辑", "", "专辑", "SUMMER ADVENTURE",
+    ]
+    assert all(
+        detail["quality_actual"] == "jymaster"
+        and detail["quality_actual_status"] == "reported"
+        and detail["format"] == "flac"
+        for detail in details
+    )
+
+    database_bytes = b""
+    connection = sqlite3.connect(tmp_path / "jobs.db")
+    try:
+        rows = connection.execute(
+            "SELECT detail_json FROM position_details WHERE job_id = ? ORDER BY position",
+            (job.job_id,),
+        ).fetchall()
+        assert len(rows) == len(song_ids)
+        database_bytes = b"".join(row[0] for row in rows)
+        assert b"jymaster" in database_bytes and b"flac" in database_bytes
+    finally:
+        connection.close()
+
+    query_client = FakeClient(_job_raw(job.job_id))
+    query_raw = query_client._chunks[0]
+    gw.handle_manual_save_playlist_job(query_client, query_raw, engine=FakeEngine(), deps=deps)
+    query_status, query = _response(query_client)
+    assert query_status == 200
+    assert [row["detail"] for row in query["data"]["positions"]] == details
+
+    for evidence in (*response_bytes, query_client.data, database_bytes):
+        for private_value in (
+            b"Cookie", b"session-secret", b"variation-secret", b"cjk-secret",
+            b"private.invalid", b"hidden.flac",
+        ):
+            assert private_value not in evidence
+
+
+def test_advance_published_source_mismatch_is_reconciliation_required(tmp_path):
+    payload = _snapshot_payload(track_ids=(1901371647, 1901371647))
+    save_engine = SaveEngine([_published_with_detail(999)])
+    _ledger, _service, deps, job = _created_job(tmp_path, payload=payload, save_engine=save_engine)
+
+    _client, status, body = _advance(tmp_path, deps, job_id=job.job_id)
+    assert status == 200
+    run = body["data"]["run"]
+    assert run == {
+        "status": "commit_unknown", "disposition": "freeze", "position": 1,
+        "outcome": "commit_unknown", "reason": "commit_unknown", "detail": None,
+    }
+    assert body["data"]["job"]["state"] == "reconciliation_required"
+
+    _retry_client, retry_status, retry_body = _advance(tmp_path, deps, job_id=job.job_id)
+    assert retry_status == 200
+    assert retry_body["data"]["run"]["status"] == "no_work"
+    assert retry_body["data"]["job"]["state"] == "reconciliation_required"
+    assert save_engine.calls == [1901371647]
 
 
 def test_job_query_cross_scope_is_not_found(tmp_path):
@@ -1165,7 +1353,12 @@ def test_advance_completed_published_returns_continue(tmp_path):
         "position": 1,
         "outcome": "published",
         "reason": "bytes_published",
-        "detail": None,
+        "detail": {
+            "status": "published", "title": "", "artist": "", "album": "",
+            "quality_actual": "", "quality_actual_status": "unknown",
+            "format": "unknown", "cover_status": "unknown", "cover_embedded": None,
+            "lyric_status": "unknown",
+        },
     }
     assert body["data"]["job"]["counts"]["published"] == 1
     assert body["data"]["job"]["state"] == "queued"
@@ -1192,6 +1385,40 @@ def test_advance_completed_abort_code_stops_dispatch(tmp_path):
     assert body["data"]["run"]["disposition"] == "abort"
     assert body["data"]["run"]["outcome"] == "failed"
     assert body["data"]["run"]["reason"] == "disabled"
+
+
+def test_advance_after_persisted_abort_returns_explicit_paused(tmp_path):
+    save_engine = SaveEngine([_failure("disabled"), _published()])
+    _ledger, _service, deps, job = _created_job(tmp_path, save_engine=save_engine)
+
+    _first_client, first_status, first_body = _advance(tmp_path, deps, job_id=job.job_id)
+    assert first_status == 200
+    assert first_body["data"]["run"]["status"] == "completed"
+    assert first_body["data"]["run"]["disposition"] == "abort"
+    assert first_body["data"]["job"]["state"] == "paused"
+
+    _retry_client, retry_status, retry_body = _advance(tmp_path, deps, job_id=job.job_id)
+    assert retry_status == 200
+    assert retry_body["ok"] is True
+    assert retry_body["data"]["run"] == {
+        "status": "paused", "disposition": "abort", "position": None,
+        "outcome": None, "reason": None, "detail": None,
+    }
+    assert retry_body["data"]["job"]["state"] == "paused"
+    assert len(save_engine.calls) == 1
+
+
+def test_paused_job_summary_preserves_fixed_state():
+    job = SimpleNamespace(
+        job_id=JOB_ID,
+        state="paused",
+        cancel_requested=False,
+        counts={"queued": 1, "failed": 1},
+        positions=({},),
+        manifest_sha256="a" * 64,
+    )
+    summary = gw._manual_save_playlist_job_summary(job)
+    assert summary["state"] == "paused"
 
 
 def test_advance_commit_unknown_freezes_and_blocks_further_dispatch(tmp_path):
@@ -1715,7 +1942,7 @@ def test_reason_message_table_matches_contract_and_fallback():
 def test_reason_message_rendered_in_job_query(tmp_path):
     save_engine = SaveEngine([
         _failure("download_failed"),
-        _published(),
+        _published(1901371648),
         _failure("staging_unavailable"),
     ])
     _ledger, _service, deps, job = _created_job(tmp_path, save_engine=save_engine)
@@ -1879,7 +2106,12 @@ def test_advance_never_echoes_raw_executor_data(tmp_path):
     _ledger, _service, deps, job = _created_job(tmp_path, save_engine=save_engine)
     client, status, body = _advance(tmp_path, deps, job_id=job.job_id)
     assert status == 200
-    assert body["data"]["run"]["detail"] is None
+    assert body["data"]["run"]["detail"] == {
+        "status": "published", "title": "", "artist": "", "album": "",
+        "quality_actual": "", "quality_actual_status": "unknown",
+        "format": "unknown", "cover_status": "unknown", "cover_embedded": None,
+        "lyric_status": "unknown",
+    }
     rendered = client.data.decode("utf-8", "replace")
     assert SIGNED_URL not in rendered
     assert SECRET_COOKIE not in rendered

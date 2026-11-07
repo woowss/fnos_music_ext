@@ -54,6 +54,7 @@ def _published(song_id=1):
             "cover_embedded": False,
             "published_size": 1300,
             "published_md5": "b" * 32,
+            "published_sha256": "c" * 64,
             "title_status": "tagged",
             "artist_status": "tagged",
             "album_status": "tagged",
@@ -330,11 +331,12 @@ def test_all_published_completes_ok():
         assert item["duplicate_of_position"] is None
         assert item["published_size"] > 0
         assert len(item["published_md5"]) == 32
+        assert len(item["published_sha256"]) == 64
     assert executor.calls == [11, 12, 13]
 
 
 def test_item_field_set_is_exact():
-    assert len(playlist.PLAYLIST_ITEM_FIELDS) == 21
+    assert len(playlist.PLAYLIST_ITEM_FIELDS) == 22
     assert playlist.PLAYLIST_ITEM_FIELDS == (
         "position",
         "song_id",
@@ -353,6 +355,7 @@ def test_item_field_set_is_exact():
         "md5",
         "published_size",
         "published_md5",
+        "published_sha256",
         "cover_status",
         "cover_error",
         "lyric_status",
@@ -382,7 +385,7 @@ def test_item_field_set_is_exact():
     ]
     for item in items:
         assert tuple(item) == playlist.PLAYLIST_ITEM_FIELDS
-        assert len(item) == 21
+        assert len(item) == 22
     assert executor.calls == [1, 2, 3, 4]
 
 
@@ -403,6 +406,7 @@ def test_executor_data_is_whitelisted_and_normalized():
                 "md5": "C" * 32,
                 "published_size": 0,
                 "published_md5": "D" * 32,
+                "published_sha256": "A" * 64,
                 "cover_status": "embedded",
                 "cover_error": "url_invalid",
                 "lyric_status": "published",
@@ -427,6 +431,7 @@ def test_executor_data_is_whitelisted_and_normalized():
                 "md5": 123,
                 "published_size": 5,
                 "published_md5": 123,
+                "published_sha256": 123,
                 "cover_status": ["error"],
                 "cover_error": 456,
                 "lyric_status": 123,
@@ -441,6 +446,7 @@ def test_executor_data_is_whitelisted_and_normalized():
                 "lyric_status": "error",
                 "published_size": 10,
                 "published_md5": "E" * 32,
+                "published_sha256": "E" * 64,
             })
             return envelope
         return _route_failure("download_failed", message="M" * 200)
@@ -463,6 +469,7 @@ def test_executor_data_is_whitelisted_and_normalized():
     assert first["md5"] == "c" * 32
     assert first["published_size"] == 0
     assert first["published_md5"] == "d" * 32
+    assert first["published_sha256"] == ""
     assert first["cover_status"] == "embedded"
     assert first["cover_error"] == ""
     assert first["lyric_status"] == "published"
@@ -477,6 +484,7 @@ def test_executor_data_is_whitelisted_and_normalized():
     assert second["md5"] == ""
     assert second["published_size"] == 5
     assert second["published_md5"] == ""
+    assert second["published_sha256"] == ""
     assert second["cover_status"] == "not_attempted"
     assert second["cover_error"] == ""
     assert second["lyric_status"] == "not_attempted"
@@ -488,6 +496,7 @@ def test_executor_data_is_whitelisted_and_normalized():
     assert third["lyric_status"] == "error"
     assert third["published_size"] == 10
     assert third["published_md5"] == "e" * 32
+    assert third["published_sha256"] == "e" * 64
 
     fourth = items[3]
     assert fourth["status"] == "failed"
