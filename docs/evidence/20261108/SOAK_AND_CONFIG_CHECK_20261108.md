@@ -208,3 +208,41 @@ install -d -m 700 -o root   -g root  /vol1/1000/fnmusic-manual-save-staging
 | 日志 | 服务 0 critical/traceback；容器近 50 行 0 error |
 | 目录/资产 | P7 两目录存在；FPK×4 + SHA256SUMS + 新备份均在；`/vol1` 仍 57% |
 
+## 9. 真实用户视角审查（2026-11-08 16:0x–16:4x JST，Computer Use 实际操作浏览器）
+
+> 方式：用桌面/浏览器实际操作（Edge 已登录 fnOS 管理员 kurumi），从 fnOS 桌面打开「fnMusic 扩展管理」与「音乐」App，按普通用户路径操作。未输入任何密码（「音乐」App 用页面自带「使用 NAS 登录」按钮完成登录）。截图存 `docs/evidence/20261108/screenshots/`。
+
+### 9.1 证明「可用」的部分（实操作验证）
+
+| 用户路径 | 结果 |
+| --- | --- |
+| 桌面打开「fnMusic 扩展管理」 | 概览正常：当前音源「网易云音乐盒子」、musicbox RUNNING、WebUI RUNNING、服务健康（musicbox 正常） |
+| 「大模型」页 | 显示本次修复后的配置：Base URL `https://llm.tantantan.tech/v1`、模型 `deepseek-v4.1-flash`、协议「Chat Completions（/chat/completions）」、Key 掩码显示；用量面板明确标注「最近失败: timeout」与更新时间（截图 `mgmt-llm.png`） |
+| 「保存到 NAS」→ 搜索「晴天」→ 保存第 1 首 | **成功**。提示「音频已保存；实际档位 jymaster·flac·113.3 MB·…\晴天（原唱 周杰伦）.flac…封面已嵌入·歌词已保存为同名 LRC·歌手标签已写入·词：未提供/曲：未提供」；设备核实：FLAC 119,785,613 B、24bit/192kHz、270.7 s + LRC 2,551 B，staging 目录为空（截图 `manual-save-success.png`） |
+| 音乐 App（官方 1.1.19） | 「使用 NAS 登录」可用；侧边栏出现扩展注入的「每日推荐 11-08 / 猜你喜欢 / 热门推荐 / [网易]各榜单」；每日推荐可打开并列出 20 首可播放曲目；**搜索「晴天」返回 89 首（含 `[music box]` 在线源）并可实际播放**，播放器进度/封面正常，歌词页有同步歌词（截图 `music-search-results.png`） |
+| App Center 状态 | 恢复为 `isOpen:true / running / 2.12.0-9`，桌面图标重新出现 |
+
+结论：**本次修复（LLM 配置、P7 目录、回滚资产、开机等待、兼容基线）在真实用户路径上成立**；单曲手动保存链路已端到端打通。
+
+### 9.2 真实用户视角发现的问题（新，按影响排序）
+
+| # | 问题 | 证据 | 建议 |
+| --- | --- | --- | --- |
+| U1（高） | **首次搜索新关键词很慢且没有加载态**：冷缓存 `/music/api/v1/search/track` 实测 **16.0 s**，期间搜索页显示「空空如也」，用户会以为搜索坏了；同一关键词第二次（缓存命中）立即出结果 | proxy.log `ms=16034`；两次搜索截图 | 前端加骨架/加载提示；后端调小 `FNMUSIC_SEARCH_DEEP_MAX_PAGES` / `FNMUSIC_SEARCH_TIMEOUT=15`，或先返回首屏再补全 |
+| U2（中） | **用 `systemctl restart` 启停会让 App Center 记 `APP_CRASH` 并摘掉桌面入口**：15:12:19 记录 APP_CRASH 后 `isOpen:false`、桌面「fnMusic 扩展管理」消失；用 App Center 正常 start 后恢复（已恢复并核实） | TRIMEVENT APP_CRASH；fnos-cli status 前后对比 | 运维约定：只用 App Center / `cmd/main start` 启停；重启后如发现入口消失，执行 `fnos-cli app start fnmusic-ext --yes` 修复 |
+| U3（中，偶发） | 管理页曾显示「无法读取手动保存状态（HTTP 501），请确认正通过飞牛桌面打开管理台」，重启服务后自动恢复，未能稳定复现 | 16:0x 截图（501 首屏） | 管理页对 501 显示「服务正在启动，请刷新重试」并自动重试；`webui_gateway.py` 目前 stdout→/dev/null 无日志，建议加持久日志便于定位 |
+| U4（低） | 「关于」页有红色 NEW 徽标，但 App Center `upgrade=false`（无可用升级入口）；管理页版本 `v2.12.0` 与 App Center `2.12.0-9` 不一致 | 关于页截图 | 版本比较逻辑区分「自编译包」；无可用更新时不显示 NEW |
+| U5（低） | 手动保存写出的文件为 `root:root 0600`：普通用户（kurumi）在文件管理器中能看到目录但**打不开/下载不了**；如目标改为正式曲库，用户后续管理受限 | `ls -l` 目标目录 | 按目标目录属主 chown（或说明仅音乐 App 可读） |
+| U6（低） | 保存结果提示「词：未提供 / 曲：未提供」，未写入作词/作曲标签 | 保存成功提示 | 元数据补全（可选） |
+| U7（低） | 整歌单保存默认关闭，页面提示「请在 .env 设置 FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED=true 后重启代理」——开发者口吻 | 保存页截图 | 在管理页提供开关，或文案改为面向用户 |
+| U8（低） | 搜索「晴天」首条是翻唱（RyaVocal）而非周杰伦原唱；结果标题统一带 `[music box]` 前缀（来源标识对普通用户是噪声） | 搜索截图 | 在线结果排序（原唱/热度优先）；前缀可做成小徽标 |
+| U9（观察） | 播放时用户自己的下载管理器扩展弹出「MP3 File 113.33 MB」下载气泡（拦截媒体流），非项目缺陷，但可能干扰播放体验 | 音乐页顶部气泡 | 文档提示：勿让下载类扩展接管 `/music/api/v1/track/stream` |
+
+### 9.3 操作副作用与回滚说明
+
+- 「音乐」App 登录态：仅用「使用 NAS 登录」，未输入密码；如不需要可退出登录。
+- 手动保存测试：在隔离目录 `/vol1/1000/fnmusic-test-20261031` 新增 1 个 FLAC + 1 个 LRC（`RyaVocal - 晴天 (原唱 周杰伦)`），未触碰正式曲库；如需清理是普通文件删除。
+- 播放器已在测试后暂停。
+- App Center 应用状态已用正常 `start` 恢复；`.env` 与备份对比：**只多出** `FNMUSIC_LLM_TIMEOUT_S`、`FNMUSIC_RECOMMEND_BUDGET_S` 两个键，无键丢失。
+
+
