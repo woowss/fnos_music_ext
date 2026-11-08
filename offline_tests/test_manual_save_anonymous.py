@@ -912,8 +912,12 @@ class AnonymousStoreLinuxTests(unittest.TestCase):
         self.assertEqual(result, core.StoreResult.PUBLISHED)
         published = self.destination / "published.mp3"
         self.assertEqual(published.read_bytes(), payload)
-        self.assertEqual(stat.S_IMODE(published.stat().st_mode), 0o600)
+        # Published artifacts are retagged to the destination directory owner
+        # with mode 0640 so ordinary users can open them (staging stayed 0600).
+        self.assertEqual(stat.S_IMODE(published.stat().st_mode), anonymous.PUBLISHED_FILE_MODE)
+        self.assertEqual(published.stat().st_uid, os.geteuid())
         self.assertEqual(published.stat().st_nlink, 1)
+        self.assertEqual(self.store.last_ownership, anonymous.OWNERSHIP_TAGGED)
         self.assertEqual(tuple(self.staging.iterdir()), ())
         self.store.release_owned_stage(handle)
 

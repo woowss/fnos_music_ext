@@ -232,7 +232,12 @@ class LinuxPosixStoreTests(unittest.TestCase):
         result = self._run(payload=b"exact audio bytes")
         self.assertEqual(result.outcome, core.Outcome.PUBLISHED)
         self.assertEqual((self.destination / "track.mp3").read_bytes(), b"exact audio bytes")
-        self.assertEqual(stat.S_IMODE((self.destination / "track.mp3").stat().st_mode), 0o600)
+        # Published artifacts are retagged to the destination directory owner
+        # with mode 0640 so ordinary users can open them (staging stayed 0600).
+        self.assertEqual(
+            stat.S_IMODE((self.destination / "track.mp3").stat().st_mode),
+            posix.PUBLISHED_FILE_MODE,
+        )
         self.assertEqual(self._stage_names(), ())
         self.assertFalse(result.audio_verified)
         self.assertFalse(result.production_ready)
