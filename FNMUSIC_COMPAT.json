@@ -1,8 +1,9 @@
 {
   "extension_version": "2.12.0-9",
   "music_versions": [
-    "1.0.10"
+    "1.0.10",
+    "1.1.19"
   ],
-  "checked_at": "2026-11-05",
-  "notes": "2026-11-05 20:57 本次正式发布准备期间通过已核实的 SSH 主机身份（StrictHostKeyChecking=yes）只读重新检查官方音乐 /var/apps/trim.music/manifest：appname=trim.music，version=1.0.10，与既有适配基线一致。未修改官方程序、生产配置或曲库；仅记录适配基线，不控制运行时行为。"
+  "checked_at": "2026-11-08",
+  "notes": "2026-11-05 20:57 通过已核实的 SSH 主机身份（StrictHostKeyChecking=yes）只读检查官方音乐 /var/apps/trim.music/manifest：appname=trim.music，version=1.0.10。2026-11-08 装机后复查：官方音乐已升级到 1.1.19（/var/apps/trim.music/manifest mtime 2026-11-07 20:27，早于 11-08 00:10 的扩展安装），2.12.0-9 的安装验收 6a/6b 即在 1.1.19 上通过；逐条核对扩展拦截的 35 条 /music/api/v1 路径，33 条在 1.1.19 二进制中逐字存在，另 2 条参数化 HLS 路径仅基路径存在（路径级兼容）。1.1.19 新增端点（search/tracks/best、search/lyrics/best、track/roam-*、folder-view/*、shared-library/*、user/auth-* 等）按设计直通官方上游、不参与在线源合并。未修改官方程序、生产配置或曲库；仅记录适配基线，不控制运行时行为。"
 }

@@ -203,6 +203,34 @@ def test_put_rejects_zero_provider(env_file):
         assert "至少" in r.json()["error"]
 
 
+def test_put_rejects_llm_protocol_base_url_mismatch(env_file):
+    """协议会自动拼接 /chat/completions 或 /responses；base 已带另一套后缀时必须拒绝。
+
+    回归：2026-11-08 装机后复查发现 protocol=responses + base=…/chat/completions 会实际请求
+    …/chat/completions/responses（404），旧实现不做任何一致性校验。
+    """
+    with authed_client() as client:
+        r = client.put("/api/config", json={"values": {
+            "FNMUSIC_LLM_BASE_URL": "https://api.example/v1/chat/completions",
+            "FNMUSIC_LLM_PROTOCOL": "responses",
+        }})
+        assert r.status_code == 400
+        assert "chat/completions" in r.json()["error"]
+        r = client.put("/api/config", json={"values": {
+            "FNMUSIC_LLM_BASE_URL": "https://api.example/v1/responses",
+            "FNMUSIC_LLM_PROTOCOL": "chat",
+        }})
+        assert r.status_code == 400
+        assert "/responses" in r.json()["error"]
+        # 一致的组合放行（chat + …/v1）
+        r = client.put("/api/config", json={"values": {
+            "FNMUSIC_LLM_BASE_URL": "https://api.example/v1",
+            "FNMUSIC_LLM_PROTOCOL": "chat",
+        }})
+        assert r.status_code == 200
+        assert client.get("/api/config").json()["values"]["FNMUSIC_LLM_BASE_URL"] == "https://api.example/v1"
+
+
 # ------------------------------------------------------------------ 写入语义 ---
 
 def test_put_hot_keys_roundtrip_preserves_custom(env_file):

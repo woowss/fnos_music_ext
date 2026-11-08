@@ -1068,6 +1068,21 @@ def validate_updates(values: dict) -> dict[str, str]:
     # 三选一互斥：以"应用后的最终状态"判断
     final = dict(existing)
     final.update(updates)
+    # LLM 协议与 Base URL 一致性：推荐链路会按协议自动在 base 后拼接 /chat/completions 或
+    # /responses；若 base 已带另一套路径后缀，实际请求会落到 .../chat/completions/responses
+    # 这类不存在的路由（2026-11-08 装机后复查实测 404）。
+    if updates.keys() & {"FNMUSIC_LLM_BASE_URL", "FNMUSIC_LLM_PROTOCOL"}:
+        llm_base = str(final.get("FNMUSIC_LLM_BASE_URL") or "").strip().rstrip("/")
+        llm_proto = str(final.get("FNMUSIC_LLM_PROTOCOL") or "chat").strip().lower()
+        if llm_base:
+            if llm_proto == "responses" and llm_base.endswith("/chat/completions"):
+                raise ValueError(
+                    "接口协议为 responses，但 Base URL 已指向 /chat/completions；"
+                    "请把 Base URL 改成 …/v1，或把协议改为 chat")
+            if llm_proto == "chat" and llm_base.endswith("/responses"):
+                raise ValueError(
+                    "接口协议为 chat，但 Base URL 已指向 /responses；"
+                    "请把 Base URL 改成 …/v1，或把协议改为 responses")
     # 储存目录互斥：缓存目录与下载目录不能相同或互为父子（否则滚动缓存被官方扫描进曲库）
     if updates.keys() & {"FNMUSIC_CACHE_DIR", "FNMUSIC_TEE_SAVE_DIR"}:
         final_cache = _normalize_dir_path("歌曲缓存目录", final.get("FNMUSIC_CACHE_DIR"))

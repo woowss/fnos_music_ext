@@ -318,6 +318,40 @@ def test_failure_sanitization_masks_api_keys(tmp_path, monkeypatch):
     assert len(saved_failure["detail"]) <= 500
 
 
+def test_failure_epoch_timestamp_not_clamped(tmp_path, monkeypatch):
+    """lastFailure.at 是 epoch 秒（当前约 1.79e9）：不能被 token 计数的 _MAX_INT(1e9) 截断。
+
+    回归：历史实现复用 _safe_int，把 2026 年的时间戳压成 1000000000（2001-09-09），
+    导致 healthz / llm_usage.json 展示错误的失败时间。
+    """
+    usage_file = tmp_path / "llm_usage.json"
+    epoch = 1_791_234_567  # 2026-10-xx，大于 _MAX_INT(1_000_000_000)
+    today = llm_usage._today()
+    usage_file.write_text(json.dumps({
+        "version": 2,
+        "timezone": "Asia/Shanghai",
+        "historyIncomplete": False,
+        "statsStartedAt": today,
+        "days": {
+            today: {
+                "prompt": 1,
+                "completion": 1,
+                "total": 2,
+                "requests": 1,
+                "unknownUsageRequests": 0,
+                "lastFailure": {"reason": "http-404", "detail": "", "at": epoch},
+            }
+        },
+    }), encoding="utf-8")
+    monkeypatch.setenv("FNMUSIC_LLM_USAGE_FILE", str(usage_file))
+
+    # 读取路径：_safe_failure 不得把真实 epoch 截断
+    assert llm_usage._safe_failure({"reason": "http-404", "at": epoch})["at"] == epoch
+    assert llm_usage.used_today()["lastFailure"]["at"] == epoch
+    # 越界值仍被保护（2100-01-01 上限）
+    assert llm_usage._safe_failure({"reason": "http-404", "at": 9_999_999_999})["at"] == llm_usage._MAX_TS
+
+
 # ----------------------------------------------------------- 8. 多线程并发写安全 ---
 
 def test_multithreaded_concurrent_recording(tmp_path, monkeypatch):

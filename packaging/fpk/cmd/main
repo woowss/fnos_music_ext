@@ -14,6 +14,26 @@ case "${1:-}" in
     start)
         [ -n "${FNMUSIC_REPO_DIR}" ] || fnmusic_fail "应用文件缺失（install.sh 不存在），请卸载后重新安装"
         [ -f "${FNMUSIC_REPO_DIR}/.env" ] || fnmusic_fail "尚未完成安装配置（.env 缺失），请卸载后重新安装"
+        # 开机自启竞态：App Center 可能在官方「飞牛音乐」创建运行套接字之前调用本脚本，
+        # 此时 extend.sh 的预检会立即失败，在 fnmusic-app.log 留下误导性 ERROR。
+        # 这里先有界等待套接字出现；超时仍走原逻辑，由 extend.sh 输出自己的诊断，
+        # systemd 单元（Restart=on-failure）随后仍会兜底拉起。
+        START_SOCK_WAIT_S="${FNMUSIC_START_SOCKET_WAIT_S:-90}"
+        waited=0
+        if [ ! -S /var/run/trim_music.socket ] && [ ! -S /var/run/trim_music_upstream.socket ]; then
+            echo "[INFO] 等待官方「飞牛音乐」运行套接字就绪（最多 ${START_SOCK_WAIT_S}s）..." >> "${FNMUSIC_LOG}"
+            while [ "${waited}" -lt "${START_SOCK_WAIT_S}" ] \
+                  && [ ! -S /var/run/trim_music.socket ] \
+                  && [ ! -S /var/run/trim_music_upstream.socket ]; do
+                sleep 2
+                waited=$((waited + 2))
+            done
+            if [ -S /var/run/trim_music.socket ] || [ -S /var/run/trim_music_upstream.socket ]; then
+                echo "[INFO] 官方「飞牛音乐」套接字已就绪（等待 ${waited}s）。" >> "${FNMUSIC_LOG}"
+            else
+                echo "[WARN] 等待 ${START_SOCK_WAIT_S}s 后仍未检测到官方音乐套接字，继续交给 extend.sh 预检诊断。" >> "${FNMUSIC_LOG}"
+            fi
+        fi
         # extend.sh is idempotent: ensures the unit exists, starts the proxy and
         # takes over /var/run/trim_music.socket. Non-TTY never prompts.
         if ! bash "${FNMUSIC_REPO_DIR}/extend.sh" >> "${FNMUSIC_LOG}" 2>&1; then

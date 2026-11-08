@@ -24,6 +24,9 @@ _LOCK = threading.Lock()
 
 DEFAULT_DAILY_TOKEN_LIMIT = 1_000_000
 _MAX_INT = 1_000_000_000
+# epoch 秒不能套用 _MAX_INT：当前时间约 1.79e9 > 1e9，会被截断成 2001-09-09。
+# 上限取 2100-01-01（只防异常大值，不改变真实时间戳）。
+_MAX_TS = 4_102_444_800
 _TZ_SHANGHAI = timezone(timedelta(hours=8))
 TIMEZONE_LABEL = "Asia/Shanghai"
 
@@ -69,6 +72,17 @@ def _safe_int(val: object, default: int = 0) -> int:
         return default
 
 
+def _safe_epoch(val: object, default: int = 0) -> int:
+    """epoch 秒的时间戳保护：只拒绝负值与明显越界值，不套用 token 计数的 _MAX_INT。"""
+    try:
+        if val is None:
+            return default
+        v = int(val)
+        return max(0, min(_MAX_TS, v))
+    except (TypeError, ValueError):
+        return default
+
+
 def _safe_failure(val: object) -> dict | None:
     if not isinstance(val, dict):
         return None
@@ -76,7 +90,7 @@ def _safe_failure(val: object) -> dict | None:
     if not reason:
         return None
     detail = _sanitize_failure_text(str(val.get("detail") or ""))
-    at = _safe_int(val.get("at"), int(time.time()))
+    at = _safe_epoch(val.get("at"), int(time.time()))
     return {
         "reason": reason[:80],
         "detail": detail[:500],
