@@ -142,6 +142,7 @@ cat /vol1/@appcenter/fnmusic-ext/repo/FNMUSIC_COMPAT.json
   - `FNMUSIC_LLM_MODEL='deepseek-v4.1-flash'`
   - `FNMUSIC_LLM_API_KEY` = new-api key（写入设备 `.env`，未在文档/日志中出现）
   - `FNMUSIC_LLM_TIMEOUT_S='60'`（原默认 20s 偏短：实测一次 2,204 token 的真实请求耗时 25.26s）
+  - `FNMUSIC_RECOMMEND_BUDGET_S='90'`（原默认 40s；`recommend.py::run_tier` 以剩余预算作 `asyncio.wait_for` 超时，90s 才容得下 25–60s 的 LLM 层；该键为热重载键，proxy.log 记录 `14:53:32 .env 热重载生效: FNMUSIC_RECOMMEND_BUDGET_S`）
 - **变更前备份**：`repo/.env.bak.20261108-143203`（root:root 640）。`.env` 保持 `kurumi:Administrators 640`。
 - **运行态验证**（服务已重启，MainPID 变更）：
   - 子进程环境（`/proc/<uvicorn pid>/environ`）：`FNMUSIC_LLM_BASE_URL=https://llm.tantantan.tech/v1`、`PROTOCOL=chat`、`MODEL=deepseek-v4.1-flash`（`API_KEY` 已设置）。
