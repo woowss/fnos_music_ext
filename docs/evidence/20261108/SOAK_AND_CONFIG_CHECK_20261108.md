@@ -246,3 +246,33 @@ install -d -m 700 -o root   -g root  /vol1/1000/fnmusic-manual-save-staging
 - App Center 应用状态已用正常 `start` 恢复；`.env` 与备份对比：**只多出** `FNMUSIC_LLM_TIMEOUT_S`、`FNMUSIC_RECOMMEND_BUDGET_S` 两个键，无键丢失。
 
 
+
+## 10. 2026-11-08 17:0x–18:1x JST 「尽数修复」记录（对应 §9.2 的 U1–U9）
+
+### 10.1 修复与验证矩阵
+
+| # | 修复内容 | 代码位置 | 设备侧验证 |
+| --- | --- | --- | --- |
+| U1 | 搜索首屏独立预算 `search_first_screen_s`（默认 8s）+ 深页补齐转后台；`search_deep_wait_s`（默认 3s）；`search_deep_max_pages` 默认 10→3 | `proxy/app.py`（`_search_first_screen_budget_s` / `_schedule_deep_fill` / `_fill_deep_pages`） | 新配置已加载（proxy.log `search_first_screen_s = 8.0`、`search_deep_wait_s = 3.0`）；`.env` 的 `FNMUSIC_SEARCH_DEEP_MAX_PAGES` 已改 3 并热重载（`16:53:02 [cfg] search_deep_max_pages=3`）。mock 回归：首查 16.06s → 5.05s，同词二次 0.003s；真实首查耗时待用户下次搜索观察 |
+| U2 | 运维文档：只用 App Center / `cmd/main` 启停；入口丢失的恢复命令 | `docs/INSTALL.md` §9.1 | 本次热更新改走 App Center `stop`/`start`（无 APP_CRASH）；`isOpen:true/running` |
+| U3 | 网关持久日志 `/var/log/apps/fnmusic-ext-gateway.log`（启动/分发/转发异常/异常/权限拒绝，>5MB 轮转）；管理页 501/503 自动重试 2 次 + 「扩展服务正在启动」文案 | `proxy/webui_gateway.py`、`webui-service/static/app.js` | 日志已产生：`gateway-start ...`、`dispatch manual-save op=track ...`（两次保存请求） |
+| U4 | 完整版本 `v2.12.0-9`；只有「官方渠道 + 上游发行包 + 上游版本更高」才提示更新；本地构建显示「本地构建」徽标、隐藏 NEW | `webui-service/app.py`、`static/app.js` | `/api/about.version=v2.12.0-9`；`/api/update-check`：`build_kind=local、has_update=false、latest=2.12.3`；静态 app.js 已含「本地构建」 |
+| U5 | 发布后 best-effort `fchown`(目标目录属主/属组)+`fchmod(0640)`，FLAC/LRC/整歌单同引擎全覆盖；`ownership`/`lyric_ownership` 返回 | `proxy/manual_save_anonymous.py`、`manual_save_posix.py`、`manual_save_route.py` | 实测保存 `Lie - 稻香.mp3/.lrc` → `-rw-r----- kurumi Users`，响应 `ownership=tagged、lyric_ownership=tagged` |
+| U6 | 管理页词曲文案改为「词/曲：上游未提供」；后端从歌词首部解析词曲（/info 显式值优先）并写标签，新增 `credits_source` | `proxy/manual_save_route.py`、`static/app.js` | 实测该曲 `credits_source=upstream_unavailable`（该曲 LRC 开头无词曲行，属上游确实未提供）；写标签路径已就绪 |
+| U7 | `FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED` 进 SCHEMA（bool/group storage），页面注入开关并即时生效；文案去 .env 口吻 | `webui-service/app.py`、`static/app.js` | `/api/config` schema 已返回该键（value=false）；node 测试 199/199 |
+| U8 | 在线结果按标题相关度稳定排序（完全相等→前缀→包含→其它；同级保持上游原序）；保留 `[music box]` 来源前缀 | `proxy/app.py`（`sort_online_items_for_keyword`） | 单元测试覆盖；真机排序效果待用户下次搜索观察（带「(原唱 …)」后缀的翻唱会排在标题完全相等者之后） |
+| U9 | 运维文档提示下载管理器拦截媒体流 | `docs/INSTALL.md` §9.3 | 文档 |
+
+### 10.2 部署与回滚
+
+- 主机侧：`proxy/{app.py,webui_gateway.py,manual_save_anonymous.py,manual_save_posix.py,manual_save_route.py}` 已覆盖到设备 repo（备份 `/vol1/1000/fnmusic-hotfix-20261108-2300/host/`），`py_compile` 通过。
+- 容器侧：`/srv/webui-service/app.py` 与 `static/app.js` 经 `docker cp` 更新并 `supervisorctl restart webui`（备份同目录 `container/`）。设备 repo 的 `webui-service/*` **未改动**（避免触发镜像 fingerprint 重建）；容器重建/升级前该补丁有效，下个 FPK 会正式包含这些修复。
+- 重启方式：App Center `stop` → `start`（无 APP_CRASH，入口正常）；容器与补丁经重启后仍在（`md5sum` 一致）。
+- 回滚：恢复备份文件 + App Center `stop/start`；`.env` 备份 `.env.bak.20261108-1755`。
+
+### 10.3 测试结果（本次修复后）
+
+- `proxy` 定向套件：809 passed, 7 skipped, 2 failed（均为 Windows 缺 `os.O_DIRECTORY` 的环境失败，非本次改动）。
+- `webui-service`：350 passed, 1 failed（Windows 符号链接权限环境问题）；`node test_app_js.js` 199/199。
+- 网关新增测试：日志落盘/自动建目录/不可写路径不抛异常/查询串不入日志。
+- 设备实测：手动保存属主与 0640 正确、网关日志落盘、`/api/about` 与 `/api/update-check` 行为符合预期、SCHEMA 新键生效、搜索新配置热重载生效。
