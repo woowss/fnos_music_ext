@@ -476,6 +476,93 @@ def test_lyric_absent_lyric_is_unavailable(tmp_path):
     assert result["data"]["lyric_status"] == "unavailable"
 
 
+# --------------------------------------------------- credit lines in lyrics --
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        pytest.param("[00:00.000] 作词 : 周杰伦", ("周杰伦", ""), id="timed-space"),
+        pytest.param("[00:00.000] 作词：周杰伦", ("周杰伦", ""), id="fullwidth-colon"),
+        pytest.param("作词：周杰伦", ("周杰伦", ""), id="no-timestamp"),
+        pytest.param("  [00:01.000]  作曲 : 林夕  ", ("", "林夕"), id="ows"),
+        pytest.param("[00:01.00] lyricist: Alex", ("Alex", ""), id="english"),
+        pytest.param("[00:01.00] Composer: Bob", ("", "Bob"), id="english-upper"),
+    ],
+)
+def test_credit_line_parser_accepts_common_forms(line, expected):
+    assert route._credits_from_lyric((line + "\n").encode("utf-8")) == expected
+
+
+def test_credit_line_parser_reads_first_credit_per_role():
+    lyric = (
+        "[00:00.000] 作词 : 甲\n"
+        "[00:01.000] 作曲 : 乙\n"
+        "[00:02.000] 作词 : 丙\n"
+        "[00:10.000] 歌词正文"
+    ).encode("utf-8")
+    assert route._credits_from_lyric(lyric) == ("甲", "乙")
+
+
+def test_credit_line_parser_ignores_plain_lyrics():
+    lyric = (
+        "[00:00.000] 我们作词作曲都不容易\n"
+        "[00:01.000] 词不达意\n"
+        "[00:02.000] 曲终人散\n"
+    ).encode("utf-8")
+    assert route._credits_from_lyric(lyric) == ("", "")
+
+
+def test_credit_line_parser_is_bounded_to_leading_lines():
+    filler = "\n".join(f"[00:{index:02d}.000] 第{index}行歌词" for index in range(80))
+    lyric = (filler + "\n[00:00.000] 作词 : 太晚\n").encode("utf-8")
+    assert route._credits_from_lyric(lyric) == ("", "")
+
+
+def test_credit_line_parser_truncates_long_values():
+    value = "词" * 600
+    lyricist, composer = route._credits_from_lyric(
+        ("[00:00.000] 作词 : " + value + "\n").encode("utf-8"))
+    assert lyricist == value[:route._CREDIT_MAX_CHARS]
+    assert composer == ""
+
+
+@pytest.mark.parametrize(
+    "lyric",
+    [None, b"", "作词 : 甲", 5, ["作词 : 甲".encode("utf-8")]],
+)
+def test_credit_line_parser_rejects_non_bytes_or_missing(lyric):
+    assert route._credits_from_lyric(lyric) == ("", "")
+
+
+def test_credit_line_parser_rejects_undecodable_bytes():
+    assert route._credits_from_lyric(b"\xff\xfe\x00\x00") == ("", "")
+
+
+def test_credit_line_parser_accepts_bytearray():
+    assert route._credits_from_lyric(bytearray("作词：甲".encode("utf-8"))) == ("甲", "")
+
+
+def test_info_credits_are_preferred_over_lyric_credit_lines(tmp_path):
+    def info_http(_url):
+        info = _info_payload()
+        info["data"]["lyricist"] = "信息词"
+        info["data"]["composer"] = ""
+        return info
+
+    deps, _store, _workdir = _pipeline_deps(
+        tmp_path,
+        info=info_http(None),
+        lyric={"ok": True, "data": {
+            "lyric": "[00:00.000] 作词 : 歌词词\n[00:01.000] 作曲 : 歌词曲",
+        }},
+    )
+    result = _save(deps)
+    assert result["ok"] is True
+    assert result["data"]["lyricist"] == "信息词"
+    assert result["data"]["composer"] == "歌词曲"
+    assert result["data"]["credits_source"] == "mixed"
+
+
 def test_info_retry_success_completes_save(tmp_path):
     attempts = []
 

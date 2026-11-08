@@ -868,3 +868,30 @@ def test_serve_reasserts_the_policy_socket_mode(monkeypatch, tmp_path):
     with pytest.raises(KeyboardInterrupt):
         _MOD.serve(sock_path, policy=(frozenset({0}), 0o600))
     assert events == ["bind", 0o600, "listen", "server-close"]
+
+
+def test_gateway_log_writes_fixed_line_and_never_raises(tmp_path, monkeypatch):
+    """网关持久日志：固定文案落盘、自动建目录、不可写路径绝不抛异常。"""
+    log_path = tmp_path / "gateway.log"
+    monkeypatch.setenv(_MOD.GATEWAY_LOG_ENV, str(log_path))
+    monkeypatch.setattr(_MOD, "_gateway_log_disabled", False)
+
+    _MOD.gateway_log("dispatch manual-save op=status path=/app/fnmusic-ext/api/manual-save/status")
+    text = log_path.read_text(encoding="utf-8")
+    assert "manual-save op=status" in text
+    assert "pid=" in text
+
+    nested = tmp_path / "a" / "b" / "gateway.log"
+    monkeypatch.setenv(_MOD.GATEWAY_LOG_ENV, str(nested))
+    _MOD.gateway_log("gateway-start sock=/tmp/x")
+    assert nested.exists()
+
+    monkeypatch.setenv(_MOD.GATEWAY_LOG_ENV, "/proc/definitely/not/writable/gw.log")
+    monkeypatch.setattr(_MOD, "_gateway_log_disabled", False)
+    _MOD.gateway_log("must-not-raise")
+
+
+def test_gateway_log_path_never_contains_query_or_user_data():
+    head = b"GET /app/fnmusic-ext/api/manual-save/search?keyword=secret HTTP/1.1\r\nHost: x\r\n\r\n"
+    assert _MOD._log_path_only(head) == "/app/fnmusic-ext/api/manual-save/search"
+    assert _MOD._log_path_only(b"") == ""

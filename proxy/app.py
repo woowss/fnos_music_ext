@@ -163,9 +163,10 @@ CONF = {
     "search_debounce_s": float(os.environ.get("FNMUSIC_SEARCH_DEBOUNCE_S", "1.0")),
     # 搜索深分页：本地优先布局不变，翻页越过在线首屏池时向音源增量取下一页
     # 把本页在线段填满（直到上游取尽或 deep_max_pages 封顶）。musicdl 库无
-    # 分页参数，深分页只作用于网易/洛雪。
+    # 分页参数，深分页只作用于网易/洛雪。默认 3 轮 ≈ 首屏 + 2 页增量（约 90 条
+    # 在线），足够覆盖"晴天"这类大结果集；10 轮只会在慢上游上放大后台耗时。
     "search_deep_page": os.environ.get("FNMUSIC_SEARCH_DEEP_PAGE", "true").lower() in ("true", "1", "yes"),
-    "search_deep_max_pages": max(1, int(os.environ.get("FNMUSIC_SEARCH_DEEP_MAX_PAGES", "10"))),
+    "search_deep_max_pages": max(1, int(os.environ.get("FNMUSIC_SEARCH_DEEP_MAX_PAGES", "3"))),
     "netease_quality": os.environ.get("FNMUSIC_NETEASE_QUALITY", "lossless"),
     "netease_search_limit": int(os.environ.get("FNMUSIC_NETEASE_SEARCH_LIMIT", "50")),
     "upstream_sock": os.environ.get("FNMUSIC_UPSTREAM_SOCK", "/var/run/trim_music_upstream.socket"),
@@ -243,6 +244,14 @@ CONF = {
     "lx_probe_timeout": float(os.environ.get("LX_PROBE_TIMEOUT", "3.0")),
     "lyric_field": os.environ.get("FNMUSIC_LYRIC_FIELD", "data.lyric"),
     "search_timeout": float(os.environ.get("FNMUSIC_SEARCH_TIMEOUT", "15")),
+    # 深页补齐占用响应的阻塞预算（秒）：超预算就先交已有切片，剩余补齐转后台。
+    # 旧实现固定 min(10, search_timeout)，慢上游首查 = debounce 1s + 首屏 5s +
+    # 深页 10s ≈ 16s（真实用户实测 ms=16034），首屏被深页补齐拖垮。
+    "search_deep_wait_s": max(0.05, float(os.environ.get("FNMUSIC_SEARCH_DEEP_WAIT_S", "3"))),
+    # 首个请求（page=1）最长等待（含 debounce）：到点先返回已有结果，聚合任务
+    # 继续在后台补全并落缓存（同词再次请求直接命中）。默认 8s 对齐"典型首屏
+    # ≤6–8s"目标；小于 search_timeout + debounce 时才生效。
+    "search_first_screen_s": max(0.05, float(os.environ.get("FNMUSIC_SEARCH_FIRST_SCREEN_S", "8"))),
     "search_empty_retry": int(os.environ.get("FNMUSIC_SEARCH_EMPTY_RETRY", "1")),
     "search_empty_retry_delay": float(os.environ.get("FNMUSIC_SEARCH_EMPTY_RETRY_DELAY", "1.2")),
     "search_cache_ttl": float(os.environ.get("FNMUSIC_SEARCH_CACHE_TTL", "604800")),
@@ -561,6 +570,28 @@ def _search_ttl(entry: dict) -> float:
     return min(float(CONF.get("search_cache_ttl", 604800)), 300.0)
 
 
+def _search_deep_wait_budget_s() -> float:
+    """深页补齐阻塞响应的预算：取深页配置与搜索总超时的小值。
+
+    预算内填满就多给几条；到点立即交已有切片，剩余补齐由后台任务继续
+    （首屏不走这里，见 _schedule_deep_fill）。
+    """
+    return min(max(0.05, float(CONF.get("search_deep_wait_s") or 3.0)),
+               max(0.05, float(CONF.get("search_timeout") or 15)))
+
+
+def _search_first_screen_budget_s() -> float:
+    """page=1 的等待预算（含 debounce），超出后先回复、聚合继续后台跑。
+
+    旧逻辑只受 search_timeout + debounce 约束（默认 16s），首屏会被慢音源
+    或深页补齐拖到十几秒；这里给首屏一个独立上限，避免"空空如也"停留过久。
+    """
+    aggregate_budget = (max(0.05, float(CONF.get("search_timeout") or 15))
+                        + max(0.0, float(CONF.get("search_debounce_s") or 0)))
+    return min(aggregate_budget,
+               max(0.05, float(CONF.get("search_first_screen_s") or 8.0)))
+
+
 def _clean_search_cache() -> None:
     now = time.time()
     try:
@@ -608,6 +639,8 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "LX_PROBE_TIMEOUT": ("lx_probe_timeout", "lx_timeout"),
     "FNMUSIC_SEARCH_DEEP_PAGE": ("search_deep_page", "bool"),
     "FNMUSIC_SEARCH_DEEP_MAX_PAGES": ("search_deep_max_pages", "deep_pages"),
+    "FNMUSIC_SEARCH_DEEP_WAIT_S": ("search_deep_wait_s", "seconds"),
+    "FNMUSIC_SEARCH_FIRST_SCREEN_S": ("search_first_screen_s", "seconds"),
     "FNMUSIC_PLAY_QUALITY": ("play_quality", "play_quality"),
     "FNMUSIC_DOWNLOAD_QUALITY": ("download_quality", "download_quality"),
     "FNMUSIC_QUALITY_MODE": ("quality_mode", "quality_mode"),
@@ -1389,6 +1422,44 @@ def deduplicate_online_items(items: list[dict]) -> list[dict]:
             if guid not in {online_guid_from_item(x) for x in alternatives}:
                 alternatives.append({k: v for k, v in item.items() if k != "_alternatives"})
     return result
+
+
+def normalize_search_match_text(value: Any) -> str:
+    """关键词匹配归一：忽略大小写与所有空白（含全角空格）。"""
+    return "".join(str(value or "").casefold().split())
+
+
+def online_result_match_rank(item: dict, keyword: str) -> int:
+    """在线结果与关键词的相关度档位（越小越靠前；同级保持上游原序）。
+
+    0 标题与关键词完全相等（忽略大小写/空白）→ 1 标题以关键词开头 →
+    2 标题包含关键词 → 3 其它。上游没有可靠的热度/播放量字段，不臆造次级
+    排序信号；同级由稳定排序保留聚合顺序（网易 → musicdl → 洛雪 → 深页）。
+    标题是归一化前的原始标题，来源前缀（[music box] 等）在 build_online_track
+    才拼接，不影响档位判定。
+    """
+    normalized_keyword = normalize_search_match_text(keyword)
+    title = normalize_search_match_text(item.get("title") or item.get("name") or "")
+    if not normalized_keyword or not title:
+        return 3
+    if title == normalized_keyword:
+        return 0
+    if title.startswith(normalized_keyword):
+        return 1
+    if normalized_keyword in title:
+        return 2
+    return 3
+
+
+def sort_online_items_for_keyword(items: list[dict], keyword: str) -> list[dict]:
+    """按标题相关度稳定排序在线结果池（去重后、合并前调用）。
+
+    只调整在线池内部顺序：本地官方结果位置、去重代表条目与 _alternatives
+    关系都不变；同级条目保持上游原顺序，避免破坏"去重代表 = 首个出现"约定。
+    """
+    if not keyword or len(items) < 2:
+        return items
+    return sorted(items, key=lambda item: online_result_match_rank(item, keyword))
 
 
 def play_format_from_ext(ext: str | None) -> str:
@@ -5678,11 +5749,17 @@ async def search_track(request: Request):
         entry["task"] = task
     # 在线搜索只有一个超时。有在线条目就立刻回复（本地在前、在线在后）；
     # 到点仍没有，就放弃这次还没回来的结果，只交本地列表。
+    # 首屏（page=1）另有一套更短的等待上限：到点先交已有结果，聚合任务继续
+    # 在后台补全并落缓存（同词再次请求直接命中），避免首屏被慢音源拖到 16s。
     if task and not task.done():
-        budget = max(0.05, float(CONF["search_timeout"])) + max(0.0, float(CONF.get("search_debounce_s") or 0))
+        debounce = max(0.0, float(CONF.get("search_debounce_s") or 0))
+        aggregate_budget = max(0.05, float(CONF["search_timeout"])) + debounce
+        budget = _search_first_screen_budget_s() if page <= 1 else aggregate_budget
+        first_screen_cut = budget < aggregate_budget
         deadline = asyncio.get_running_loop().time() + budget
         entry["waiters"] = entry.get("waiters", 0) + 1
         abandon = False
+        cut_short = False
         try:
             while not task.done() and asyncio.get_running_loop().time() < deadline:
                 if entry.get("items"):
@@ -5692,19 +5769,28 @@ async def search_track(request: Request):
                     break
                 await asyncio.wait({task}, timeout=min(0.05, remaining))
             abandon = not entry.get("items") and not task.done()
+            cut_short = abandon and first_screen_cut
         except asyncio.CancelledError:
             abandon = not entry.get("items")
             raise
         finally:
             entry["waiters"] -= 1
             if abandon and not entry["waiters"]:
-                entry["abandoned"] = True
-                entry["items"] = []
-                entry["partial"] = True
-                entry["ts"] = 0
-                # Cancellation cleanup is not part of the response budget.
-                # New requests replace this round without awaiting task.done().
-                task.cancel()
+                if cut_short:
+                    # 首屏预算用尽但聚合还没交卷：不取消聚合。让首屏结果在后台
+                    # 补全并正常落缓存/时间戳，本次只按已有（本地）结果回复；
+                    # 不碰 items、不设 abandoned，缓存一致性与 scope 隔离不变。
+                    entry["first_screen_timeout"] = True
+                    logger.info("搜索首屏预算用尽先回复: keyword=%r items=%d",
+                                keyword, len(entry.get("items") or []))
+                else:
+                    entry["abandoned"] = True
+                    entry["items"] = []
+                    entry["partial"] = True
+                    entry["ts"] = 0
+                    # Cancellation cleanup is not part of the response budget.
+                    # New requests replace this round without awaiting task.done().
+                    task.cancel()
     local_list = ensure_search_list(upstream_json)
     local_keys = {(title_from_track(x), artist_from_track(x)) for x in local_list}
     total_online = sum(1 for x in entry["items"] if (title_from_track(x), artist_from_track(x)) not in local_keys)
@@ -5724,10 +5810,15 @@ async def search_track(request: Request):
         local_list[:] = local_list[win_start:win_start + size]
     # 深分页：本页在线段末尾越过在线池时，向未取尽的源增量取下一页填满本页
     # （本地优先布局不变）。池增长后 total_online 需按新池重算。
+    # 首屏（page=1）不再阻塞等深页：只等第一页在线结果就回复，剩余补齐交给
+    # 后台任务（_schedule_deep_fill）；翻页页仍在小预算内阻塞等待。
     if CONF.get("search_deep_page"):
         need_end = max(0, page * size - original_total)
         if need_end > len(entry["items"]):
-            await _wait_deep_pages(request, keyword, entry, need_end)
+            if page <= 1:
+                _schedule_deep_fill(request, keyword, entry, need_end)
+            else:
+                await _wait_deep_pages(request, keyword, entry, need_end)
             total_online = sum(1 for x in entry["items"] if (title_from_track(x), artist_from_track(x)) not in local_keys)
     # 本地优先全局布局：本地条目占据全局前 local_total 位，在线条目紧随其后。
     # 本页在线切片 = 全局分页区间与在线区间的交集；纯本地页（区间未触及在线段）
@@ -5804,7 +5895,10 @@ async def _aggregate_search(request: Request, keyword: str, entry: dict) -> None
                     ordered = [item for source_task in tasks for item in results.get(source_task, [])]
                 else:
                     ordered = entry["items"] + items
-                entry["items"] = deduplicate_online_items(ordered)[:2000]
+                # 在线池写回处统一按关键词相关度稳定排序（U8）：本地官方结果
+                # 在 merge 时仍排最前，这里只影响在线段内部顺序。
+                entry["items"] = sort_online_items_for_keyword(
+                    deduplicate_online_items(ordered)[:2000], keyword)
             if (not pending and not entry["items"] and failed
                     and not entry.get("abandoned") and not _user_search_stale(entry, scope)
                     and retries < max(0, min(1, int(CONF.get("search_empty_retry", 1))))):
@@ -5854,8 +5948,9 @@ def _online_window(entry: dict, page: int, size: int, local_total: int) -> list[
 
     全局布局：[本地 0..local_total) [在线 local_total..local_total+len(items))。
     本页全局区间 = [(page-1)*size, page*size)；与在线段求交集后映射到 items 下标。
-    items 只追加不重排，同一 (page,size,local_total) 的切片稳定；items 后续
-    增长只会让更靠后的页多出条目（已返回页的前缀不动）。
+    在线池按关键词相关度稳定排序（U8）：同档条目保持上游原序，池只增长时
+    同档新条目追加在同档尾部，因此同 (page,size,local_total) 的切片对已返回
+    页的前缀基本稳定；更相关的新条目（rank 更高）会前插，属已知分页取舍。
     """
     start_global = (page - 1) * size
     end_global = page * size
@@ -5869,7 +5964,7 @@ def _online_window(entry: dict, page: int, size: int, local_total: int) -> list[
 
 def _deep_sources_available(entry: dict) -> bool:
     """深分页是否还有可取的源：启用且未取尽，且未达 max_pages 封顶。"""
-    if int(entry.get("deep_round") or 1) >= max(1, int(CONF.get("search_deep_max_pages") or 10)):
+    if int(entry.get("deep_round") or 1) >= max(1, int(CONF.get("search_deep_max_pages") or 3)):
         return False
     exhausted = entry.get("exhausted") or set()
     for name in ("netease", "lx"):
@@ -5881,7 +5976,7 @@ def _deep_sources_available(entry: dict) -> bool:
 async def _extend_search(request: Request, keyword: str, entry: dict) -> None:
     """深分页增量取页：向未取尽的在线源取下一页并追加进在线池。
 
-    只追加不重排（_online_window 的前缀稳定承诺）。取尽判定：某源本轮
+    写回时按关键词相关度稳定排序（同级保持既有顺序）；取尽判定：某源本轮
     返回空列表，或去重后对池 0 新增（上游开始重复自身）。musicdl 库无
     分页参数，不参与深分页。绕过代理侧取消门——翻页是用户主动行为；
     lx 请求仍带 scope 头，lx 服务端的同词取消门自然生效。
@@ -5890,7 +5985,7 @@ async def _extend_search(request: Request, keyword: str, entry: dict) -> None:
     round_no = int(entry.get("deep_round") or 1)
     if _user_search_stale(entry, scope):
         return
-    if round_no >= max(1, int(CONF.get("search_deep_max_pages") or 10)):
+    if round_no >= max(1, int(CONF.get("search_deep_max_pages") or 3)):
         entry.setdefault("exhausted", set()).update({"netease", "lx"})
         return
     token = _FETCH_SCOPE.set(scope)
@@ -5936,7 +6031,10 @@ async def _extend_search(request: Request, keyword: str, entry: dict) -> None:
             # 该源成功获取新数据，推进该源的独立游标
             cursors[name] = cursors.get(name, 1) + 1
 
-            merged = deduplicate_online_items(merged + items)[:2000]
+            # 增量写回同样按相关度稳定排序，保证深页补进来的标题命中不会
+            # 沉到池尾（同级保持既有顺序，分页前缀尽量稳定）。
+            merged = sort_online_items_for_keyword(
+                deduplicate_online_items(merged + items)[:2000], keyword)
 
         if len(merged) >= 2000:
             exhausted.update({"netease", "lx"})
@@ -5951,41 +6049,87 @@ async def _extend_search(request: Request, keyword: str, entry: dict) -> None:
         _FETCH_SCOPE.reset(token)
 
 
-async def _wait_deep_pages(request: Request, keyword: str, entry: dict, need_end: int) -> None:
-    """确保在线池覆盖到 need_end：创建/加入增量任务并在预算内等待填满。
+def _deep_fill_budget_s() -> float:
+    """后台深页补齐预算（秒）：不占用响应，给足时间取完剩余页（max_pages 封顶）。"""
+    return max(5.0, float(CONF.get("search_timeout") or 15))
 
-    到点没填满就交现有切片（短页自愈：total 仍大于客户端已见条数，下次
-    翻页会再次触发）。首屏聚合仍在跑时先等它交卷，避免增量页与首屏页
-    乱序（聚合的最后写回会覆盖增量结果）。
+
+async def _fill_deep_pages(request: Request, keyword: str, entry: dict, need_end: int,
+                           budget: float) -> None:
+    """后台把在线池补齐到 need_end：循环增量取页，不阻塞当前响应。
+
+    与翻页等待共用 entry["extend_task"] 槽位：翻页/预取请求可直接等待同一个
+    任务，不会并发重复取页。取页本身仍走 _extend_search（scope 隔离、取尽
+    判定、相关度稳定排序都在原处）。
+    """
+    scope = entry.get("credentials") or _credential_scope(request)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.05, budget)
+    try:
+        while len(entry.get("items") or []) < need_end and _deep_sources_available(entry):
+            if loop.time() >= deadline or _user_search_stale(entry, scope):
+                break
+            if not entry.get("items"):
+                # 首屏池还空：深取第 2 页会留下永久空洞，等聚合写回首屏再做
+                break
+            await _extend_search(request, keyword, entry)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        logger.warning("deep page fill failed for %r: %s", keyword, e)
+
+
+def _ensure_deep_fill(request: Request, keyword: str, entry: dict, need_end: int) -> asyncio.Task | None:
+    """确保有一个后台补齐任务指向 need_end；已有在跑的任务直接复用。"""
+    if need_end <= len(entry.get("items") or []):
+        return None
+    if not entry.get("items") or not _deep_sources_available(entry):
+        return None
+    task = entry.get("extend_task")
+    if task and not task.done():
+        return task
+    task = asyncio.create_task(
+        _fill_deep_pages(request, keyword, entry, need_end, _deep_fill_budget_s()))
+    entry["extend_task"] = task
+    return task
+
+
+async def _wait_deep_pages(request: Request, keyword: str, entry: dict, need_end: int) -> None:
+    """翻页时确保在线池覆盖到 need_end：只在预算内阻塞等待，到点交现有切片。
+
+    到点没填满就把剩余补齐交给后台任务继续（短页自愈：total 仍大于客户端
+    已见条数，下次翻页会再次触发）。首屏不走这里（见 _schedule_deep_fill）。
+    首屏聚合仍在跑时先在预算内等它交卷，避免增量页与首屏页乱序。
     """
     if not entry.get("items"):
         # 首屏池还空（聚合被放弃/超时）：深取第 2 页会留下永久空洞，不做
         return
+    loop = asyncio.get_running_loop()
+    budget = _search_deep_wait_budget_s()
+    deadline = loop.time() + budget
     agg = entry.get("task")
     if agg and not agg.done():
-        await asyncio.wait({agg}, timeout=min(10.0, max(0.05, float(CONF["search_timeout"]))))
-    deadline = asyncio.get_running_loop().time() + min(10.0, max(0.05, float(CONF["search_timeout"])))
-    while len(entry["items"]) < need_end and _deep_sources_available(entry):
-        task = entry.get("extend_task")
-        if not task or task.done():
-            task = asyncio.create_task(_extend_search(request, keyword, entry))
-            entry["extend_task"] = task
-        remaining = deadline - asyncio.get_running_loop().time()
+        await asyncio.wait({agg}, timeout=budget)
+    task = _ensure_deep_fill(request, keyword, entry, need_end)
+    while task and not task.done() and len(entry.get("items") or []) < need_end:
+        remaining = deadline - loop.time()
         if remaining <= 0:
             break
         await asyncio.wait({task}, timeout=min(0.05, remaining))
+        task = entry.get("extend_task")
+    if len(entry.get("items") or []) < need_end:
+        # 阻塞预算到点：剩余补齐转后台，本次先交现有切片
+        _ensure_deep_fill(request, keyword, entry, need_end)
+
+
+def _schedule_deep_fill(request: Request, keyword: str, entry: dict, need_end: int) -> None:
+    """首屏不等深页：把当前页需要的在线段补齐交给后台任务。"""
+    _ensure_deep_fill(request, keyword, entry, need_end)
 
 
 def _schedule_deep_prefetch(request: Request, keyword: str, entry: dict, next_need: int) -> None:
-    """预取：下一页的在线段未填满且源未取尽时后台先取一轮，连续翻页零等待。"""
-    if not entry.get("items") or next_need <= len(entry["items"]):
-        return
-    if not _deep_sources_available(entry):
-        return
-    task = entry.get("extend_task")
-    if task and not task.done():
-        return
-    entry["extend_task"] = asyncio.create_task(_extend_search(request, keyword, entry))
+    """预取：下一页的在线段未填满且源未取尽时后台先补，连续翻页零等待。"""
+    _ensure_deep_fill(request, keyword, entry, next_need)
 
 
 @app.get("/music/api/v1/search/suggest")

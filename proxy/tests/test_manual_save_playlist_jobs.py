@@ -385,6 +385,25 @@ def test_executor_passes_only_the_numeric_source_id_without_deps():
     assert result.save_response == _published(1901371647)
 
 
+def test_executor_accepts_ownership_and_credits_fields_from_route():
+    """Playlist jobs reuse the same engine: ownership/credits never change mapping."""
+    envelope = _published_with_details(
+        1901371647,
+        ownership="tagged",
+        lyric_ownership="unavailable",
+        credits_source="lyric",
+    )
+    engine = FakeEngine({1901371647: envelope})
+    result = adapter.make_executor(engine)(_position(), lambda: False)
+    assert (result.result.outcome, result.result.reason) == (
+        manual_save_core.Outcome.PUBLISHED, "bytes_published",
+    )
+    assert result.result.cleanup_pending is False
+    assert result.save_response["data"]["ownership"] == "tagged"
+    assert result.save_response["data"]["lyric_ownership"] == "unavailable"
+    assert result.save_response["data"]["credits_source"] == "lyric"
+
+
 @pytest.mark.parametrize("source_status", ["invalid_id", "unavailable", "missing"])
 def test_executor_never_calls_engine_for_non_ok_source_status(source_status):
     engine = FakeEngine({1901371647: _published(1901371647)})

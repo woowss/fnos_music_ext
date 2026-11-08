@@ -4,6 +4,11 @@ This module does not authenticate callers, authorize a destination, acquire or
 inspect audio, resolve paths, recover abandoned stages, or enable a save route.
 Callers must provide already-open directory descriptors. It is not a production
 adapter and is intentionally not imported by application code.
+
+Staging is always 0600. After a confirmed no-replace publication the visible
+inode is retagged, best effort, to the destination directory's owner/group with
+mode 0640 (:data:`PUBLISHED_FILE_MODE`); a denied chown/chmod is reported about
+the published stage as ownership ``unavailable`` and never fails the save.
 """
 
 from __future__ import annotations
@@ -22,6 +27,13 @@ from proxy import manual_save_core as core
 
 _STAGE_PREFIX: Final = ".fnmusic-offline-stage-"
 _STAGE_ATTEMPTS: Final = 16
+
+# Published artifacts must be usable by the fnOS directory owner, not only by
+# the (root) service account that publishes them: owner/group are copied from
+# the destination directory and the mode is 0640 (owner rw, group r).
+PUBLISHED_FILE_MODE: Final = 0o640
+OWNERSHIP_TAGGED: Final = "tagged"
+OWNERSHIP_UNAVAILABLE: Final = "unavailable"
 
 
 class UnsupportedPosixStore(RuntimeError):
@@ -42,6 +54,7 @@ class _Stage:
     publication_attempted: bool = False
     link_created: bool = False
     publication_confirmed: bool = False
+    ownership: str = ""
 
 
 def _require_linux_primitives() -> None:
@@ -74,6 +87,66 @@ def _directory_stat(fd: int, label: str) -> os.stat_result:
     if not stat.S_ISDIR(result.st_mode):
         raise InvalidPosixStore(f"{label}_not_directory")
     return result
+
+
+def _tag_published_ownership(
+    fd: int,
+    uid: int,
+    gid: int,
+    *,
+    mode: int = PUBLISHED_FILE_MODE,
+    fchown=None,
+    fchmod=None,
+    fstat=None,
+) -> str:
+    """Best-effort owner/group/mode tagging for one published inode.
+
+    Mirrors the production anonymous-store behaviour for this offline candidate:
+    after a confirmed no-replace publication the visible inode is retagged to
+    the destination directory's owner/group with mode 0640. Any denied
+    chown/chmod is reported as ``OWNERSHIP_UNAVAILABLE`` and never fails the
+    publication. Defaults resolve at call time so synthetic tests can exercise
+    each branch without a privileged host.
+    """
+    chown_fn = getattr(os, "fchown", None) if fchown is None else fchown
+    chmod_fn = getattr(os, "fchmod", None) if fchmod is None else fchmod
+    stat_fn = getattr(os, "fstat", None) if fstat is None else fstat
+
+    owner_ok = False
+    if callable(chown_fn):
+        try:
+            chown_fn(fd, uid, gid)
+        except OSError:
+            owner_ok = False
+        else:
+            owner_ok = True
+
+    mode_ok = False
+    if callable(chmod_fn):
+        try:
+            chmod_fn(fd, mode)
+        except (OSError, TypeError):
+            mode_ok = False
+        else:
+            mode_ok = True
+
+    if not owner_ok or not mode_ok or not callable(stat_fn):
+        return OWNERSHIP_UNAVAILABLE
+    try:
+        info = stat_fn(fd)
+    except OSError:
+        return OWNERSHIP_UNAVAILABLE
+    if (
+        info.st_uid != uid
+        or info.st_gid != gid
+        or stat.S_IMODE(info.st_mode) != mode
+    ):
+        return OWNERSHIP_UNAVAILABLE
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    return OWNERSHIP_TAGGED
 
 
 def _safe_basename(value: object) -> str:
@@ -144,9 +217,19 @@ class OfflineLinuxStore:
         self._staging_fd = staging_copy
         self._staging_device = staging_info.st_dev
         self._effective_uid = effective_uid
+        # Published artifacts are retagged to these, never wider.
+        self._destination_uid = destination_info.st_uid
+        self._destination_gid = destination_info.st_gid
+        self._last_ownership = ""
         self._stages: dict[object, _Stage] = {}
         self._lock = threading.RLock()
         self._closed = False
+
+    @property
+    def last_ownership(self) -> str:
+        """Ownership-tagging outcome of the most recently published inode."""
+        with self._lock:
+            return self._last_ownership
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -173,7 +256,11 @@ class OfflineLinuxStore:
             raise RuntimeError("stage_descriptor_changed")
         if (entry_info.st_dev, entry_info.st_ino) != expected:
             raise RuntimeError("stage_entry_changed")
-        if not stat.S_ISREG(entry_info.st_mode) or entry_info.st_uid != self._effective_uid:
+        if not stat.S_ISREG(entry_info.st_mode):
+            raise RuntimeError("stage_entry_not_owned_regular_file")
+        if not stage.publication_confirmed and entry_info.st_uid != self._effective_uid:
+            # Unpublished staging must stay service-user owned. A confirmed
+            # publication is intentionally retagged to the destination owner.
             raise RuntimeError("stage_entry_not_owned_regular_file")
         return entry_info
 
@@ -285,6 +372,17 @@ class OfflineLinuxStore:
                 # for reconciliation; never retry or roll back the final name.
                 raise RuntimeError("publication_unknown") from None
             stage.publication_confirmed = True
+            # The final name is confirmed; only now may the inode be retagged.
+            # This is advisory for the caller and must never undo the commit.
+            try:
+                stage.ownership = _tag_published_ownership(
+                    stage.fd,
+                    self._destination_uid,
+                    self._destination_gid,
+                )
+            except Exception:  # noqa: BLE001 - tagging can never fail a save
+                stage.ownership = OWNERSHIP_UNAVAILABLE
+            self._last_ownership = stage.ownership
             return core.StoreResult.PUBLISHED
 
     def _remove_owned_stage(self, handle: object, *, published: bool) -> None:

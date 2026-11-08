@@ -172,6 +172,47 @@ def test_config_view_defaults_tee_save_on_when_key_is_missing(env_file):
         assert body["schema"]["FNMUSIC_TEE_SAVE_ENABLED"]["default"] == "true"
 
 
+def test_config_schema_exposes_playlist_save_switch(env_file):
+    """U7：整歌单保存开关进 Schema，管理页才能自动渲染开关。"""
+    with authed_client() as client:
+        body = client.get("/api/config").json()
+    spec = body["schema"]["FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED"]
+    assert spec["kind"] == "bool"
+    assert spec["default"] == "false"
+    assert spec["group"] == "storage"
+    assert spec["reload"] == "hot"  # 宿主网关每次请求重读 .env，保存即生效
+    assert body["values"]["FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED"] == "false"
+
+
+def test_playlist_save_switch_round_trip(env_file):
+    """保存/读取 round-trip：PUT 后 .env 与 GET 都反映新值，再改回 false。"""
+    with authed_client() as client:
+        r = client.put("/api/config", json={
+            "values": {"FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED": True}})
+        assert r.status_code == 200
+        assert r.json()["changed"] == ["FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED"]
+        assert "FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED='true'" in env_file.read_text(encoding="utf-8")
+        assert client.get("/api/config").json()["values"][
+            "FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED"] == "true"
+
+        r = client.put("/api/config", json={
+            "values": {"FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED": False}})
+        assert r.status_code == 200
+        assert "FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED='false'" in env_file.read_text(encoding="utf-8")
+        assert client.get("/api/config").json()["values"][
+            "FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED"] == "false"
+
+
+def test_playlist_save_switch_accepts_truthy_strings(env_file):
+    """bool 归一化沿用 _normalize_value 的既有 true/1/yes/on 语义。"""
+    with authed_client() as client:
+        r = client.put("/api/config", json={
+            "values": {"FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED": "on"}})
+        assert r.status_code == 200
+        assert client.get("/api/config").json()["values"][
+            "FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED"] == "true"
+
+
 # ------------------------------------------------------------------ PUT 校验 ---
 
 def test_put_rejects_unknown_key(env_file):
@@ -2858,10 +2899,11 @@ def update_cache_clean():
 
 
 @pytest.mark.parametrize("version,channel,display", [
-    ("2.11.0-4", "stable", "v2.11.0"),
-    ("2.11.0-4", "prerelease", "v2.11.0e"),
-    ("2.11.0-0", "prerelease", "v2.11.0a"),
-    ("2.11.0-1", "prerelease", "v2.11.0b"),
+    # 管理页展示完整安装包版本（含 -N 构建号），与 App Center 的包版本一致
+    ("2.11.0-4", "stable", "v2.11.0-4"),
+    ("2.11.0-4", "prerelease", "v2.11.0-4"),
+    ("2.11.0-0", "prerelease", "v2.11.0-0"),
+    ("2.11.0-1", "prerelease", "v2.11.0-1"),
     ("2.11.0", None, "v2.11.0"),
     ("2.10.0b", None, "v2.10.0b"),
 ])
@@ -2873,6 +2915,50 @@ def test_webui_derives_display_version(env_file, tmp_path, monkeypatch, version,
     monkeypatch.setattr(webui, "VERSION_PATH", path)
     with authed_client() as client:
         assert client.get("/api/about").json()["version"] == display
+
+
+def test_version_info_distinguishes_official_and_local_build(tmp_path, monkeypatch):
+    """官方渠道 + 官方发行格式才不是本地构建；缺失/非法通道、怪后缀都算本地构建。"""
+    path = tmp_path / "VERSION"
+    channel_path = path.with_name("RELEASE_CHANNEL")
+
+    def info_for(version, channel=None):
+        path.write_text(version, encoding="utf-8")
+        if channel is None:
+            channel_path.unlink(missing_ok=True)
+        else:
+            channel_path.write_text(channel, encoding="utf-8")
+        monkeypatch.setattr(webui, "VERSION_PATH", path)
+        return webui._version_info()
+
+    stable = info_for("2.12.0-9", "stable")
+    assert stable["version"] == "2.12.0-9"
+    assert stable["display_version"] == "v2.12.0-9"
+    assert stable["ui_version"] == "v2.12.0"
+    assert stable["official_channel"] is True
+    assert stable["local_build"] is False
+    assert stable["reason"] == ""
+
+    prerelease = info_for("2.11.0-4", "prerelease")
+    assert prerelease["display_version"] == "v2.11.0-4"
+    assert prerelease["ui_version"] == "v2.11.0e"
+    assert prerelease["official_channel"] is True
+
+    missing_channel = info_for("2.12.0-9", None)
+    assert missing_channel["local_build"] is True
+    assert missing_channel["official_channel"] is False
+    assert missing_channel["channel"] is None
+    assert "RELEASE_CHANNEL" in missing_channel["reason"]
+
+    illegal_channel = info_for("2.12.0-9", "local")
+    assert illegal_channel["channel"] is None
+    assert illegal_channel["local_build"] is True
+
+    git_describe = info_for("2.12.0-9-gabc1234", "stable")
+    assert git_describe["display_version"] == "v2.12.0-9-gabc1234"
+    assert git_describe["official_channel"] is False
+    assert git_describe["local_build"] is True
+    assert "格式" in git_describe["reason"]
 
 
 def test_version_newer():
@@ -2894,21 +2980,60 @@ def test_version_newer():
     assert not webui._version_newer("abc", "2.8.3")
 
 
-def test_update_check_github_first(env_file, update_cache_clean):
-    paths = []
+def _fpk_assets(*versions):
+    assets = []
+    for version in versions:
+        assets.append({"name": f"fnmusic-ext-{version}.fpk"})
+        assets.append({"name": f"fnmusic-ext-{version}.fpk.sha256"})
+    return assets
+
+
+# 上游发行版列表（附件名即官方安装包版本）：本地 2.0.0-0 是官方发行产物
+RELEASES_INDEX = [
+    {"tag_name": "v2.9.0", "name": "fnmusic-ext 2.9.0", "assets": _fpk_assets("2.9.0-0")},
+    {"tag_name": "v2.0.0", "name": "fnmusic-ext 2.0.0", "assets": _fpk_assets("2.0.0-0")},
+]
+GT_RELEASES_INDEX = [
+    {"tag_name": "v2.9.0", "name": "fnmusic-ext 2.9.0", "assets": _fpk_assets("2.9.0-0")},
+    {"tag_name": "v2.0.0", "name": "fnmusic-ext 2.0.0", "assets": _fpk_assets("2.0.0-0")},
+]
+
+
+@pytest.fixture
+def official_env(env_file):
+    """官方渠道安装：显式 stable 通道 + 上游发行过的安装包版本。"""
+    root = env_file.parent
+    (root / "VERSION").write_text("2.0.0-0\n", encoding="utf-8")
+    (root / "RELEASE_CHANNEL").write_text("stable\n", encoding="utf-8")
+    return env_file
+
+
+def _latest_and_index_handler(paths, *, latest=GH_RELEASE, index=None):
+    """双源共用：latest 返回发行信息，其余路径返回发行版列表。"""
+    releases = RELEASES_INDEX if index is None else index
 
     def handler(request: httpx.Request) -> httpx.Response:
         paths.append(str(request.url))
-        return httpx.Response(200, json=GH_RELEASE)
+        if request.url.path.endswith("/releases/latest"):
+            return httpx.Response(200, json=latest)
+        return httpx.Response(200, json=releases)
+
+    return handler
+
+
+def test_update_check_github_first(official_env, update_cache_clean):
+    paths = []
 
     with authed_client() as client:
-        _mock_http(handler)
+        _mock_http(_latest_and_index_handler(paths))
         r = client.get("/api/update-check")
     assert r.status_code == 200
     rj = r.json()
     assert rj["ok"] is True
     assert rj["source"] == "github"
-    assert rj["current_version"] == "v2.0.0"
+    assert rj["current_version"] == "v2.0.0-0"
+    assert rj["channel"] == "stable"
+    assert rj["build_kind"] == "official"
     assert rj["has_update"] is True
     assert rj["latest"]["version"] == "2.9.0"
     assert rj["latest"]["html_url"] == GH_RELEASE["html_url"]
@@ -2917,36 +3042,46 @@ def test_update_check_github_first(env_file, update_cache_clean):
     assert "热门推荐播放失败" in rj["latest"]["changelog"]
     assert "[issue #49]" not in rj["latest"]["changelog"]
     assert "issue #49" in rj["latest"]["changelog"]
-    # GitHub 命中即不再请求 Gitee
-    assert paths == [webui.UPDATE_SOURCES[0]["api"]]
+    # GitHub 命中即不再请求 Gitee；官方渠道需再取一次发行版列表确认安装包来源
+    assert paths[0] == webui.UPDATE_SOURCES[0]["api"]
+    assert len(paths) == 2
+    assert paths[1].startswith(webui.UPDATE_SOURCES[0]["list_api"])
+    assert "per_page=100" in paths[1]
 
 
-def test_update_check_gitee_fallback_on_403(env_file, update_cache_clean):
+def test_update_check_gitee_fallback_on_403(official_env, update_cache_clean):
     calls = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(str(request.url))
         if "api.github.com" in str(request.url):
             return httpx.Response(403, json={"message": "rate limit"})
-        return httpx.Response(200, json=GT_RELEASE)
+        if request.url.path.endswith("/releases/latest"):
+            return httpx.Response(200, json=GT_RELEASE)
+        return httpx.Response(200, json=GT_RELEASES_INDEX)
 
     with authed_client() as client:
         _mock_http(handler)
         rj = client.get("/api/update-check").json()
     assert rj["source"] == "gitee"
+    assert rj["build_kind"] == "official"
     assert rj["has_update"] is True
     assert rj["latest"]["version"] == "2.9.0"
     # gitee 响应无 html_url/published_at：按 tag 构造发行版页，时间取 created_at
     assert rj["latest"]["html_url"] == "https://gitee.com/javycoder/fnos_music_ext/releases/tag/v2.9.0"
     assert rj["latest"]["published_at"] == "2026-10-11T08:00:00+08:00"
-    assert calls == [webui.UPDATE_SOURCES[0]["api"], webui.UPDATE_SOURCES[1]["api"]]
+    assert calls[0] == webui.UPDATE_SOURCES[0]["api"]
+    assert calls[1] == webui.UPDATE_SOURCES[1]["api"]
+    assert calls[2].startswith(webui.UPDATE_SOURCES[1]["list_api"])
 
 
-def test_update_check_gitee_fallback_on_network_error(env_file, update_cache_clean):
+def test_update_check_gitee_fallback_on_network_error(official_env, update_cache_clean):
     def handler(request: httpx.Request) -> httpx.Response:
         if "api.github.com" in str(request.url):
             raise httpx.ConnectError("connection reset")
-        return httpx.Response(200, json=GT_RELEASE)
+        if request.url.path.endswith("/releases/latest"):
+            return httpx.Response(200, json=GT_RELEASE)
+        return httpx.Response(200, json=GT_RELEASES_INDEX)
 
     with authed_client() as client:
         _mock_http(handler)
@@ -2955,7 +3090,7 @@ def test_update_check_gitee_fallback_on_network_error(env_file, update_cache_cle
     assert rj["has_update"] is True
 
 
-def test_update_check_both_fail_degrades(env_file, update_cache_clean):
+def test_update_check_both_fail_degrades(official_env, update_cache_clean):
     calls = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -2969,45 +3104,49 @@ def test_update_check_both_fail_degrades(env_file, update_cache_clean):
     rj = r.json()
     assert rj["ok"] is True
     assert rj["has_update"] is False
+    assert rj["build_kind"] == "unknown"  # 无法确认发行来源 → fail-closed 不提示更新
     assert "github" in rj["error"] and "gitee" in rj["error"]
     # 失败负缓存生效：缓存期内重复请求不再出网
     client.get("/api/update-check")
     assert len(calls) == 2
 
 
-def test_update_check_success_cached_no_refetch(env_file, update_cache_clean):
+def test_update_check_success_cached_no_refetch(official_env, update_cache_clean):
     calls = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(str(request.url))
-        return httpx.Response(200, json=GH_RELEASE)
+        if request.url.path.endswith("/releases/latest"):
+            return httpx.Response(200, json=GH_RELEASE)
+        return httpx.Response(200, json=RELEASES_INDEX)
 
     with authed_client() as client:
         _mock_http(handler)
         client.get("/api/update-check")
         client.get("/api/update-check")
-    assert len(calls) == 1  # 成功缓存 6h，第二次命中不出网
+    assert len(calls) == 2  # 成功缓存 6h：latest + 发行版列表各一次，第二次全命中缓存
 
 
-def test_update_check_no_update_when_same_version(env_file, update_cache_clean):
+def test_update_check_no_update_when_same_version(official_env, update_cache_clean):
     release = dict(GH_RELEASE, tag_name="v2.0.0")
     with authed_client() as client:
-        _mock_http(lambda request: httpx.Response(200, json=release))
+        _mock_http(_latest_and_index_handler([], latest=release))
         rj = client.get("/api/update-check").json()
+    assert rj["build_kind"] == "official"
     assert rj["has_update"] is False
 
 
-def test_update_check_prerelease_latest_not_detected(env_file, update_cache_clean):
+def test_update_check_prerelease_latest_not_detected(official_env, update_cache_clean):
     """latest 是迭代预发布号（带字母尾巴）时不视为更新——检查更新只认正式版。"""
     release = dict(GH_RELEASE, tag_name="v2.8.0e")
     with authed_client() as client:
-        _mock_http(lambda request: httpx.Response(200, json=release))
+        _mock_http(_latest_and_index_handler([], latest=release))
         rj = client.get("/api/update-check").json()
     assert rj["source"] == "github"
     assert rj["has_update"] is False
 
 
-def test_update_check_gitee_null_body_degrades(env_file, update_cache_clean):
+def test_update_check_gitee_null_body_degrades(official_env, update_cache_clean):
     """gitee 对"无发行版"返回 200 + null body（release.yml 实测），按无数据处理。"""
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -3020,6 +3159,120 @@ def test_update_check_gitee_null_body_degrades(env_file, update_cache_clean):
         rj = client.get("/api/update-check").json()
     assert rj["ok"] is True
     assert rj["has_update"] is False
+    assert rj["build_kind"] == "unknown"
+
+
+def test_update_check_local_build_not_promoted(env_file, update_cache_clean):
+    """U4 现场：本地自编译包 2.12.0-9 不在上游发行附件里（官方是 2.12.0-8）。
+
+    即使上游已有更高版本 2.12.3，也不显示 NEW（App Center 没有升级入口）。
+    """
+    root = env_file.parent
+    (root / "VERSION").write_text("2.12.0-9\n", encoding="utf-8")
+    (root / "RELEASE_CHANNEL").write_text("stable\n", encoding="utf-8")
+    latest = dict(GH_RELEASE, tag_name="v2.12.3", name="fnmusic-ext 2.12.3")
+    index = [
+        {"tag_name": "v2.12.3", "name": "fnmusic-ext 2.12.3", "assets": _fpk_assets("2.12.3-0")},
+        {"tag_name": "v2.12.0", "name": "fnmusic-ext 2.12.0", "assets": _fpk_assets("2.12.0-8")},
+    ]
+    with authed_client() as client:
+        _mock_http(_latest_and_index_handler([], latest=latest, index=index))
+        rj = client.get("/api/update-check").json()
+    assert rj["current_version"] == "v2.12.0-9"
+    assert rj["build_kind"] == "local"
+    assert rj["has_update"] is False
+    assert rj["latest"]["version"] == "2.12.3"  # 上游信息仍可展示，但不提示升级
+    assert rj["build_reason"]
+
+
+def test_update_check_official_install_reports_update(env_file, update_cache_clean):
+    """官方安装包（2.12.0-8 出现在上游发行附件里）+ 上游更高版本 → 提示更新。"""
+    root = env_file.parent
+    (root / "VERSION").write_text("2.12.0-8\n", encoding="utf-8")
+    (root / "RELEASE_CHANNEL").write_text("stable\n", encoding="utf-8")
+    latest = dict(GH_RELEASE, tag_name="v2.12.3", name="fnmusic-ext 2.12.3")
+    index = [
+        {"tag_name": "v2.12.3", "name": "fnmusic-ext 2.12.3", "assets": _fpk_assets("2.12.3-0")},
+        {"tag_name": "v2.12.0", "name": "fnmusic-ext 2.12.0", "assets": _fpk_assets("2.12.0-8")},
+    ]
+    with authed_client() as client:
+        _mock_http(_latest_and_index_handler([], latest=latest, index=index))
+        rj = client.get("/api/update-check").json()
+    assert rj["current_version"] == "v2.12.0-8"
+    assert rj["build_kind"] == "official"
+    assert rj["has_update"] is True
+
+
+def test_update_check_official_install_same_release_not_newer(env_file, update_cache_clean):
+    """官方安装 2.12.0-8 面对最新 release v2.12.0（同一发行版）：不提示更新。
+
+    版本比较用发布身份（v2.12.0）而不是带修订号的包版本，否则同一发行版
+    会因 -8 后缀被误判为「更旧」。
+    """
+    root = env_file.parent
+    (root / "VERSION").write_text("2.12.0-8\n", encoding="utf-8")
+    (root / "RELEASE_CHANNEL").write_text("stable\n", encoding="utf-8")
+    latest = dict(GH_RELEASE, tag_name="v2.12.0", name="fnmusic-ext 2.12.0")
+    index = [{"tag_name": "v2.12.0", "name": "fnmusic-ext 2.12.0",
+              "assets": _fpk_assets("2.12.0-8")}]
+    with authed_client() as client:
+        _mock_http(_latest_and_index_handler([], latest=latest, index=index))
+        rj = client.get("/api/update-check").json()
+    assert rj["build_kind"] == "official"
+    assert rj["has_update"] is False
+
+
+def test_update_check_missing_channel_is_local_and_offline(env_file, update_cache_clean):
+    """缺少 RELEASE_CHANNEL 的本地构建：不联网检查，明确 build_kind=local。"""
+    (env_file.parent / "VERSION").write_text("2.12.0-9\n", encoding="utf-8")
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        raise AssertionError("本地构建不应联网检查更新")
+
+    with authed_client() as client:
+        _mock_http(handler)
+        r = client.get("/api/update-check")
+    assert r.status_code == 200
+    rj = r.json()
+    assert calls == []
+    assert rj["build_kind"] == "local"
+    assert rj["has_update"] is False
+    assert rj["channel"] is None
+    assert "RELEASE_CHANNEL" in rj["build_reason"]
+
+
+def test_update_check_index_failure_fails_closed(official_env, update_cache_clean):
+    """发行版列表不可达：无法确认安装包来源 → 不显示更新入口，也不报 500。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/releases/latest"):
+            return httpx.Response(200, json=GH_RELEASE)
+        return httpx.Response(500)
+
+    with authed_client() as client:
+        _mock_http(handler)
+        r = client.get("/api/update-check")
+    assert r.status_code == 200
+    rj = r.json()
+    assert rj["build_kind"] == "unknown"
+    assert rj["has_update"] is False
+    assert rj["error"]
+
+
+def test_published_package_versions():
+    published = webui._published_package_versions([
+        {"tag_name": "v2.12.0", "name": "fnmusic-ext 2.12.0",
+         "assets": _fpk_assets("2.12.0-8")},
+        {"tag_name": "v2.12.3", "name": "fnmusic-ext 2.12.3",
+         "assets": _fpk_assets("2.12.3-0")},
+    ])
+    assert "2.12.0-8" in published
+    assert "2.12.3-0" in published
+    assert "2.12.0" in published   # tag/标题中的发布身份
+    assert "2.12.0-9" not in published
+    assert webui._published_package_versions(None) == set()
 
 
 def test_update_check_requires_admin(env_file, update_cache_clean):
@@ -3073,6 +3326,36 @@ def test_hidden_toggled_elements_not_defeated_by_display():
                 f"#{el_id} 靠 hidden 属性切换，但 .{cls} 的 display 声明会压过 UA 的 "
                 f"[hidden] 规则导致常显——需补 .{cls}[hidden] 或 #{el_id}[hidden] "
                 f"{{ display: none; }} 兜底")
+
+
+def test_app_js_user_facing_manual_save_copy():
+    """U3/U7/U4 前端文案回归：面向用户、501 有限重试、词曲合并说明。"""
+    js = (HERE / "static" / "app.js").read_text(encoding="utf-8")
+    # U7：整歌单保存开关 + 面向用户的开启指引
+    assert "MANUAL_SAVE_PLAYLIST_ENABLED" in js
+    assert "整歌单保存未开启，可在本页上方的开关开启" in js
+    assert "manual-save-playlist-toggle" in js
+    # U3：501/503 有限重试（2 次），仍失败才提示启动中
+    assert "MANUAL_SAVE_STATUS_RETRIES = 2" in js
+    assert "扩展服务正在启动，请稍后刷新页面。" in js
+    assert "请确认正通过飞牛桌面打开管理台" not in js
+    # U4：本地构建徽标与完整版本展示
+    assert "about-build-local" in js
+    assert "本地构建" in js
+    # 任务 4：作词作曲上游都取不到时合并成一条说明
+    assert "词/曲：上游未提供" in js
+    assert "词：未提供" not in js
+    assert "曲：未提供" not in js
+
+
+def test_app_js_playlist_toggle_uses_schema_gate():
+    """整歌单开关只在后端 Schema 暴露该键时注入，旧后端不提交未知键。"""
+    js = (HERE / "static" / "app.js").read_text(encoding="utf-8")
+    assert "function playlistToggleSupported()" in js
+    assert "configSchema.FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED" in js
+    assert '"/api/config"' in js
+    # 保存后立即刷新卡片状态，不依赖整页刷新
+    assert "await loadPlaylistSaveStatus();" in js
 
 
 # ---------------------------------------------------------------- 落盘方式 ----

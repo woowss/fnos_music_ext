@@ -17,6 +17,14 @@ an O_TMPFILE inode requested with mode 0600 can be reported with owner rwx
 inode to 0600 with fchmod before its strict verification. It fails closed if
 normalization fails or does not yield exactly 0600; there is no fallback and
 no exception text is exposed.
+
+Staging stays 0600 for the whole unpublished lifetime. Only after the no-replace
+publication is confirmed is the now-visible inode retagged, best effort, to the
+destination directory's owner/group with mode 0640. A denied chown/chmod (for
+example a non-root service user, or an ACL-inheriting filesystem that overrides
+the mode) is reported per published stage as ownership "unavailable"; it never
+turns a confirmed publication into a failure and never changes the no-replace
+or staging-cleanup semantics.
 """
 
 from __future__ import annotations
@@ -36,6 +44,13 @@ from proxy import manual_save_core as core
 
 _AT_EMPTY_PATH: Final = 0x1000  # Linux <fcntl.h>
 PIPELINE_INTEGRATION_ALLOWED: Final = False
+
+# Published artifacts must be usable by the fnOS directory owner, not only by
+# the (root) service account that publishes them: owner/group are copied from
+# the destination directory and the mode is 0640 (owner rw, group r).
+PUBLISHED_FILE_MODE: Final = 0o640
+OWNERSHIP_TAGGED: Final = "tagged"
+OWNERSHIP_UNAVAILABLE: Final = "unavailable"
 
 
 class UnsupportedAnonymousStaging(RuntimeError):
@@ -64,6 +79,7 @@ class _Stage:
     link_created: bool = False
     publication_confirmed: bool = False
     fd_close_attempted: bool = False
+    ownership: str = ""
 
 
 def _require_linux_primitives() -> None:
@@ -115,6 +131,72 @@ def _normalize_anonymous_mode(fd: int) -> None:
         os.fchmod(fd, 0o600)
     except OSError:
         raise UnsupportedAnonymousStaging("stage_mode_normalization_failed") from None
+
+
+def _tag_published_ownership(
+    fd: int,
+    uid: int,
+    gid: int,
+    *,
+    mode: int = PUBLISHED_FILE_MODE,
+    fchown=None,
+    fchmod=None,
+    fstat=None,
+) -> str:
+    """Best-effort owner/group/mode tagging for one published inode.
+
+    The inode was created by the service user (root) with mode 0600; once its
+    final name exists, ordinary fnOS users cannot open it in that state. The
+    published inode is therefore retagged to the destination directory's
+    owner/group with ``PUBLISHED_FILE_MODE`` (0640). ``fchown``/``fchmod``/
+    ``fstat`` default to the ``os`` functions at call time so synthetic offline
+    tests can drive the exact success/failure branches without a privileged
+    host or a Linux kernel.
+
+    Returns ``OWNERSHIP_TAGGED`` only when the resulting inode actually reports
+    the expected owner, group, and mode; every other outcome is
+    ``OWNERSHIP_UNAVAILABLE``. The caller treats this as advisory and never
+    fails a confirmed publication because of it.
+    """
+    chown_fn = getattr(os, "fchown", None) if fchown is None else fchown
+    chmod_fn = getattr(os, "fchmod", None) if fchmod is None else fchmod
+    stat_fn = getattr(os, "fstat", None) if fstat is None else fstat
+
+    owner_ok = False
+    if callable(chown_fn):
+        try:
+            chown_fn(fd, uid, gid)
+        except OSError:
+            owner_ok = False
+        else:
+            owner_ok = True
+
+    mode_ok = False
+    if callable(chmod_fn):
+        try:
+            chmod_fn(fd, mode)
+        except (OSError, TypeError):
+            mode_ok = False
+        else:
+            mode_ok = True
+
+    if not owner_ok or not mode_ok or not callable(stat_fn):
+        return OWNERSHIP_UNAVAILABLE
+    try:
+        info = stat_fn(fd)
+    except OSError:
+        return OWNERSHIP_UNAVAILABLE
+    if (
+        info.st_uid != uid
+        or info.st_gid != gid
+        or stat.S_IMODE(info.st_mode) != mode
+    ):
+        return OWNERSHIP_UNAVAILABLE
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    return OWNERSHIP_TAGGED
 
 
 def _safe_basename(value: object) -> str:
@@ -240,9 +322,24 @@ class AnonymousLinuxStore:
         self._destination_fd = destination_copy
         self._staging_fd = staging_copy
         self._effective_uid = effective_uid
+        # Published artifacts are retagged to these, never wider.
+        self._destination_uid = destination_info.st_uid
+        self._destination_gid = destination_info.st_gid
+        self._last_ownership = ""
         self._stages: dict[object, _Stage] = {}
         self._lock = threading.RLock()
         self._closed = False
+
+    @property
+    def last_ownership(self) -> str:
+        """Ownership-tagging outcome of the most recently published inode.
+
+        ``"tagged"`` means the published file reports the destination
+        directory's owner/group and mode 0640. ``"unavailable"`` means the
+        save succeeded but the advisory retag could not be confirmed.
+        """
+        with self._lock:
+            return self._last_ownership
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -264,10 +361,17 @@ class AnonymousLinuxStore:
             raise RuntimeError("stage_descriptor_unavailable") from None
         if (info.st_dev, info.st_ino) != (stage.device, stage.inode):
             raise RuntimeError("stage_descriptor_changed")
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != self._effective_uid:
+        if not stat.S_ISREG(info.st_mode):
             raise RuntimeError("stage_not_owned_regular_file")
-        if stat.S_IMODE(info.st_mode) != 0o600:
-            raise RuntimeError("stage_permissions_invalid")
+        if not stage.publication_confirmed:
+            # Unpublished staging must stay exactly service-user owned 0600.
+            # After a confirmed publication the inode is intentionally
+            # retagged to the destination owner/group with mode 0640, so only
+            # identity and link count are re-verified from then on.
+            if info.st_uid != self._effective_uid:
+                raise RuntimeError("stage_not_owned_regular_file")
+            if stat.S_IMODE(info.st_mode) != 0o600:
+                raise RuntimeError("stage_permissions_invalid")
         if info.st_nlink != link_count:
             raise RuntimeError("stage_link_count_changed")
         return info
@@ -404,6 +508,17 @@ class AnonymousLinuxStore:
             except Exception:
                 raise PublicationUncertain("publication_outcome_unknown") from None
             stage.publication_confirmed = True
+            # The final name is confirmed; only now may the inode be retagged.
+            # This is advisory for the caller and must never undo the commit.
+            try:
+                stage.ownership = _tag_published_ownership(
+                    stage.fd,
+                    self._destination_uid,
+                    self._destination_gid,
+                )
+            except Exception:  # noqa: BLE001 - tagging can never fail a save
+                stage.ownership = OWNERSHIP_UNAVAILABLE
+            self._last_ownership = stage.ownership
             return core.StoreResult.PUBLISHED
 
     def _close_stage_fd_once(self, stage: _Stage) -> None:

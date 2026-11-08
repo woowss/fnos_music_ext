@@ -43,6 +43,7 @@ let lxRuntimeSnapshot = null; // /api/status 的只读运行快照
 const LX_STATE_LABEL = { unconfigured: "未配置", loading: "初始化中", ready: "可用", degraded: "部分可用", failed: "全部失败", unavailable: "服务不可用" };
 const LX_SOURCE_STATUS_LABEL = { success: "运行就绪", failed: "运行失败", loading: "初始化中", unknown: "运行状态未知" };
 let updateInfo = null;    // /api/update-check 结果（菜单红点 / NEW 标记 / 详情弹窗共用）
+let aboutBuildKind = "";  // /api/about 的构建来源（local/official），本地构建不显示 NEW
 let publicSelection = [];
 let publicUsers = [];
 let publicUsersReady = false;
@@ -713,6 +714,7 @@ function applyConfigToForm() {
   renderLxSourceOrder();
   syncLxAddButton();
   renderPlatformChips();
+  renderPlaylistToggle();
 }
 
 function collectConfig() {
@@ -2774,7 +2776,13 @@ function fmtBytes(n) {
 
 async function loadAbout() {
   const info = await api("/api/about");
+  // 管理页展示完整安装版本（含 -9 之类构建号），与 App Center 的包版本一致
   $("#about-version").textContent = formatVersionLabel(info.version);
+  aboutBuildKind = typeof info.build_kind === "string" ? info.build_kind : "";
+  const aboutVersion = $("#about-version");
+  if (aboutVersion && typeof info.build_reason === "string" && info.build_reason) {
+    aboutVersion.title = info.build_reason;
+  }
   $("#about-deploy").textContent = info.deploy_mode === "native" ? "原生部署" : "Docker 部署";
   // 免责声明来自 README「免责与版权声明」小节；解析失败时后端返回空数组，隐藏卡片
   const card = $("#about-disclaimer-card");
@@ -2839,6 +2847,8 @@ async function loadAbout() {
     }
   }
   syncDonateCard();
+  // 先按本地文件判定渲染「本地构建」徽标（不依赖网络），再刷新检查更新
+  renderBuildBadge();
   // 进入关于页顺带刷新检查更新（后端有 TTL 缓存，命中不出网）
   checkUpdate();
 }
@@ -2887,9 +2897,52 @@ async function checkUpdate() {
 
 // 有新版本则红点常亮（两处"关于"入口 + 关于页 NEW 标记），不因查看而清除
 function renderUpdateBadge() {
-  const has = !!(updateInfo && updateInfo.has_update);
+  const info = updateInfo || {};
+  const buildKind = typeof info.build_kind === "string" && info.build_kind
+    ? info.build_kind : aboutBuildKind;
+  // 本地/自编译构建永不显示 NEW（后端已保证 has_update=false，前端再兜一层）
+  const has = !!info.has_update && buildKind !== "local";
   $$(".nav-dot").forEach((el) => { el.hidden = !has; });
   $("#about-new").hidden = !has;
+  renderBuildBadge();
+}
+
+/* 本地/自编译构建徽标：index.html 未预置该元素，首次渲染时注入到关于页
+ * 版本徽标组（NEW 左侧）。.badge 的 display 声明会压过 [hidden]，而
+ * style.css 只为 #about-new 补了 [hidden] 兜底，所以这里用内联 display
+ * 控制显隐，不依赖样式表。 */
+function ensureBuildBadge() {
+  let badge = $("#about-build-local");
+  if (badge && badge._fnmusicInjected) return badge;
+  const anchor = $("#about-new");
+  const host = anchor && anchor.parentNode;
+  const injectable = Boolean(host) && typeof document.createElement === "function"
+    && typeof host.insertBefore === "function";
+  if (injectable) {
+    badge = document.createElement("span");
+    badge.id = "about-build-local";
+    badge.style.display = "none";
+    host.insertBefore(badge, anchor);
+    badge._fnmusicInjected = true;
+  }
+  if (!badge) return null;  // 测试桩/旧页面：无法注入时只操作已存在元素
+  badge.className = "badge dim";
+  badge.textContent = "本地构建";
+  badge.title = "当前安装为本地/自编译构建，不由上游发行渠道发布，不提示在线更新";
+  return badge;
+}
+
+function renderBuildBadge() {
+  const info = updateInfo || {};
+  const kind = typeof info.build_kind === "string" && info.build_kind
+    ? info.build_kind : aboutBuildKind;
+  const badge = ensureBuildBadge();
+  if (!badge) return;
+  const local = kind === "local";
+  badge.style.display = local ? "inline-block" : "none";
+  if (local && typeof info.build_reason === "string" && info.build_reason) {
+    badge.title = info.build_reason;
+  }
 }
 
 function fmtDate(iso) {
@@ -3246,11 +3299,47 @@ function setSaveControlsEnabled(enabled) {
   if (button) button.disabled = !enabled;
 }
 
+// 手动保存状态请求的有限重试：扩展服务/网关刚启动时可能短暂返回 501/503。
+// 只重试这两个「正在启动」类状态（2 次，间隔 800ms）；403 等权限/直连错误
+// 不重试，保持原有语义并显示后端返回的信息。
+const MANUAL_SAVE_STATUS_RETRIES = 2;
+const MANUAL_SAVE_STATUS_RETRY_MS = 800;
+
+function manualSaveBackendMessage(body) {
+  if (!body || typeof body !== "object") return "";
+  if (typeof body.message === "string" && body.message) return body.message;
+  if (typeof body.detail === "string" && body.detail) return body.detail;
+  if (typeof body.error === "string" && body.error) return body.error;
+  return "";
+}
+
+function manualSaveStatusSleep(ms) {
+  // 测试替换点：Node 行为测试用即时桩替换（unref 定时器会让测试进程提前退出）
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
+}
+
+async function manualSaveStatusRequest(path) {
+  let response = null;
+  for (let attempt = 0; attempt <= MANUAL_SAVE_STATUS_RETRIES; attempt += 1) {
+    response = await manualSaveApi(path);
+    if (response.status !== 501 && response.status !== 503) return response;
+    if (attempt < MANUAL_SAVE_STATUS_RETRIES) {
+      const statusEl = $("#save-status");
+      if (statusEl) {
+        statusEl.textContent = "扩展服务正在启动，正在重试…（"
+          + (attempt + 1) + "/" + MANUAL_SAVE_STATUS_RETRIES + "）";
+      }
+      await manualSaveStatusSleep(MANUAL_SAVE_STATUS_RETRY_MS);
+    }
+  }
+  return response;
+}
+
 async function loadSaveStatus() {
   const statusEl = $("#save-status");
   if (!statusEl) return;
   try {
-    const { status, ok, body } = await manualSaveApi("/api/manual-save/status");
+    const { status, ok, body } = await manualSaveStatusRequest("/api/manual-save/status");
     const data = (body && body.data) || {};
     saveState.enabled = !!(ok && body && body.ok === true && data.enabled === true);
     saveState.statusLoaded = true;
@@ -3265,8 +3354,18 @@ async function loadSaveStatus() {
       if (results) results.innerHTML = "";
       const resultEl = $("#save-result");
       if (resultEl) resultEl.textContent = "";
+    } else if (status === 501 || status === 503) {
+      // 重试后仍是 501/503：扩展服务还在启动，给用户可执行的下一步。
+      statusEl.textContent = "扩展服务正在启动，请稍后刷新页面。";
+      setSaveControlsEnabled(false);
     } else {
-      statusEl.textContent = "无法读取手动保存状态（HTTP " + status + "），请确认正通过飞牛桌面打开管理台。";
+      // 其它状态（403 等）保持原有语义：不重试，显示后端返回的信息。
+      const backendMessage = manualSaveBackendMessage(body);
+      const fallback = status === 403
+        ? "请通过飞牛桌面打开管理台。"
+        : "请稍后刷新页面；若持续失败，请通过飞牛桌面打开管理台。";
+      statusEl.textContent = "无法读取手动保存状态（HTTP " + status + "）："
+        + (backendMessage || fallback);
       setSaveControlsEnabled(false);
     }
   } catch (exc) {
@@ -3421,11 +3520,16 @@ async function saveOneTrack(button) {
       }
       parts.push(lyricLabels[data.lyric_status] || "歌词状态未知");
       parts.push(data.artist_status === "tagged" ? "歌手标签已写入" : "音源未提供歌手");
-      const lyricist = data.lyricist_status === "tagged" && data.lyricist
-        ? "词：" + data.lyricist : "词：未提供";
-      const composer = data.composer_status === "tagged" && data.composer
-        ? "曲：" + data.composer : "曲：未提供";
-      parts.push(lyricist + " / " + composer);
+      // 上游 NEMbox 详情没有作词/作曲字段（歌词富文本前两行含词曲但未解析），
+      // 两项都取不到时合并成一条准确说明，不再显示两个「未提供」占位。
+      const lyricistKnown = data.lyricist_status === "tagged" && Boolean(data.lyricist);
+      const composerKnown = data.composer_status === "tagged" && Boolean(data.composer);
+      if (lyricistKnown || composerKnown) {
+        parts.push((lyricistKnown ? "词：" + data.lyricist : "词：上游未提供")
+          + " / " + (composerKnown ? "曲：" + data.composer : "曲：上游未提供"));
+      } else {
+        parts.push("词/曲：上游未提供");
+      }
       const metadataFailed = data.cover_status === "error"
         || data.lyric_status === "error" || data.lyric_status === "unknown";
       const prefix = metadataFailed
@@ -3894,6 +3998,8 @@ function playlistUpdateButtons() {
           || state === "reconciliation_required" || state === "paused");
     cancelBtn.disabled = !canCancel;
   }
+  // 推进中禁用整歌单开关，避免任务运行期改配置
+  renderPlaylistToggle();
 }
 
 function playlistSetSnapshotStatus(text) {
@@ -4028,24 +4134,116 @@ function playlistClearStoredJob() {
 
 function playlistDisabledText(code, response) {
   if (code === "playlist_disabled") {
-    return "整歌单保存未启用：请在 .env 设置 FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED=true 后重启代理。";
+    if (configSchema && configSchema.FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED) {
+      // 新后端已把开关暴露到管理页：给用户可执行的下一步，而不是开发者口吻的 .env 指引
+      return "整歌单保存未开启，可在本页上方的开关开启（保存后立即生效，无需重启代理）。";
+    }
+    // 旧后端没有页内开关，只能改 .env，保留可执行指引
+    return "整歌单保存未开启：当前管理页不支持页内开关，请在 .env 设置 FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED=true 后重启代理。";
   }
   if (code === "disabled") {
-    return "手动保存未启用：请在 .env 设置 FNMUSIC_MANUAL_SAVE_ENABLED=true 后重启代理。";
+    return "手动保存未启用：请先开启单曲手动保存。";
   }
   if (code === "not_logged_in") {
     return "网易云账号未登录：请先在「账号」里扫码登录后再使用整歌单保存。";
   }
   if (code === "forbidden") return "仅管理员可执行手动保存：请通过飞牛桌面打开管理台。";
   const status = response && Number.isInteger(response.status) ? response.status : 0;
+  if (status === 501 || status === 503) {
+    return "扩展服务正在启动，请稍后刷新页面。";
+  }
   return "无法读取整歌单保存状态（HTTP " + status + "）："
     + playlistJobMessage(response && response.body, "服务不可用") + "。";
+}
+
+/* ------------------------------------------------------ 整歌单保存开关 */
+/* 后端 SCHEMA 暴露 FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED 后，在「手动保存歌单」
+ * 卡片顶部注入开关（index.html 未预置该元素）。宿主网关每次请求都重读 .env，
+ * 因此保存后立即生效，无需重启代理。旧后端没有该键时不注入，保持只读提示。 */
+let playlistToggleSaving = false;
+
+function playlistToggleSupported() {
+  return Boolean(configSchema && configSchema.FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED);
+}
+
+function ensurePlaylistToggle() {
+  let toggle = $("#manual-save-playlist-toggle");
+  if (toggle && toggle._fnmusicInjected) return toggle;
+  if (!playlistToggleSupported()) return toggle;
+  const statusEl = $("#playlist-status");
+  const host = statusEl && statusEl.parentNode;
+  if (!host || typeof document.createElement !== "function"
+      || typeof host.insertBefore !== "function") {
+    return toggle;  // 测试桩/旧页面：无法注入时只操作已存在元素
+  }
+  const row = document.createElement("label");
+  row.className = "switch-row";
+  row.id = "manual-save-playlist-row";
+  const label = document.createElement("span");
+  label.textContent = "整歌单保存";
+  const input = document.createElement("input");
+  input.type = "checkbox";
+  input.id = "manual-save-playlist-toggle";
+  row.appendChild(label);
+  row.appendChild(input);
+  host.insertBefore(row, statusEl);
+  input.addEventListener("change", () => { void savePlaylistToggle(input.checked); });
+  input._fnmusicInjected = true;
+  return input;
+}
+
+function renderPlaylistToggle() {
+  const supported = playlistToggleSupported();
+  const row = $("#manual-save-playlist-row");
+  // .switch-row 自带 display:flex，会压过 [hidden]，用内联 display 控制显隐
+  if (row) row.style.display = supported ? "" : "none";
+  if (!supported) return false;
+  const toggle = ensurePlaylistToggle();
+  const enabled = String(configValues.FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED || "false")
+    .trim().toLowerCase() === "true";
+  if (toggle) {
+    toggle.checked = enabled;
+    toggle.disabled = playlistToggleSaving || playlistState.running === true;
+  }
+  return true;
+}
+
+async function savePlaylistToggle(enabled) {
+  if (playlistToggleSaving || !playlistToggleSupported()) return false;
+  playlistToggleSaving = true;
+  const toggle = $("#manual-save-playlist-toggle");
+  if (toggle) toggle.disabled = true;
+  try {
+    const result = await api("/api/config", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ values: { FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED: enabled } }),
+    });
+    configValues = Object.assign({}, configValues, {
+      FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED: enabled ? "true" : "false",
+    });
+    const changed = Array.isArray(result && result.changed) && result.changed.length > 0;
+    toast(changed ? (enabled ? "整歌单保存已开启，已即时生效" : "整歌单保存已关闭")
+      : "整歌单保存开关状态未变化", changed ? "ok" : "");
+    // 立即刷新歌单卡片状态，让开关状态即时反映到该卡片（刷新失败不影响保存结果）
+    try { await loadPlaylistSaveStatus(); } catch (_) { /* 卡片独立降级 */ }
+    return true;
+  } catch (exc) {
+    if (toggle) toggle.checked = !enabled;
+    toast("保存整歌单保存开关失败：" + (exc && exc.message ? exc.message : "网络错误"), "fail");
+    return false;
+  } finally {
+    playlistToggleSaving = false;
+    renderPlaylistToggle();
+  }
 }
 
 async function loadPlaylistSaveStatus() {
   const statusEl = $("#playlist-status");
   const wasEnabled = playlistState.enabled;
   playlistState.loaded = true;
+  // 开关状态先与配置同步（旧后端无该键时保持隐藏）
+  renderPlaylistToggle();
   // 单曲开关关闭时不得发起任何 playlist 请求（§6.3 禁用守卫 6）
   if (!saveState.enabled) {
     playlistState.enabled = false;
@@ -4056,6 +4254,7 @@ async function loadPlaylistSaveStatus() {
     playlistRenderOptions();
     playlistRenderJob();
     playlistUpdateButtons();
+    renderPlaylistToggle();
     return false;
   }
   playlistState.enabled = false;
@@ -4089,6 +4288,7 @@ async function loadPlaylistSaveStatus() {
     }
     playlistRenderOptions();
     playlistUpdateButtons();
+    renderPlaylistToggle();
     await playlistResumeFromStorage();  // §6.5 路径 1：localStorage 恢复
     return true;
   }
@@ -4098,6 +4298,7 @@ async function loadPlaylistSaveStatus() {
   playlistRenderOptions();
   playlistRenderJob();
   playlistUpdateButtons();
+  renderPlaylistToggle();
   return false;
 }
 

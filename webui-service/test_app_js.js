@@ -1209,6 +1209,21 @@ test("检查更新：has_update → 两处红点与 NEW 常亮；无更新 → �
   assert.strictEqual(els.get("#about-new").hidden, false);
 });
 
+test("检查更新：本地/自编译构建（build_kind=local）不显示 NEW，改显示本地构建徽标", async () => {
+  enqueue("/app/fnmusic-ext/api/update-check", {
+    ok: true, current_version: "v2.12.0-9", channel: "stable", build_kind: "local",
+    has_update: false, build_reason: "当前安装包不是上游发行的安装包",
+  });
+  await global.checkUpdate();
+  assert.strictEqual(els.get("#nav-dot-desktop").hidden, true);
+  assert.strictEqual(els.get("#nav-dot-mobile").hidden, true);
+  assert.strictEqual(els.get("#about-new").hidden, true, "本地构建不得显示 NEW");
+  const badge = els.get("#about-build-local");
+  assert.strictEqual(badge.textContent, "本地构建");
+  assert.strictEqual(badge.style.display, "inline-block");
+  assert.strictEqual(badge.title, "当前安装包不是上游发行的安装包");
+});
+
 test("检查更新：接口失败静默，不炸不弹错", async () => {
   enqueue("/app/fnmusic-ext/api/update-check", new Error("服务器失联"));
   await global.checkUpdate();  // 不应抛出
@@ -3006,6 +3021,49 @@ test("关于页打赏二维码：图片加载失败触发 onerror 时自动隐�
   assert.strictEqual(donateCard.hidden, true);
 });
 
+/* 501/503 重试退避（800ms）在测试中即时返回：unref 定时器不会保持事件循环，
+ * 真等待会让 node 进程在测试中途提前退出。 */
+global.manualSaveStatusSleep = () => Promise.resolve();
+
+test("手动保存状态：501/503 自动重试 2 次后成功，不再误报直连模式", async () => {
+  for (const status of [501, 503]) {
+    enqueue("/app/fnmusic-ext/api/manual-save/status", { __rawResponse: true, resp: {
+      ok: false, status, json: async () => ({ detail: "gateway starting" }),
+    } });
+  }
+  enqueue("/app/fnmusic-ext/api/manual-save/status", {
+    ok: true, data: { enabled: true, target_dir: "/library" },
+  });
+  enqueue("/app/fnmusic-ext/api/manual-save/playlist/playlists", { ok: true, data: { playlists: [] } });
+  await global.loadSaveStatus();
+  const statusCalls = fetchCalls.filter((c) => c.path.endsWith("/manual-save/status"));
+  assert.strictEqual(statusCalls.length, 3, "501/503 各重试一次后成功");
+  assert.ok(els.get("#save-status").textContent.includes("手动保存已启用"));
+});
+
+test("手动保存状态：501 重试耗尽 → 提示扩展服务正在启动", async () => {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    enqueue("/app/fnmusic-ext/api/manual-save/status", { __rawResponse: true, resp: {
+      ok: false, status: 501, json: async () => ({ detail: "gateway starting" }),
+    } });
+  }
+  await global.loadSaveStatus();
+  const statusCalls = fetchCalls.filter((c) => c.path.endsWith("/manual-save/status"));
+  assert.strictEqual(statusCalls.length, 3, "首次 + 2 次重试");
+  assert.ok(els.get("#save-status").textContent.includes("扩展服务正在启动，请稍后刷新页面"));
+  assert.ok(!els.get("#save-status").textContent.includes("飞牛桌面"));
+});
+
+test("手动保存状态：403 不重试，显示后端返回的信息", async () => {
+  enqueue("/app/fnmusic-ext/api/manual-save/status", { __rawResponse: true, resp: {
+    ok: false, status: 403, json: async () => ({ detail: "仅管理员可执行手动保存" }),
+  } });
+  await global.loadSaveStatus();
+  const statusCalls = fetchCalls.filter((c) => c.path.endsWith("/manual-save/status"));
+  assert.strictEqual(statusCalls.length, 1, "403 不得自动重试");
+  assert.ok(els.get("#save-status").textContent.includes("仅管理员可执行手动保存"));
+});
+
 test("手动保存：显示封面/歌词/词曲状态并明确标注附加项部分失败", async () => {
   enqueue("/app/fnmusic-ext/api/manual-save/status", {
     ok: true, data: { enabled: true, target_dir: "/library" },
@@ -3029,8 +3087,33 @@ test("手动保存：显示封面/歌词/词曲状态并明确标注附加项部
   assert.ok(message.includes("音频已发布；部分元数据/歌词附加项失败"));
   assert.ok(message.includes("封面获取或嵌入失败"));
   assert.ok(message.includes("歌词发布结果待核对"));
-  assert.ok(message.includes("词：作词者 / 曲：未提供"));
+  assert.ok(message.includes("词：作词者 / 曲：上游未提供"));
   assert.strictEqual(stateEl.textContent, "已保存");
+});
+
+test("手动保存：作词作曲上游都取不到时合并为「词/曲：上游未提供」", async () => {
+  enqueue("/app/fnmusic-ext/api/manual-save/status", {
+    ok: true, data: { enabled: true, target_dir: "/library" },
+  });
+  await global.loadSaveStatus();
+  enqueue("/app/fnmusic-ext/api/manual-save/track", {
+    ok: true, code: "ok", data: {
+      status: "published", format: "flac", size: 1024,
+      basename: "歌手 - 歌曲.flac", target_dir: "/library",
+      cover_status: "embedded", lyric_status: "published", artist_status: "tagged",
+      lyricist: "", lyricist_status: "unavailable",
+      composer: "", composer_status: "unavailable",
+    },
+  });
+  const button = stubEl();
+  button.dataset.songId = "42";
+  const stateEl = stubEl();
+  button.closest = () => ({ querySelector: () => stateEl });
+  await global.saveOneTrack(button);
+  const message = els.get("#save-result").textContent;
+  assert.ok(message.includes("词/曲：上游未提供"));
+  assert.ok(!message.includes("词：未提供"), "不应再出现两个「未提供」占位");
+  assert.ok(!message.includes("曲：未提供"), "不应再出现两个「未提供」占位");
 });
 
 async function savePublishedTrack(data) {
@@ -4057,6 +4140,28 @@ test("手动保存歌单：index.html 卡片 id 与 app.js 引用一一对应", 
   assert.ok(refs.size >= 14, "app.js 应引用至少 14 个 playlist id，实际 " + refs.size);
   for (const ref of refs) assert.ok(ids.has(ref), "index.html 缺少 #" + ref);
   for (const id of ids) assert.ok(refs.has(id), "app.js 未引用 #" + id);
+});
+
+test("整歌单开关：Schema 暴露开关时提示页内开启（不再 .env 开发者口吻）", async () => {
+  enqueue("/app/fnmusic-ext/api/config", {
+    values: { FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED: "false" },
+    schema: { FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED: { kind: "bool", default: "false" } },
+  });
+  await global.loadConfig();
+  enqueue("/app/fnmusic-ext/api/manual-save/status", {
+    ok: true, data: { enabled: true, target_dir: "/library" },
+  });
+  plEnqueueRaw(PL_PATH + "/playlists", 403, plErr("playlist_disabled"));
+  await global.loadSaveStatus();
+  const text = els.get("#playlist-status").textContent;
+  assert.ok(text.includes("本页上方的开关"), "应引导到页内开关: " + text);
+  assert.ok(!text.includes(".env"), "不应再出现 .env 开发者口吻: " + text);
+  // 开关状态与配置一致，且卡片仍按禁用态渲染
+  assert.strictEqual(els.get("#manual-save-playlist-toggle").checked, false);
+  assert.strictEqual(global.playlistUiState().enabled, false);
+  // 复位全局 configSchema，避免影响后续用例
+  enqueue("/app/fnmusic-ext/api/config", { values: {}, schema: {} });
+  await global.loadConfig();
 });
 
 /* ------------------------------------------------ 运行 --------------------- */

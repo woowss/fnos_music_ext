@@ -60,6 +60,52 @@ else:  # direct execution from the proxy source directory
 UPSTREAM = ("127.0.0.1", 8774)
 SOCK_NAME = "fnmusic-ext.sock"
 PID_FILE = Path("/run/fnmusic-ext/webui-gateway.pid")
+
+# 持久化网关日志（2026-11-08 真实用户复查：管理页曾出现 manual-save 501，但网关
+# stdout→/dev/null 无任何可查日志）。只记录固定文案、路由与整数状态码；
+# 绝不记录请求头、Cookie、查询参数或用户数据。
+GATEWAY_LOG_ENV = "FNMUSIC_GATEWAY_LOG"
+DEFAULT_GATEWAY_LOG = "/var/log/apps/fnmusic-ext-gateway.log"
+GATEWAY_LOG_MAX_BYTES = 5 * 1024 * 1024
+_gateway_log_lock = threading.Lock()
+_gateway_log_disabled = False
+
+
+def gateway_log(message: str) -> None:
+    """Append one fixed-format line to the gateway log; never raise, never block service."""
+    global _gateway_log_disabled
+    if _gateway_log_disabled:
+        return
+    try:
+        path = (os.environ.get(GATEWAY_LOG_ENV) or "").strip() or DEFAULT_GATEWAY_LOG
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with _gateway_log_lock:
+            try:
+                if os.path.getsize(path) > GATEWAY_LOG_MAX_BYTES:
+                    os.replace(path, path + ".1")
+            except OSError:
+                pass
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            with open(path, "a", encoding="utf-8") as stream:
+                stream.write(f"{stamp} pid={os.getpid()} {message}\n")
+    except Exception:  # noqa: BLE001 — diagnostics must never change service behavior
+        _gateway_log_disabled = True
+
+
+def _log_path_only(head_raw: bytes) -> str:
+    """Return the request path without query string for logging (no user data)."""
+    try:
+        request_line = head_raw.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+        parts = request_line.split(" ")
+        if len(parts) < 2:
+            return ""
+        path = parts[1].partition("?")[0]
+        return path[:200]
+    except Exception:  # noqa: BLE001
+        return ""
+
 # create_connection 的 timeout 会留在套接字上，之后的 recv 也受它限制。
 # 洛雪源校验要几十秒才有响应；沿用 5 秒会让桌面网关中途拆连接，nginx 回 502。
 CONNECT_TIMEOUT = 5
@@ -929,6 +975,18 @@ def _sanitize_manual_save_data(data: object) -> dict:
     for name, allowed in status_values.items():
         value = source.get(name)
         sanitized[name] = value if type(value) is str and value in allowed else "unavailable"
+    # 2026-11-08 真实用户复查新增：发布后属主打标状态（"tagged"/"unavailable"）
+    # 与词曲来源（info/mixed/lyric/upstream_unavailable）同样只放行固定枚举。
+    for name in ("ownership", "lyric_ownership"):
+        value = source.get(name)
+        sanitized[name] = value if type(value) is str and value in ("tagged", "unavailable") else ""
+    credits_source = source.get("credits_source")
+    sanitized["credits_source"] = (
+        credits_source
+        if type(credits_source) is str
+        and credits_source in ("info", "mixed", "lyric", "upstream_unavailable")
+        else "upstream_unavailable"
+    )
     cover_error = sanitized["cover_error"]
     if sanitized["cover_status"] != "error":
         cover_error = ""
@@ -2572,6 +2630,7 @@ def _log_channel_rejection(code: str,
         if peer is not None:
             fields.append(f"pid={int(peer.pid)}")
             fields.append(f"uid={int(peer.uid)}")
+        gateway_log("channel-rejected " + " ".join(fields))
         print(f"{_CHANNEL_REJECT_LOG_PREFIX} " + " ".join(fields),
               file=sys.stderr, flush=True)
     except Exception:  # noqa: BLE001 — logging must never change service behavior
@@ -2633,6 +2692,10 @@ def serve(sock_path: Path, upstream: tuple[str, int] = UPSTREAM,
         # Re-assert the policy mode on every start; never inherit a stale 0666.
         os.chmod(sock_path, socket_mode)
         server.listen(64)
+        gateway_log(
+            "gateway-start "
+            f"sock={sock_path} mode={oct(socket_mode)} "
+            f"allow_uids={','.join(str(uid) for uid in sorted(allow_uids))}")
         if observer is not None:
             try:
                 observer.start()
@@ -2658,10 +2721,10 @@ def serve(sock_path: Path, upstream: tuple[str, int] = UPSTREAM,
                 continue
             try:
                 if observer is None:
-                    thread = threading.Thread(target=_handle, args=(client, upstream), daemon=True)
+                    thread = threading.Thread(target=_handle_logged, args=(client, upstream), daemon=True)
                 else:
                     thread = threading.Thread(
-                        target=_handle, args=(client, upstream, observer), daemon=True,
+                        target=_handle_logged, args=(client, upstream, observer), daemon=True,
                     )
                 thread.start()
             except Exception:  # noqa: BLE001 - transient dispatch failure must not kill serve()
@@ -2819,6 +2882,16 @@ def handle_maintenance(client: socket.socket, head_raw: bytes, method: str, targ
         client.close()
 
 
+def _handle_logged(client: socket.socket, upstream: tuple[str, int],
+                   observer: "gateway_observation.GatewayObserver | None" = None) -> None:
+    """Thread entry: never let one handler's unexpected exception escape silently."""
+    try:
+        _handle(client, upstream, observer)
+    except Exception as exc:  # noqa: BLE001 — record class only, never message/headers
+        gateway_log(f"unhandled-exception class={type(exc).__name__}")
+        _close_quietly(client)
+
+
 def _handle(client: socket.socket, upstream: tuple[str, int],
             observer: "gateway_observation.GatewayObserver | None" = None) -> None:
     client.settimeout(CONNECT_TIMEOUT)
@@ -2827,6 +2900,7 @@ def _handle(client: socket.socket, upstream: tuple[str, int],
         client.close()
         return
     head_raw, headers = head
+    log_path = _log_path_only(head_raw)
     if observer is not None:
         try:
             # Inspect only the already-read request head. Any diagnostic failure
@@ -2836,15 +2910,19 @@ def _handle(client: socket.socket, upstream: tuple[str, int],
             pass
     maintenance = _maintenance_target(head_raw)
     if maintenance is not None:
+        gateway_log(f"dispatch maintenance path={log_path}")
         handle_maintenance(client, head_raw, *maintenance)
         return
     if _is_manual_save_status_request(head_raw):
+        gateway_log(f"dispatch manual-save op=status path={log_path}")
         handle_manual_save_status(client, head_raw)
         return
     if _is_manual_save_track_request(head_raw):
+        gateway_log(f"dispatch manual-save op=track path={log_path}")
         handle_manual_save_track(client, head_raw)
         return
     if _is_manual_save_search_request(head_raw):
+        gateway_log(f"dispatch manual-save op=search path={log_path}")
         handle_manual_save_search(client, head_raw)
         return
     # Playlist save endpoints (contract §3) are matched before `_validate_head`
@@ -2853,6 +2931,7 @@ def _handle(client: socket.socket, upstream: tuple[str, int],
     # responses, before any body, ledger, engine, or upstream work.
     playlist_kind = _manual_save_playlist_request_kind(head_raw)
     if playlist_kind is not None:
+        gateway_log(f"dispatch manual-save op=playlist kind={playlist_kind} path={log_path}")
         handle_manual_save_playlist(client, head_raw, playlist_kind)
         return
     client.settimeout(None)
@@ -2862,6 +2941,11 @@ def _handle(client: socket.socket, upstream: tuple[str, int],
     if _is_fs_check_request(head_raw):
         handle_fs_check(client, headers, head_raw)
         return
+    # 正常情况下 privileged 端点在上面已全部本地处理；走到这里说明请求被转发给
+    # WebUI（真实用户复查中曾出现 manual-save 被转发后返回 501 的间歇状态）。
+    # 只记录固定路径，便于事后定位，不记录头/查询/正文。
+    if log_path and ("manual-save" in log_path or log_path.startswith(MAINTENANCE_ROOT)):
+        gateway_log(f"anomaly forward-privileged path={log_path}")
     # L3 boundary for the forwarded path: an ambiguous identity/framing head is
     # rejected here, before any upstream connection exists, and the body is
     # never read. Local privileged handlers above keep their own strict parse

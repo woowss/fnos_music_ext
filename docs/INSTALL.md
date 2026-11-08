@@ -431,3 +431,48 @@ BASE_IMAGE=docker.m.daocloud.io/library/python:3.13-slim ./install.sh
 
 v1.2.1 及更早的已知问题（umask 077 检出导致镜像内非 root 用户读不了源码），
 v1.2.2 起已修复。若遇旧镜像残留：`git pull && ./install.sh` 重建即可。
+
+## 9. 运维与使用注意（2026-11-08 真实用户复查补充）
+
+### 9.1 启停请走「应用中心」，不要直接用 systemctl
+
+`fnmusic-ext.service` 由应用中心托管。直接执行 `systemctl restart/stop fnmusic-ext`
+会让应用中心观测到非预期停止，记录 `APP_CRASH` 事件，并把应用标记为未启动
+（桌面上的「fnMusic 扩展管理」入口随之消失；音源与接管仍在跑，但用户找不到管理页）。
+
+正确做法：
+
+- 图形界面：应用中心 → fnMusic 音源扩展 → 启动/停止；
+- 命令行：`/var/apps/fnmusic-ext/cmd/main start|stop`；
+- 若入口已消失：应用中心重新点「启动」，或
+  `fnos-cli --profile <profile> app start fnmusic-ext --yes`。
+
+排查时可看：`TRIMEVENT ... APP_CRASH`（`journalctl -b | grep TRIMEVENT`）与
+`trim_http_cgi ... fnmusic-ext.main ... register success`（入口注册日志）。
+
+### 9.2 网关日志
+
+管理页所用桌面网关（`webui_gateway.py`）默认把固定格式日志写入
+**`/var/log/apps/fnmusic-ext-gateway.log`**（可用 `FNMUSIC_GATEWAY_LOG` 覆盖；
+>5 MB 时轮转为 `.1`）。日志只含固定文案、路由与整数状态码，不含请求头、
+Cookie 或查询参数。
+
+排查「保存到 NAS 打不开/HTTP 501」这类问题时：
+
+```bash
+tail -n 50 /var/log/apps/fnmusic-ext-gateway.log
+# 期望看到 dispatch manual-save op=status ...；若出现
+# anomaly forward-privileged path=...manual-save... 说明请求被错误转发
+```
+
+### 9.3 浏览器下载类扩展
+
+部分下载管理器（如 NeatDownloadManager 等）会接管
+`/music/api/v1/track/stream` 媒体流并弹出「MP3 File …」下载气泡，可能干扰在线
+播放。请把 `https://<NAS>:<端口>/music/` 加入该扩展的站点例外，或暂停其媒体嗅探。
+
+### 9.4 手动保存文件的属主
+
+手动保存由宿主 root 完成，历史版本写出的文件为 `root:root 0600`，普通用户在
+文件管理器中不可读。新版本会把文件属主/属组对齐目标目录、权限 0640（见
+`CHANGELOG`）；如目标为正式曲库，请确认目录属主与音乐 App 读取权限一致。

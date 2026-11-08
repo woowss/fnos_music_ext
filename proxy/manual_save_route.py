@@ -7,6 +7,7 @@ import hashlib
 import http.client
 import ipaddress
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -157,6 +158,7 @@ _FILENAME_FORBIDDEN = frozenset("/\\:")
 _CONTROL_CATEGORIES = frozenset({"Cc", "Cs"})
 _SAVE_LOCK = threading.Lock()
 _ANONYMOUS_MODULE = None
+_LOGGER = logging.getLogger(__name__)
 
 
 _MESSAGES = {
@@ -675,6 +677,30 @@ def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
         except Exception:
             lyric_status = "error"
 
+        # The song-detail object has no credit fields; fall back to the credit
+        # lines of the lyric text that is already fetched (and later saved as
+        # the sibling .lrc sidecar). Explicit /info credits always win.
+        lyricist = track_metadata.lyricist
+        composer = track_metadata.composer
+        used_lyric_credit = False
+        if not lyricist or not composer:
+            parsed_lyricist, parsed_composer = _credits_from_lyric(lyric_bytes)
+            if not lyricist and parsed_lyricist:
+                lyricist = parsed_lyricist
+                used_lyric_credit = True
+            if not composer and parsed_composer:
+                composer = parsed_composer
+                used_lyric_credit = True
+        info_credit = bool(track_metadata.lyricist or track_metadata.composer)
+        if not lyricist and not composer:
+            credits_source = "upstream_unavailable"
+        elif used_lyric_credit and info_credit:
+            credits_source = "mixed"
+        elif used_lyric_credit:
+            credits_source = "lyric"
+        else:
+            credits_source = "info"
+
         metadata: dict[str, str] = {"title": title}
         if artist:
             metadata["artist"] = artist
@@ -684,10 +710,10 @@ def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
             metadata["track"] = str(track_number)
         if disc_number is not None:
             metadata["disc"] = str(disc_number)
-        if track_metadata.lyricist:
-            metadata["lyricist"] = track_metadata.lyricist
-        if track_metadata.composer:
-            metadata["composer"] = track_metadata.composer
+        if lyricist:
+            metadata["lyricist"] = lyricist
+        if composer:
+            metadata["composer"] = composer
         tag_metadata = _TagMetadata(
             metadata,
             cover_path=cover_path,
@@ -747,14 +773,17 @@ def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
             "title_status": "tagged",
             "artist_status": "tagged" if artist else "unavailable",
             "album_status": "tagged" if album else "unavailable",
-            "lyricist": track_metadata.lyricist,
-            "lyricist_status": "tagged" if track_metadata.lyricist else "unavailable",
-            "composer": track_metadata.composer,
-            "composer_status": "tagged" if track_metadata.composer else "unavailable",
+            "lyricist": lyricist,
+            "lyricist_status": "tagged" if lyricist else "unavailable",
+            "composer": composer,
+            "composer_status": "tagged" if composer else "unavailable",
+            "credits_source": credits_source,
             "cover_status": cover_status,
             "cover_error": cover_error,
             "lyric_status": lyric_status,
             "cover_embedded": cover_embedded,
+            "ownership": "",
+            "lyric_ownership": "",
         })
 
         try:
@@ -799,9 +828,22 @@ def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
             data["published_size"] = published_size
             data["published_md5"] = published_digest.hexdigest()
             data["published_sha256"] = published_sha256.hexdigest()
+            data["ownership"] = _store_ownership(store)
+            if data["ownership"] != "tagged":
+                _LOGGER.warning(
+                    "manual save ownership_unavailable: published file ownership "
+                    "tagging not confirmed")
+                _log_ownership_failure("ownership_unavailable")
             if lyric_bytes is not None:
                 lyric_basename = basename.rsplit(".", 1)[0] + ".lrc"
                 data["lyric_status"] = _publish_sidecar(store, lyric_basename, lyric_bytes)
+                if data["lyric_status"] == "published":
+                    data["lyric_ownership"] = _store_ownership(store)
+                    if data["lyric_ownership"] != "tagged":
+                        _LOGGER.warning(
+                            "manual save lyric_ownership_unavailable: lyric "
+                            "ownership tagging not confirmed")
+                        _log_ownership_failure("lyric_ownership_unavailable")
             return _result(True, "ok", data)
         if outcome == "conflict":
             data["status"] = "conflict"
@@ -940,6 +982,59 @@ def _credit_text(value: object) -> str:
         ]
         return ARTIST_SEPARATOR.join(names)[:512]
     return ""
+
+
+# The NetEase song-detail object used by ``/api/v1/song/<id>/info`` carries
+# ``ar``/``al`` but no credit fields (verified against NEMbox's weapi
+# ``v3/song/detail``). The lyric endpoint, however, prefixes the timed lyrics
+# with credit lines, e.g. "[00:00.000] 作词 : 周杰伦" / "[00:01.000] 作曲 : 周杰伦".
+# These are the only upstream credits available to this route, so they are
+# parsed from the same lyric text that is saved as the .lrc sidecar.
+_CREDIT_LINE_RE = re.compile(
+    r"^[ \t]*(?:\[[^\]\r\n]{0,64}\][ \t]*)?"
+    r"(?P<label>作词|作曲|词|曲|lyricist|composer)[ \t]*[:：][ \t]*"
+    r"(?P<value>.+?)[ \t]*$",
+    re.IGNORECASE,
+)
+_CREDIT_SCAN_LINES = 64
+_CREDIT_MAX_CHARS = 512
+_CREDIT_LABELS = {
+    "作词": "lyricist",
+    "词": "lyricist",
+    "lyricist": "lyricist",
+    "作曲": "composer",
+    "曲": "composer",
+    "composer": "composer",
+}
+
+
+def _credits_from_lyric(lyric_bytes: object) -> tuple[str, str]:
+    """Extract ``(lyricist, composer)`` from the leading credit lines of a lyric.
+
+    Only the first ``_CREDIT_SCAN_LINES`` lines are inspected; the first
+    explicit credit wins per role. Returns empty strings when the lyric is
+    missing, undecodable, or carries no credit lines. Never raises.
+    """
+    if not isinstance(lyric_bytes, (bytes, bytearray)):
+        return "", ""
+    try:
+        text = bytes(lyric_bytes).decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return "", ""
+    found = {"lyricist": "", "composer": ""}
+    for line in text.splitlines()[:_CREDIT_SCAN_LINES]:
+        match = _CREDIT_LINE_RE.match(line)
+        if match is None:
+            continue
+        role = _CREDIT_LABELS.get(match.group("label").casefold())
+        if role is None or found[role]:
+            continue
+        value = match.group("value").strip()[:_CREDIT_MAX_CHARS]
+        if value:
+            found[role] = value
+        if found["lyricist"] and found["composer"]:
+            break
+    return found["lyricist"], found["composer"]
 
 
 def _fetch_lyric_bytes(
@@ -1550,6 +1645,39 @@ def _store_outcome(result: object) -> str:
     if type(value) is not str:
         return ""
     return value if value in {"published", "conflict"} else ""
+
+
+def _store_ownership(store: object) -> str:
+    """Advisory ownership outcome of the store's latest publication.
+
+    The storage adapter reports ``"tagged"`` only when it confirmed the
+    published inode carries the destination directory's owner/group with mode
+    0640. Adapters without that telemetry (including test fakes) are reported
+    as ``"unavailable"``; ownership never changes save success semantics.
+    """
+    value = getattr(store, "last_ownership", None)
+    if type(value) is str and value in {"tagged", "unavailable"}:
+        return value
+    return "unavailable"
+
+
+def _log_ownership_failure(code: str) -> None:
+    """Best-effort fixed-code line in the desktop gateway log.
+
+    Only runs on Linux (the deployment target), so the Windows test runner never
+    touches the gateway log path. The import is lazy because ``webui_gateway``
+    imports this module; a failure to log never affects the save result.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        if __package__:
+            from . import webui_gateway as gateway  # noqa: PLC0415
+        else:
+            import webui_gateway as gateway  # noqa: PLC0415
+        gateway.gateway_log(code)
+    except Exception:  # noqa: BLE001 - diagnostics never affect a save
+        pass
 
 
 def _success_data(

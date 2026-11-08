@@ -62,7 +62,7 @@ from proxy.quality_policy import (  # noqa: E402
     normalize_quality,
     quality_migration,
 )
-from proxy.version import read_release_channel, ui_version
+from proxy.version import RELEASE_CHANNELS, read_release_channel, release_info
 
 logger = logging.getLogger("webui_service")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -132,20 +132,23 @@ UPDATE_SOURCES = (
     {
         "name": "github",
         "api": "https://api.github.com/repos/javycoder/fnos_music_ext/releases/latest",
+        "list_api": "https://api.github.com/repos/javycoder/fnos_music_ext/releases",
         "page": "https://github.com/javycoder/fnos_music_ext/releases",
     },
     {
         "name": "gitee",
         "api": "https://gitee.com/api/v5/repos/javycoder/fnos_music_ext/releases/latest",
+        "list_api": "https://gitee.com/api/v5/repos/javycoder/fnos_music_ext/releases",
         "page": "https://gitee.com/javycoder/fnos_music_ext/releases",
     },
 )
 # 成功缓存 6 小时（GitHub 匿名限额 60 次/小时），双源皆败负缓存 10 分钟——
-# 前端进页面即查但不轮询，命中缓存不出网
+# 前端进页面即查但不轮询，命中缓存不出网。一次成功检查最多两次出网
+# （latest + 发行版列表），发行版列表的 6h 缓存由本结果缓存一并承担。
 _UPDATE_OK_TTL = 6 * 3600.0
 _UPDATE_FAIL_TTL = 600.0
 _UPDATE_HEADERS = {"User-Agent": f"fnmusic-ext/{SERVICE_VERSION}"}
-# {"ts": float, "data": dict}：ts 为写入时间，data 为最终响应体（失败结果无 source 键）
+# {"ts": float, "ttl": float, "data": dict}：data 为最终响应体
 _update_cache: dict = {}
 
 # 音源进程 ↔ 启用开关（三选一互斥）
@@ -186,6 +189,8 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION": {"kind": "str", "default": "[]", "group": "recommend", "reload": "hot", "label": "公共歌单选择"},
     "FNMUSIC_PUBLIC_PLAYLISTS_BY_USER": {"kind": "str", "default": "", "group": "recommend", "reload": "hot", "label": "各用户公共歌单"},
     "FNMUSIC_TEE_SAVE_ENABLED": {"kind": "bool", "default": "true", "group": "tee", "reload": "hot", "label": "边听边存"},
+    # 整歌单保存开关：宿主网关每次请求都会重读 .env，保存后即生效，无需重启代理。
+    "FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED": {"kind": "bool", "default": "false", "group": "storage", "reload": "hot", "label": "整歌单保存"},
     "FNMUSIC_TEE_SAVE_DIR": {"kind": "dir", "default": "", "group": "storage", "reload": "hot", "label": "下载目录（留空自动探测共享曲库）"},
     "FNMUSIC_DOWNLOAD_LAYOUT": {"kind": "enum", "values": ["flat", "artist", "album", "artist_album"], "default": "flat", "group": "storage", "reload": "hot", "label": "存放方式（beta）"},
     "FNMUSIC_TEE_SAVE_MODE": {"kind": "enum", "values": ["auto", "direct", "staged"], "default": "auto", "group": "storage", "reload": "hot", "label": "落盘方式"},
@@ -1222,12 +1227,77 @@ async def _fetch_json(request: Request, url: str, *, timeout: float = 4.0) -> "t
         return False, {"error": str(exc)}
 
 
-def _read_version() -> str:
+_OFFICIAL_CHANNELS = frozenset(RELEASE_CHANNELS)
+
+
+def _read_package_version() -> str:
+    """VERSION 文件里的完整安装包版本（如 2.12.0-9）；读不到返回空串。"""
     try:
-        channel = read_release_channel(VERSION_PATH.with_name("RELEASE_CHANNEL"), allow_legacy=True)
-        return ui_version(VERSION_PATH.read_text(encoding="utf-8").strip(), channel=channel)
+        text = VERSION_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            return line
+    return ""
+
+
+def _read_channel_optional() -> "str | None":
+    """读取 RELEASE_CHANNEL；文件缺失或内容非法都返回 None（不抛错）。"""
+    try:
+        return read_release_channel(VERSION_PATH.with_name("RELEASE_CHANNEL"), allow_legacy=True)
     except (OSError, ValueError):
-        return SERVICE_VERSION
+        return None
+
+
+def _version_info() -> dict:
+    """安装版本与构建来源。
+
+    - version：完整包版本（含 -N 修订号，用于管理页展示与上游发行包比对）
+    - display_version：管理页展示串（v2.12.0-9）
+    - ui_version：发布身份（v2.12.0 / v2.12.0e），用于与上游 tag 比较
+    - channel：RELEASE_CHANNEL 显式声明的通道；缺失/非法为 None
+    - official_channel：仅当通道文件显式声明 stable/prerelease 时为 True
+    - local_build：非官方渠道或版本号不符合官方发行格式（本地/自编译构建）
+    """
+    raw = _read_package_version()
+    channel = _read_channel_optional()
+    info: dict = {
+        "version": raw,
+        "display_version": SERVICE_VERSION,
+        "ui_version": SERVICE_VERSION,
+        "channel": channel,
+        "official_channel": False,
+        "local_build": True,
+        "reason": "缺少可解析的 VERSION",
+    }
+    if not raw:
+        return info
+    display = "v" + raw.strip().lstrip("vV")
+    info["display_version"] = display
+    info["ui_version"] = display
+    if channel not in _OFFICIAL_CHANNELS:
+        # 本地/自编译构建不会带官方通道文件：不联网检查更新，也不显示 NEW。
+        info["reason"] = "未声明官方发布通道（RELEASE_CHANNEL 缺失或非 stable/prerelease）"
+        return info
+    try:
+        parsed = release_info(raw, channel=channel, allow_legacy=True)
+    except ValueError:
+        info["reason"] = "版本号不符合官方发行格式"
+        return info
+    info.update({
+        "ui_version": parsed["ui_version"],
+        "official_channel": True,
+        "local_build": False,
+        "reason": "",
+    })
+    return info
+
+
+def _read_version() -> str:
+    """管理页展示用完整版本（v2.12.0-9）；无法解析时回退服务版本。"""
+    return _version_info()["display_version"]
 
 
 def _version_nums(v: str) -> "list[int]":
@@ -1309,6 +1379,58 @@ async def _fetch_release(request: Request, source: dict) -> "tuple[bool, dict | 
         # tag 页 URL 缺失时按 tag 名兜底构造（两边仓库发行版页同构 /releases/tag/<tag>）
         "html_url": str(data.get("html_url") or f"{source['page']}/tag/{data['tag_name']}"),
     }
+
+
+# 发行附件名即官方安装包版本：fnmusic-ext-2.12.0-8.fpk（CI 产物命名，见 packaging/fpk/build.sh）
+_RELEASE_ASSET_VERSION_RE = re.compile(r"fnmusic-ext-(?P<version>[0-9][0-9A-Za-z.+-]*?)\.fpk(?:\.sha256)?")
+
+
+def _published_package_versions(releases) -> "set[str]":
+    """上游已发布的安装包版本集合（如 {"2.12.0-8", "2.12.3-0"}）。
+
+    证据只认发行附件名 fnmusic-ext-<version>.fpk（含 .sha256），以及
+    tag/标题中出现的完整版本号；解析不出的条目直接跳过，绝不猜测。
+    """
+    published: set[str] = set()
+    if not isinstance(releases, list):
+        return published
+    for release in releases:
+        if not isinstance(release, dict):
+            continue
+        for asset in release.get("assets") or []:
+            name = asset.get("name") if isinstance(asset, dict) else None
+            if not isinstance(name, str):
+                continue
+            match = _RELEASE_ASSET_VERSION_RE.fullmatch(name.strip())
+            if match:
+                published.add(match.group("version").strip().lstrip("vV"))
+        tag = release.get("tag_name")
+        if isinstance(tag, str) and tag.strip():
+            published.add(tag.strip().lstrip("vV"))
+        title = release.get("name")
+        if isinstance(title, str):
+            for token in re.findall(r"\d+\.\d+\.\d+(?:-[0-9]+)?", title):
+                published.add(token)
+    return published
+
+
+async def _fetch_release_index(request: Request, source: dict) -> "tuple[bool, list | str]":
+    """拉取发行版列表（含历史发行包附件），确认本地安装包是否由上游发行。"""
+    client = get_http(request)
+    try:
+        resp = await client.get(source["list_api"], timeout=6.0, headers=_UPDATE_HEADERS,
+                                params={"per_page": 100})
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{source['name']} 发行版列表 {exc}"
+    if resp.status_code != 200:
+        return False, f"{source['name']} 发行版列表 HTTP {resp.status_code}"
+    try:
+        data = resp.json() if resp.content else None
+    except Exception:  # noqa: BLE001
+        return False, f"{source['name']} 发行版列表响应非 JSON"
+    if not isinstance(data, list):
+        return False, f"{source['name']} 发行版列表响应格式异常"
+    return True, data
 
 
 # ------------------------------------------------------------------ API --
@@ -2364,7 +2486,7 @@ async def api_manual_save_placeholder(target: str = ""):
     WebUI 不是信任边界，也不持有手动保存引擎；任何能直连到这里的请求
     都不可信，一律回 501，不得降级为可执行路径。
     """
-    raise HTTPException(status_code=501, detail="直连模式不支持手动保存，请在飞牛桌面内打开管理台")
+    raise HTTPException(status_code=501, detail="直连模式不支持手动保存，请从飞牛桌面打开管理台，或稍后重试")
 
 
 @app.post("/api/maintenance/cleanup")
@@ -2569,11 +2691,17 @@ class _LogExportResponse(FileResponse):
 @app.get("/api/about")
 async def api_about():
     values = read_env()
+    version_info = _version_info()
     donate_alipay = (STATIC_DIR / "alipay.png").is_file()
     donate_wechat = (STATIC_DIR / "wechat.png").is_file()
     return {
         "ok": True,
-        "version": _read_version(),
+        "version": version_info["display_version"],
+        # 构建来源只依赖本地文件：官方渠道 + 版本格式可解析才算 official；
+        # 是否真的由上游发行由 /api/update-check 用发行版附件进一步确认。
+        "channel": version_info["channel"],
+        "build_kind": "local" if version_info["local_build"] else "official",
+        "build_reason": version_info["reason"],
         "deploy_mode": values.get("FNMUSIC_DEPLOY_MODE", "docker"),
         **ABOUT,
         "disclaimer": _read_disclaimer(),
@@ -2587,44 +2715,101 @@ async def api_about():
     }
 
 
+def _update_cache_store(now: float, ttl: float, result: dict) -> None:
+    _update_cache.clear()
+    _update_cache.update({"ts": now, "ttl": ttl, "data": result})
+
+
+def _update_cache_fresh(now: float) -> "dict | None":
+    cached = _update_cache.get("data")
+    if not cached:
+        return None
+    ttl = _update_cache.get("ttl")
+    if not isinstance(ttl, (int, float)):
+        ttl = _UPDATE_OK_TTL if "source" in cached else _UPDATE_FAIL_TTL
+    return cached if now - float(_update_cache.get("ts", 0.0)) < ttl else None
+
+
 @app.get("/api/update-check")
 async def api_update_check(request: Request):
     """检查更新：GitHub Releases 优先，不可达（被墙/限流）回退 Gitee。
 
-    结果缓存（成功 6h / 双源皆败 10min，按响应里有无 source 键区分）：
-    前端进页面即查但不轮询，命中缓存不出网。双源皆败不报 500——前端静默降级，
-    红点只是锦上添花，不能因检查失败打扰用户。"""
+    只有「官方渠道安装（RELEASE_CHANNEL=stable/prerelease）+ 本地安装包确由
+    上游发行（出现在发行版附件列表里）+ 上游发行版本更高」才 has_update=true。
+    本地/自编译构建（通道缺失、版本号不合官方格式、或本地包不在上游发行附件
+    中）一律 build_kind=local，不显示 NEW/升级入口。网络或数据异常时
+    fail-closed（build_kind=unknown、has_update=false），绝不 500。
+    结果缓存（成功 6h / 失败 10min）：前端进页面即查但不轮询，命中缓存不出网。
+    """
     now = time.time()
-    cached = _update_cache.get("data")
-    if cached and now - _update_cache.get("ts", 0.0) < (
-            _UPDATE_OK_TTL if "source" in cached else _UPDATE_FAIL_TTL):
+    cached = _update_cache_fresh(now)
+    if cached is not None:
         return cached
-    current = _read_version()
+    version_info = _version_info()
+    current = version_info["display_version"]
+    base = {
+        "ok": True,
+        "current_version": current,
+        "channel": version_info["channel"],
+        "build_kind": "local",
+        "has_update": False,
+    }
+    if not version_info["official_channel"]:
+        # 本地/自编译构建：不联网检查，明确标记为本地构建（不显示 NEW）。
+        result = dict(base, checked_at=int(now), build_reason=version_info["reason"])
+        _update_cache_store(now, _UPDATE_OK_TTL, result)
+        return result
     errors: list[str] = []
     for source in UPDATE_SOURCES:
         ok, payload = await _fetch_release(request, source)
         if not ok:
             errors.append(str(payload))
             continue
+        index_ok, index = await _fetch_release_index(request, source)
+        if not index_ok:
+            # 无法确认本地包是否由上游发行 → fail-closed：不显示更新入口。
+            errors.append(str(index))
+            result = dict(
+                base,
+                build_kind="unknown",
+                checked_at=int(now),
+                source=source["name"],
+                latest=payload,
+                error="；".join(errors),
+            )
+            _update_cache_store(now, _UPDATE_FAIL_TTL, result)
+            return result
+        published = _published_package_versions(index)
+        if version_info["version"] not in published:
+            # 官方渠道但安装包不是上游发行产物（自编译/重打包）→ 本地构建。
+            result = dict(
+                base,
+                checked_at=int(now),
+                source=source["name"],
+                latest=payload,
+                build_reason="当前安装包不是上游发行的安装包",
+            )
+            _update_cache_store(now, _UPDATE_OK_TTL, result)
+            return result
         result = {
             "ok": True,
             "current_version": current,
-            "has_update": _version_newer(str(payload["version"]), current),
+            "channel": version_info["channel"],
+            "build_kind": "official",
+            "has_update": _version_newer(str(payload["version"]), version_info["ui_version"]),
             "source": source["name"],
             "checked_at": int(now),
             "latest": payload,
         }
-        _update_cache.clear()
-        _update_cache.update({"ts": now, "data": result})
+        _update_cache_store(now, _UPDATE_OK_TTL, result)
         return result
-    result = {
-        "ok": True,
-        "current_version": current,
-        "has_update": False,
-        "error": "；".join(errors) or "所有更新源均不可达",
-    }
-    _update_cache.clear()
-    _update_cache.update({"ts": now, "data": result})
+    result = dict(
+        base,
+        build_kind="unknown",
+        checked_at=int(now),
+        error="；".join(errors) or "所有更新源均不可达",
+    )
+    _update_cache_store(now, _UPDATE_FAIL_TTL, result)
     return result
 
 

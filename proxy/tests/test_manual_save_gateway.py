@@ -355,6 +355,7 @@ def test_track_success_returns_sanitized_engine_result():
         "published_md5", "published_sha256", "title_status", "artist_status", "album_status",
         "lyricist", "lyricist_status", "composer", "composer_status",
         "cover_status", "cover_error", "lyric_status",
+        "ownership", "lyric_ownership", "credits_source",
     }
     assert set(payload["data"]) == expected_fields
     assert payload["data"]["status"] == "published"

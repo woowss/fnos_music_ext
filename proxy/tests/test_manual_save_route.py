@@ -155,9 +155,11 @@ def _small_png_with_unsafe_dimensions(width=50_000, height=1):
 
 
 class FakeStore:
-    def __init__(self, publish_result="published", outcomes=None):
+    def __init__(self, publish_result="published", outcomes=None, ownership="tagged"):
         self.publish_result = publish_result
         self.outcomes = list(outcomes or [])
+        self.ownership = ownership
+        self.last_ownership = ownership
         self.begin_target = None
         self.chunks = []
         self.sealed = False
@@ -180,6 +182,7 @@ class FakeStore:
         self.published_names.append(basename)
         outcome = self.outcomes.pop(0) if self.outcomes else self.publish_result
         if outcome == "published":
+            self.last_ownership = self.ownership
             return manual_save_core.StoreResult.PUBLISHED
         return manual_save_core.StoreResult.CONFLICT
 
@@ -390,9 +393,12 @@ def test_success_publishes_tagged_bytes_and_hides_signed_url(tmp_path):
     assert data["lyricist_status"] == "unavailable"
     assert data["composer"] == ""
     assert data["composer_status"] == "unavailable"
+    assert data["credits_source"] == "upstream_unavailable"
     assert data["cover_status"] == "unavailable"
     assert data["cover_error"] == ""
     assert data["lyric_status"] == "unavailable"
+    assert data["ownership"] == "tagged"
+    assert data["lyric_ownership"] == ""
     assert data["published_size"] == len(b"TAGGED:" + PAYLOAD)
     assert data["published_md5"] == hashlib.md5(b"TAGGED:" + PAYLOAD).hexdigest()
     assert data["published_sha256"] == hashlib.sha256(b"TAGGED:" + PAYLOAD).hexdigest()
@@ -403,7 +409,9 @@ def test_success_publishes_tagged_bytes_and_hides_signed_url(tmp_path):
         "target_dir", "tagged", "cover_embedded", "published_size",
         "published_md5", "published_sha256", "title_status", "artist_status", "album_status",
         "lyricist", "lyricist_status", "composer", "composer_status",
+        "credits_source",
         "cover_status", "cover_error", "lyric_status",
+        "ownership", "lyric_ownership",
     }
     assert store.begin_target == "manual-save"
     assert b"".join(store.chunks) == b"TAGGED:" + PAYLOAD
@@ -456,10 +464,13 @@ def test_success_embeds_trusted_cover_saves_lrc_and_uses_explicit_credits(tmp_pa
     assert data["cover_embedded"] is True
     assert data["cover_status"] == "embedded"
     assert data["lyric_status"] == "published"
+    assert data["ownership"] == "tagged"
+    assert data["lyric_ownership"] == "tagged"
     assert data["lyricist"] == "作词者甲/作词者乙"
     assert data["lyricist_status"] == "tagged"
     assert data["composer"] == "作曲者"
     assert data["composer_status"] == "tagged"
+    assert data["credits_source"] == "info"
     assert seen["cover_url"] == "https://p1.music.126.net/cover.jpg"
     assert seen["cover_bytes"] == cover_bytes
     assert seen["metadata"]["lyricist"] == "作词者甲/作词者乙"
@@ -481,7 +492,116 @@ def test_sidecar_conflict_does_not_change_audio_success_or_overwrite_existing_ly
     assert result["ok"] is True
     assert result["data"]["status"] == "published"
     assert result["data"]["lyric_status"] == "conflict"
+    assert result["data"]["lyric_ownership"] == ""
     assert store.published_names[-1].endswith(".lrc")
+
+
+def test_ownership_unavailable_is_reported_without_failing_the_save(tmp_path):
+    store = FakeStore(ownership="unavailable")
+    deps, _store, _workdir = _pipeline_deps(tmp_path, store=store)
+    result = route.save_track(489970550, deps=deps)
+    assert result["ok"] is True
+    assert result["code"] == "ok"
+    assert result["data"]["status"] == "published"
+    assert result["data"]["ownership"] == "unavailable"
+    assert result["data"]["lyric_ownership"] == ""
+    assert store.published_names[0].endswith(".flac")
+
+
+def test_ownership_telemetry_absent_from_store_is_unavailable(tmp_path):
+    class NoTelemetryStore(FakeStore):
+        def __init__(self):
+            super().__init__()
+            self.last_ownership = None
+
+        def publish_noreplace(self, stage, basename):
+            self.published_basename = basename
+            self.published_names.append(basename)
+            return manual_save_core.StoreResult.PUBLISHED
+
+    deps, _store, _workdir = _pipeline_deps(tmp_path, store=NoTelemetryStore())
+    result = route.save_track(489970550, deps=deps)
+    assert result["ok"] is True
+    assert result["data"]["ownership"] == "unavailable"
+
+
+def test_credits_are_read_from_lyric_when_info_has_none(tmp_path):
+    lyric_text = (
+        "[00:00.000] 作词 : 周杰伦\n"
+        "[00:01.000] 作曲 : 周杰伦\n"
+        "[00:02.000] 编曲 : 钟兴民\n"
+        "[00:10.000] 歌词第一行"
+    )
+    seen = {}
+
+    def fake_tag(source, tagged, metadata):
+        seen["metadata"] = dict(metadata)
+        tagged.write_bytes(b"TAGGED:" + source.read_bytes())
+
+    deps, store, _workdir = _pipeline_deps(
+        tmp_path,
+        lyric={"ok": True, "data": {"lyric": lyric_text}},
+        tag=fake_tag,
+    )
+    result = route.save_track(489970550, deps=deps)
+    assert result["ok"] is True
+    data = result["data"]
+    assert data["lyricist"] == "周杰伦"
+    assert data["lyricist_status"] == "tagged"
+    assert data["composer"] == "周杰伦"
+    assert data["composer_status"] == "tagged"
+    assert data["credits_source"] == "lyric"
+    assert seen["metadata"]["lyricist"] == "周杰伦"
+    assert seen["metadata"]["composer"] == "周杰伦"
+    assert data["lyric_status"] == "published"
+    assert store.published_names == [
+        "歌手A_歌手B - 测试歌曲.flac", "歌手A_歌手B - 测试歌曲.lrc",
+    ]
+
+
+def test_info_credits_take_precedence_over_lyric_credits(tmp_path):
+    def info_http(_url):
+        info = _info_payload()
+        info["data"]["lyricist"] = "信息作词"
+        info["data"]["composer"] = "信息作曲"
+        return info
+
+    seen = {}
+
+    def fake_tag(source, tagged, metadata):
+        seen["metadata"] = dict(metadata)
+        tagged.write_bytes(b"TAGGED:" + source.read_bytes())
+
+    deps, _store, _workdir = _pipeline_deps(
+        tmp_path,
+        info=info_http(None),
+        lyric={"ok": True, "data": {
+            "lyric": "[00:00.000] 作词 : 歌词作词\n[00:01.000] 作曲 : 歌词作曲",
+        }},
+        tag=fake_tag,
+    )
+    result = route.save_track(489970550, deps=deps)
+    assert result["ok"] is True
+    assert result["data"]["lyricist"] == "信息作词"
+    assert result["data"]["composer"] == "信息作曲"
+    assert result["data"]["credits_source"] == "info"
+    assert seen["metadata"]["lyricist"] == "信息作词"
+    assert seen["metadata"]["composer"] == "信息作曲"
+
+
+def test_missing_credits_stay_unavailable_even_with_plain_lyric(tmp_path):
+    deps, _store, _workdir = _pipeline_deps(
+        tmp_path,
+        lyric={"ok": True, "data": {"lyric": "[00:00.00]只有歌词没有词曲信息"}},
+    )
+    result = route.save_track(489970550, deps=deps)
+    assert result["ok"] is True
+    assert result["data"]["lyricist"] == ""
+    assert result["data"]["lyricist_status"] == "unavailable"
+    assert result["data"]["composer"] == ""
+    assert result["data"]["composer_status"] == "unavailable"
+    assert result["data"]["credits_source"] == "upstream_unavailable"
+    assert result["data"]["lyric_status"] == "published"
 
 
 @pytest.mark.parametrize("stage", ["cover", "lyric"])
