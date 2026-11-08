@@ -128,3 +128,82 @@ docker logs --tail 300 fnmusic-sources 2>&1 | grep -ciE 'traceback|error'
 cat /var/apps/trim.music/manifest | grep -E 'appname|version'
 cat /vol1/@appcenter/fnmusic-ext/repo/FNMUSIC_COMPAT.json
 ```
+
+## 8. 处理结果（2026-11-08 14:32–14:50 CST / 15:32–15:50 JST，用户已授权写操作）
+
+### 8.1 F1 LLM 推荐 —— 已修复并实测通过
+
+- **根因确认（两条）**：
+  1. 路径错配：`protocol=responses` + base 已含 `/chat/completions` → 实际请求 `…/chat/completions/responses`（404）。
+  2. 凭据不可用：原 `oc_sk` key 属于 DSH 的 `opencode-go` provider（`https://opencode.ai/inference/go/v1`），该上游要求 `x-opencode-session` 头（实测无头返回 `400 MissingSessionID`），扩展无法注入该头；原 key 对旧路径 `…/openai/v1` 亦返回 `401 Invalid credential`。
+- **采用方案**：改用 DSH 中已配置的 `new-api` provider（OpenAI Responses/Chat 兼容）：
+  - `FNMUSIC_LLM_BASE_URL='https://llm.tantantan.tech/v1'`
+  - `FNMUSIC_LLM_PROTOCOL='chat'`（扩展拼接 `/chat/completions`）
+  - `FNMUSIC_LLM_MODEL='deepseek-v4.1-flash'`
+  - `FNMUSIC_LLM_API_KEY` = new-api key（写入设备 `.env`，未在文档/日志中出现）
+  - `FNMUSIC_LLM_TIMEOUT_S='60'`（原默认 20s 偏短：实测一次 2,204 token 的真实请求耗时 25.26s）
+- **变更前备份**：`repo/.env.bak.20261108-143203`（root:root 640）。`.env` 保持 `kurumi:Administrators 640`。
+- **运行态验证**（服务已重启，MainPID 变更）：
+  - 子进程环境（`/proc/<uvicorn pid>/environ`）：`FNMUSIC_LLM_BASE_URL=https://llm.tantantan.tech/v1`、`PROTOCOL=chat`、`MODEL=deepseek-v4.1-flash`（`API_KEY` 已设置）。
+  - 扩展代码路径：`recommend._llm_endpoint()` = `('chat', 'https://llm.tantantan.tech/v1/chat/completions')`；`recommend._llm_complete()` 返回 `ok`，账本记 42+2 token（用 `/tmp` 隔离账本验证，未污染正式账本）。
+  - 真实规模请求：HTTP 200 / 8,877 B / **25.26s** / prompt 95 + completion 2,109 token，返回合法 JSON 歌曲数组。
+- 说明：`llm_usage.json` 中 2026-11-08 的 4 次历史失败（http-404×3、timeout×1）保留为审计记录，未篡改；`lastFailure` 会在下一次失败时覆盖（成功不清空，属既有行为）。
+
+### 8.2 F4 手动保存目录 —— 已建立
+
+```text
+install -d -m 750 -o kurumi -g Users /vol1/1000/fnmusic-test-20261031
+install -d -m 700 -o root   -g root  /vol1/1000/fnmusic-manual-save-staging
+```
+
+- 实测：`drwxr-x--- kurumi:Users`、`drwx------ root:root`，两者 `st_dev=60`（同 btrfs 挂载，满足原子 rename 前提）。
+- 以扩展代码验证：`manual_save_route.load_config()` → `enabled=true`、target/staging 路径一致；`O_RDONLY|O_DIRECTORY` 打开均 `OPEN_OK`（原 `staging_unavailable` 风险解除）。
+- P7 真实保存验收仍需用户指认测试曲目（本步未写任何音频文件）。
+
+### 8.3 F5 回滚资产 —— 已恢复
+
+- 从 Windows 副本恢复四个 FPK 与校验文件到 `/vol1/1000/fnmusic-deploy-20261107/`（目录 700，文件 600，root）：
+  - `fnmusic-ext-2.10.2.fpk` 28,072,710 B `77bb7566…` ✔
+  - `fnmusic-ext-2.8.2-rollback.fpk` 27,170,364 B `1379e2e9…` ✔
+  - `fnmusic-ext-2.12.0-8.fpk` 29,963,672 B `cd5d71ff…` ✔
+  - `fnmusic-ext-2.12.0-9.fpk` 29,919,023 B `35af6788…` ✔
+  - `SHA256SUMS`（368 B）由设备侧重算生成，四个哈希与交接文档完全一致。
+- 新建当前状态备份：`/vol1/1000/fnmusic-backup-20261108-post-2120-9.tar.gz`，30,036,776 B，`sha256 6cdd40dad827baf0063a775a642be55b127fc0126d7fdb28de61937537a2cc3b`（排除 `.venv-proxy`/`__pycache__`/`recommend_cache`/`cache`；已验证含 `.env`、`online_favorites`、`play_history`、`sources-data`）。
+- 原 `fnmusic-backup-20261107-pre-212`（2.10.2 时代 41,325,507 B）**不可恢复**；回滚到 2.10.2 现在仍有 FPK 可用。
+
+### 8.4 F6 Docker 悬空镜像 —— 已清理（保留构建缓存）
+
+- 删除 4 个 `fnmusic-sources` 悬空镜像：`b36effe0`（指纹 82d75107）、`1fbf38aa`（dc712048）、`ba948fa4`（2c4fbdcb）、`39153d82`（2026-10-11 旧构建），共约 5.28 GB。
+- `docker system df`：Images 10.94 GB→9.136 GB；可回收 7.347 GB→4.34 GB。
+- **刻意保留** Build Cache（2.575 GB）与 `fnmusic-sources:latest`、`fnmusic-sources:rollback-20261101` 镜像——前者用于下次 FPK 升级时命中 apt/pip 层（NAS 外网弱），后者是 2.10.2 回滚镜像。
+- 其余可回收层属其它应用（ani-rss/ubuntu 旧层），未动。
+
+### 8.5 F3 开机竞态 —— 代码已修 + 设备已打补丁（未触发镜像重建）
+
+- 仓库 `packaging/fpk/cmd/main`：`start` 分支在调用 `extend.sh` 前对有界等待 `/var/run/trim_music.socket` / `trim_music_upstream.socket`（默认 90s，可由 `FNMUSIC_START_SOCKET_WAIT_S` 覆盖），并写明确的 `[INFO]`/`[WARN]` 日志；超时仍交由 `extend.sh` 输出原诊断。
+- 设备热补丁：`/var/apps/fnmusic-ext/cmd/main`（备份 `main.bak-20261108-pre-socketwait`，原文件与仓库 `ae7680d` 版本逐字节一致，`bash -n` 通过）。该路径在 App Center 应用包目录、**不在** Dockerfile COPY 源内，不影响 `build_fingerprint`，不会触发镜像重建。
+- 未改动设备上的 `repo/proxy/*.py`、`repo/webui-service/*.py`：这些是 Dockerfile COPY 源，直接改会让构建指纹漂移、下次 `extend.sh` 触发镜像重建（弱网下风险高）；对应修复随下个 FPK 生效。
+
+### 8.6 F2 `lastFailure.at` 截断 + F1 预防性校验 —— 代码已修 + 测试
+
+- `proxy/llm_usage.py`：新增 `_MAX_TS=4_102_444_800` 与 `_safe_epoch()`，`_safe_failure()` 的时间戳不再套用 `_MAX_INT(1e9)`。
+- `webui-service/app.py::validate_updates()`：当本次保存涉及 `FNMUSIC_LLM_BASE_URL`/`FNMUSIC_LLM_PROTOCOL` 时校验组合，拒绝 `responses + …/chat/completions` 与 `chat + …/responses` 两种错配，并给出可执行的修改建议。
+- `FNMUSIC_COMPAT.json`：`music_versions` 增加 `1.1.19`，`checked_at=2026-11-08`，notes 记录路径级核对结论与新增端点直通说明。
+- 测试（本地 venv，Python 3.14）：
+  - `proxy/tests/test_llm_ledger.py` **19 passed**（含新增 `test_failure_epoch_timestamp_not_clamped`）
+  - `proxy/tests/test_llm_protocols.py` **18 passed**
+  - `webui-service/test_webui.py` **337 passed / 1 failed**，唯一失败是 `test_logs_export_excludes_symlinks_and_listing_matches`，原因 Windows 无符号链接权限（`WinError 1314`），与本次改动无关
+  - `bash -n packaging/fpk/cmd/main` 通过
+- 提交：`65ae09a`（代码+测试+compat）、`0ad120a`（本证据文档）、另见本次处理追加提交。
+
+### 8.7 处理后的整体状态（只读复核）
+
+| 项 | 结果 |
+| --- | --- |
+| 服务 | active/running，`NRestarts=0`，14:46:50 启动 |
+| 容器 | running / healthy，`RestartCount=0` |
+| healthz | `ok:true version:2.12.0-9 upstream:ok musicbox:ok llm:enabled` |
+| WebUI | `:8774/` 200 / 48,890 B |
+| 日志 | 服务 0 critical/traceback；容器近 50 行 0 error |
+| 目录/资产 | P7 两目录存在；FPK×4 + SHA256SUMS + 新备份均在；`/vol1` 仍 57% |
+
