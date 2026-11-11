@@ -276,3 +276,39 @@ install -d -m 700 -o root   -g root  /vol1/1000/fnmusic-manual-save-staging
 - `webui-service`：350 passed, 1 failed（Windows 符号链接权限环境问题）；`node test_app_js.js` 199/199。
 - 网关新增测试：日志落盘/自动建目录/不可写路径不抛异常/查询串不入日志。
 - 设备实测：手动保存属主与 0640 正确、网关日志落盘、`/api/about` 与 `/api/update-check` 行为符合预期、SCHEMA 新键生效、搜索新配置热重载生效。
+
+## 11. 2026-11-09 23:1x–24:0x JST 真实用户复验（完成「以一个真实用户的视角完成审查」）
+
+> 方式：从飞牛桌面打开「fnMusic 扩展管理」，按普通用户路径逐页点击；遇到异常时用 Edge DevTools 控制台读取真实 HTTP 状态（普通用户也可看到控制台报错）。截图见 `docs/evidence/20261108/screenshots/`（`about-local-build.png`、`save-nas-toggle.png`、`save-success-credits.png`、`transient-save-failure.png`、`devtools-501-evidence.png`）。
+
+### 11.1 ✅ 已修复项的真实界面复验（通过）
+
+| 项 | 界面证据 | 结论 |
+| --- | --- | --- |
+| U4 版本/NEW | 侧边栏与关于页均显示 **v2.12.0-9**；关于页徽标为「v2.12.0-9 / Docker 部署 / **本地构建**」，无 NEW、导航无红点 | 通过 |
+| U7 整歌单开关 | 「保存到 NAS → 手动保存歌单」出现「整歌单保存」开关（未勾选），文案：「整歌单保存未开启，可在本页上方的开关开启（保存后立即生效，无需重启代理）」 | 通过 |
+| U6 词曲文案 | 保存成功提示：`…封面已嵌入·歌词已保存为同名 LRC·歌手标签已写入·词/曲：上游未提供`（不再出现两个「未提供」） | 通过 |
+| U5 属主/权限 | 界面保存 3 首均成功；设备核实全部为 `-rw-r----- kurumi Users`（0640） | 通过（3 次） |
+| 冲突语义 | 对已存在文件再次点保存 → 提示「目标目录已存在同名文件，未覆盖。」，不覆盖原文件 | 通过 |
+| U2 App Center | 桌面入口存在；App Center stop/start 后 `isOpen:true / running`，无 APP_CRASH，桌面图标正常 | 通过 |
+| U3 网关日志 | `/var/log/apps/fnmusic-ext-gateway.log` 记录 `gateway-start`、`dispatch manual-save op=track/search/status/playlist`，并新增 `manual-save track result code=conflict` 结果码 | 通过（可定位） |
+
+### 11.2 ⚠️ 新发现（真实用户可见）
+
+**N1（高）重启扩展后，管理页的「首次特权请求」可能失败且提示误导**
+- 现象：App Center 重启扩展后进入管理页，「保存」或「搜索」第一次点按可能失败：保存显示「保存失败：内部错误」，搜索显示「搜索失败：服务不可用」；重试一次或刷新页面即恢复。
+- DevTools 证据（`devtools-501-evidence.png`）：这些请求真实返回 **HTTP 501**（`/app/fnmusic-ext/api/manual-save/track`）、501（`/api/search?…`）、403（`/api/playlist/playlists`）、503（`/api/platforms`）——501 是 WebUI 直连占位响应，说明请求**没有走桌面网关**，而是落到了 WebUI 服务。
+- 网关日志同步证据：这些失败请求**没有** `dispatch manual-save …` 行（未到网关）；而同一 URL 稍后从页面控制台手发 fetch 得到 501→改回网关后的 409/200 正常结果。
+- 根因方向：fnOS 应用中心重启期间 `trim_http_cgi` 先 `upstream remove`（22:39:09）再 `upstream register`（22:39:46），浏览器到该前缀的持久连接/上游状态在切换窗口内可能落到 WebUI 直连路由；窗口过后恢复。
+- 建议：① 前端把现有 501/503 自动重试从「状态接口」扩展到保存/搜索/歌单接口；② 失败文案改为「扩展服务正在重启/路由未就绪，请重试或刷新页面」；③ 文档提示「重启扩展后刷新一次管理页」。
+- 现状：已用旧版前端复现，属**用户可感知但可自愈**的问题，建议下个补丁修（本次未改，避免再动容器侧）。
+
+**N2（低）失败行状态残留**：保存失败的行会保留「失败」标记，且没有「重试」字样，用户需再点一次「保存」才能重试（可接受，但可改进）。
+
+**N3（运维）`fnos-cli app start` 客户端超时**：连续两次出现 `http2: timeout awaiting response headers`，但应用实际已启动（`isOpen:true`）。自动化应把该超时当「结果未知 → 轮询状态」，不要直接判失败。
+
+### 11.3 本轮代码改动（诊断能力，已热更设备）
+
+- `proxy/webui_gateway.py`：新增 `manual-save worker-exception class=…`、`manual-save track result code=…`、`engine-status-unavailable` 固定 code 日志（不含异常文本/请求数据），用于定位偶发失败。
+- `proxy/manual_save_route.py`：复核后确认 `sys` 原本已导入（先前怀疑的 NameError 不成立）；保留「属主告警失败绝不影响保存」的健壮性测试 `test_ownership_failure_log_never_raises_and_is_fixed_code`，并去掉一处重复 import。
+- 设备热更：两份文件已覆盖并 App Center stop/start 重启（`isOpen:true`，网关新 pid 682042）；日志已验证输出结果码。

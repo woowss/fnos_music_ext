@@ -1668,9 +1668,9 @@ def _log_ownership_failure(code: str) -> None:
     touches the gateway log path. The import is lazy because ``webui_gateway``
     imports this module; a failure to log never affects the save result.
     """
-    if not sys.platform.startswith("linux"):
-        return
     try:
+        if not sys.platform.startswith("linux"):
+            return
         if __package__:
             from . import webui_gateway as gateway  # noqa: PLC0415
         else:

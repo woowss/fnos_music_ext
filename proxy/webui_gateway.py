@@ -1038,7 +1038,9 @@ def _run_manual_save(engine, song_id: int, timeout: float):
         try:
             try:
                 holder["value"] = engine.save_track(song_id)
-            except BaseException:  # noqa: BLE001 — worker errors become fixed JSON
+            except BaseException as exc:  # noqa: BLE001 — worker errors become fixed JSON
+                # 固定 code 日志：只记异常类名，便于定位偶发 internal；不记异常文本。
+                gateway_log(f"manual-save worker-exception class={type(exc).__name__}")
                 holder["value"] = _manual_save_error("internal")
         finally:
             MANUAL_SAVE_PLAYLIST_LOCK.release()
@@ -1116,6 +1118,7 @@ def handle_manual_save_track(client: socket.socket, head_raw: bytes, *,
             return
         engine_result = _engine_status(active_engine)
         if engine_result is None:
+            gateway_log("manual-save track engine-status-unavailable")
             client.sendall(_json_response(500, _manual_save_error("internal")))
             return
         if engine_result.get("ok") is not True:
@@ -1150,9 +1153,11 @@ def handle_manual_save_track(client: socket.socket, head_raw: bytes, *,
             MANUAL_SAVE_TIMEOUT if timeout is None else timeout,
         )
         if result is None:
+            gateway_log("manual-save track result code=timeout")
             client.sendall(_json_response(504, _manual_save_error("timeout")))
             return
         payload = _sanitize_manual_save_result(result)
+        gateway_log(f"manual-save track result code={payload['code']}")
         client.sendall(_json_response(
             _manual_save_http_status(payload["code"], payload["ok"]), payload,
         ))

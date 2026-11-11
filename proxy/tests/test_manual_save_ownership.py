@@ -162,3 +162,34 @@ def test_real_fchown_and_fchmod_round_trip_on_published_file(tmp_path):
     assert status == "tagged"
     assert (info.st_uid, info.st_gid) == (uid, gid)
     assert stat.S_IMODE(info.st_mode) == 0o640
+
+
+def test_ownership_failure_log_never_raises_and_is_fixed_code(monkeypatch):
+    """属主告警只能写固定 code；任何平台/导入/写入失败都不得影响保存结果。
+
+    真实用户保存链路要求：诊断日志失败绝不能把一次成功保存变成失败
+    （2026-11-09 真实用户复现一次「内部错误」，网关侧无法定位；
+    该测试保证告警路径在任何平台/任何 sink 故障下都静默降级）。
+    """
+    from proxy import manual_save_route as route
+    import proxy.webui_gateway as gateway
+
+    calls = []
+    monkeypatch.setattr(gateway, "gateway_log", lambda code: calls.append(code))
+
+    monkeypatch.setattr(route.sys, "platform", "linux")
+    route._log_ownership_failure("ownership_unavailable")
+    assert calls == ["ownership_unavailable"]
+
+    calls.clear()
+    monkeypatch.setattr(route.sys, "platform", "win32")
+    route._log_ownership_failure("lyric_ownership_unavailable")
+    assert calls == []
+
+    monkeypatch.setattr(route.sys, "platform", "linux")
+
+    def broken(_code):
+        raise RuntimeError("log sink down")
+
+    monkeypatch.setattr(gateway, "gateway_log", broken)
+    route._log_ownership_failure("ownership_unavailable")  # 不抛异常即通过
