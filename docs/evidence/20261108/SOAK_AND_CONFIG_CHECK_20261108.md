@@ -342,3 +342,10 @@ install -d -m 700 -o root   -g root  /vol1/1000/fnmusic-manual-save-staging
 - N2（低）：失败行残留「失败」标记，无「重试」文案。
 - N3（运维）：`fnos-cli app start` 客户端 http2 超时但实际启动成功（本轮 3 次），自动化应轮询状态而非判失败。
 - LLM 推荐质量依赖所选模型：默认 `deepseek-v4.1-flash` 推理模型不适配本任务；建议把「推荐模型」默认值改为非推理模型或增加「推理模型需要更长超时」的说明/校验。
+
+### 12.4 用户裁定：禁止使用 gpt-4.1-mini（2026-11-11 22:3x）
+
+- 用户明确「不允许使用」`gpt-4.1-mini`。已立即回滚：`FNMUSIC_LLM_MODEL` 恢复为 `deepseek-v4.1-flash`（热重载日志 21:27:58 确认），该模型生成的推荐缓存已被配置变更清除，**后续不得再调用该模型**。
+- 代价（用户已知情）：`deepseek-v4.1-flash` 为推理模型，真实推荐 prompt 单次 53s 起、更大 prompt 仍会超时；21:30 猜你喜欢构建仍记录 `lastFailure: timeout`，每日推荐/猜你喜欢将回退本地/榜单兜底。
+- 保留内容：`recommend.py` 超时上限 60→180s 的代码修复（与模型无关，属通用健壮性）；`.env` 的 `LLM_TIMEOUT_S=120`、`RECOMMEND_BUDGET_S=180`、`MAX_TOKENS=16384` 保留。
+- 如需 LLM 推荐真正可用，须由用户指定「允许使用的非推理模型」（同一中转下可选 gemini/claude 等）或明确关闭 LLM 推荐；在获得授权前不再更换模型。
