@@ -73,7 +73,7 @@ LLM_CANDIDATE_COUNT = _env_int("FNMUSIC_RECOMMEND_CANDIDATES", 36, 10, 60)
 # issue #55：歌单曲目数可配（每日推荐/热门推荐两链同口径）
 PLAYLIST_SIZE = _env_int("FNMUSIC_RECOMMEND_SIZE", 20, 5, 100)
 RECOMMEND_COUNT = PLAYLIST_SIZE  # 兼容旧引用
-LLM_TIMEOUT_S = _env_float("FNMUSIC_LLM_TIMEOUT_S", 20.0, 5.0, 60.0)
+LLM_TIMEOUT_S = _env_float("FNMUSIC_LLM_TIMEOUT_S", 20.0, 5.0, 180.0)
 BUILD_BUDGET_S = _env_float("FNMUSIC_RECOMMEND_BUDGET_S", 40.0, 10.0, 180.0)
 # local-random 层候选池读取量：排除集（最近播放/收藏）在 SQL 后过滤，
 # 池子放大几倍避免排除后不足 20 首；本地曲库本身很小时按库存返回
@@ -128,7 +128,7 @@ def llm_candidate_count() -> int:
 
 
 def llm_timeout_s() -> float:
-    return _env_float("FNMUSIC_LLM_TIMEOUT_S", LLM_TIMEOUT_S, 5.0, 60.0)
+    return _env_float("FNMUSIC_LLM_TIMEOUT_S", LLM_TIMEOUT_S, 5.0, 180.0)
 
 
 def llm_protocol() -> str:

@@ -312,3 +312,33 @@ install -d -m 700 -o root   -g root  /vol1/1000/fnmusic-manual-save-staging
 - `proxy/webui_gateway.py`：新增 `manual-save worker-exception class=…`、`manual-save track result code=…`、`engine-status-unavailable` 固定 code 日志（不含异常文本/请求数据），用于定位偶发失败。
 - `proxy/manual_save_route.py`：复核后确认 `sys` 原本已导入（先前怀疑的 NameError 不成立）；保留「属主告警失败绝不影响保存」的健壮性测试 `test_ownership_failure_log_never_raises_and_is_fixed_code`，并去掉一处重复 import。
 - 设备热更：两份文件已覆盖并 App Center stop/start 重启（`isOpen:true`，网关新 pid 682042）；日志已验证输出结果码。
+
+## 12. 2026-11-11 21:0x–22:2x JST 浏览器真实用户判断（音乐 App 实测）
+
+> 方式：在已登录的飞牛桌面里打开「音乐」App，按普通用户操作搜索/播放/看每日推荐；异常时用 DevTools/服务端日志取证。截图：`daily-llm-playlist.png`、`search-daoxiang-3s.png`、`music-home-library.png`、`play-daoxiang.png`。
+
+### 12.1 实测结论（通过）
+
+| 用户路径 | 实测结果 |
+| --- | --- |
+| 搜索新关键词「稻香」（冷缓存） | **3.2 秒**返回 39 首（proxy.log `ms=3246`），修复前同场景 16.0s；官方 App 搜索页正常展示，无「空空如也」 |
+| 在线播放 | 点第 1 首 `[music box] 稻香 - Lie` 成功播放（播放器进度/暂停正常），顶部下载管理器提示 MP3 8.34MB（已知 N-U9） |
+| 保存到 NAS 的曲目入库 | 音乐 App「最近播放/最近添加」出现 `稻香 - Lie`、`晴天 - RyaVocal`（手工保存的文件被官方曲库扫描入库） |
+| 每日推荐（LLM） | **tiers=llm**：20 首全部为在线曲目、封面完整（イナンナの見た夢、光るなら、secret base、告白气球、光辉岁月、Blinding Lights、STAY、群青…），不再是本地随机兜底 |
+
+### 12.2 本轮发现并修复的真实问题（LLM 每日推荐一直降级）
+
+- 现象：11-08/11-11 两次构建日志均为 `daily recommend tier llm llm failure timeout` → `tiers=local-random`，用户看到的「每日推荐」其实是本地随机。
+- 根因链：
+  1. `proxy/recommend.py` 把 `FNMUSIC_LLM_TIMEOUT_S` 硬夹在 **60s**（`_env_float(..., 5.0, 60.0)`），.env 调到 120 无效；
+  2. 配置的 `deepseek-v4.1-flash` 是**推理模型**：真实推荐 prompt 实测 53s（1615 tokens→4966 completion，其中 reasoning 3244），稍大即超 60s；
+  3. 改大 `max_tokens` 后请求变慢再次超时；最终换非推理模型 `gpt-4.1-mini`（同 prompt 实测 **20s**、JSON 合法 20 首）。
+- 修复：代码上限 60→180（`recommend.py` + 新增 `proxy/tests/test_recommend_timeout.py`）；设备 `.env`：`FNMUSIC_LLM_MODEL='gpt-4.1-mini'`、`FNMUSIC_LLM_TIMEOUT_S='120'`、`FNMUSIC_RECOMMEND_BUDGET_S='180'`、`FNMUSIC_LLM_MAX_TOKENS='16384'`（均热重载生效，备份 `.env.bak.20261111-*`）。
+- 验证：21:18:05 日志 `tracks=20 status=ready tiers=llm`；界面 20 首在线推荐（见截图）。
+
+### 12.3 仍存在的真实用户问题
+
+- **N1（高，已再次复现）**：App Center 重启扩展后，浏览器里已打开/新打开的页面在 30–60s 内请求可能不达扩展（页面白屏/空空如也/提示「内部错误」），刷新一次或等 re-register 完成即恢复。建议：前端对 501/502/503 自动重试 + 「重启后请刷新页面」提示；文档补充。
+- N2（低）：失败行残留「失败」标记，无「重试」文案。
+- N3（运维）：`fnos-cli app start` 客户端 http2 超时但实际启动成功（本轮 3 次），自动化应轮询状态而非判失败。
+- LLM 推荐质量依赖所选模型：默认 `deepseek-v4.1-flash` 推理模型不适配本任务；建议把「推荐模型」默认值改为非推理模型或增加「推理模型需要更长超时」的说明/校验。
