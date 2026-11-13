@@ -2546,10 +2546,10 @@ def test_about_fields_and_disclaimer(about_env):
     assert r.status_code == 200
     rj = r.json()
     assert rj["version"] == "v2.0.0"
-    assert rj["author"] == "javycoder"
-    assert rj["author_url"] == "https://github.com/javycoder"
-    assert rj["repo_url"] == "https://github.com/javycoder/fnos_music_ext"
-    assert rj["issues_url"] == "https://github.com/javycoder/fnos_music_ext/issues"
+    assert rj["author"] == "woowss"
+    assert rj["author_url"] == "https://github.com/woowss"
+    assert rj["repo_url"] == "https://github.com/woowss/fnos_music_ext"
+    assert rj["issues_url"] == "https://github.com/woowss/fnos_music_ext/issues"
     assert rj["donate"] is False  # 无 alipay.png 时不展示打赏
     assert rj["donate_alipay"] is False
     assert rj["donate_wechat"] is False
@@ -2880,8 +2880,8 @@ GH_RELEASE = {
     "tag_name": "v2.9.0",
     "name": "fnmusic-ext 2.9.0",
     "published_at": "2026-10-11T08:00:00Z",
-    "body": "### 修复\n\n- **热门推荐播放失败**：详见 [issue #49](https://github.com/javycoder/fnos_music_ext/issues/49)",
-    "html_url": "https://github.com/javycoder/fnos_music_ext/releases/tag/v2.9.0",
+    "body": "### 修复\n\n- **热门推荐播放失败**：详见 [issue #49](https://github.com/woowss/fnos_music_ext/issues/49)",
+    "html_url": "https://github.com/woowss/fnos_music_ext/releases/tag/v2.9.0",
 }
 GT_RELEASE = {
     "tag_name": "v2.9.0",
@@ -3068,7 +3068,7 @@ def test_update_check_gitee_fallback_on_403(official_env, update_cache_clean):
     assert rj["has_update"] is True
     assert rj["latest"]["version"] == "2.9.0"
     # gitee 响应无 html_url/published_at：按 tag 构造发行版页，时间取 created_at
-    assert rj["latest"]["html_url"] == "https://gitee.com/javycoder/fnos_music_ext/releases/tag/v2.9.0"
+    assert rj["latest"]["html_url"] == "https://gitee.com/woowss/fnos_music_ext/releases/tag/v2.9.0"
     assert rj["latest"]["published_at"] == "2026-10-11T08:00:00+08:00"
     assert calls[0] == webui.UPDATE_SOURCES[0]["api"]
     assert calls[1] == webui.UPDATE_SOURCES[1]["api"]

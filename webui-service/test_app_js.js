@@ -989,9 +989,9 @@ test("版本标签：正式/预发布新旧API均只显示一个v前缀", async 
 test("loadAbout：版本/部署徽章/免责声明/日志清单渲染，donate=false 隐藏打赏", async () => {
   enqueue("/app/fnmusic-ext/api/about", {
     ok: true, version: "2.8.0e", deploy_mode: "docker",
-    author: "javycoder", author_url: "https://github.com/javycoder",
-                repo_url: "https://github.com/javycoder/fnos_music_ext",
-    issues_url: "https://github.com/javycoder/fnos_music_ext/issues",
+    author: "woowss", author_url: "https://github.com/woowss",
+                repo_url: "https://github.com/woowss/fnos_music_ext",
+    issues_url: "https://github.com/woowss/fnos_music_ext/issues",
     disclaimer: [
       { title: "本项目基于 MIT 许可证开源", text: "仅限个人技术研究" },
       { title: "不托管受版权保护的音频", text: "" },
@@ -1192,7 +1192,7 @@ const UPDATE_PAYLOAD = {
   ok: true, current_version: "2.8.3", has_update: true, source: "github", checked_at: 1,
   latest: {
     version: "2.9.0", name: "fnmusic-ext 2.9.0", published_at: "2026-10-11T08:00:00Z",
-    changelog: "关于页新增检查更新", html_url: "https://github.com/javycoder/fnos_music_ext/releases/tag/v2.9.0",
+    changelog: "关于页新增检查更新", html_url: "https://github.com/woowss/fnos_music_ext/releases/tag/v2.9.0",
   },
 };
 
@@ -1239,7 +1239,7 @@ test("openUpdateModal：填充版本/日期/changelog/升级链接（跟随检�
   assert.strictEqual(els.get("#update-modal-version").textContent, "v2.9.0");
   assert.strictEqual(els.get("#update-modal-date").textContent, "2026-10-11");
   assert.strictEqual(els.get("#update-modal-changelog").textContent, "关于页新增检查更新");
-  assert.strictEqual(els.get("#update-upgrade-btn").href, "https://github.com/javycoder/fnos_music_ext/releases/tag/v2.9.0");
+  assert.strictEqual(els.get("#update-upgrade-btn").href, "https://github.com/woowss/fnos_music_ext/releases/tag/v2.9.0");
 });
 
 test("updateModal：取消按钮与遮罩空白点击均可关闭", async () => {

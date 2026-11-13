@@ -13,7 +13,7 @@
 发布工作流在 Release 上传后自动调用（.github/workflows/release.yml 的
 update-moo-index job），也可本地手动执行：
 
-    python3 tools/update_moo_index.py [--repo javycoder/fnos_music_ext] \
+    python3 tools/update_moo_index.py [--repo woowss/fnos_music_ext] \
         [--out moo.json] [--token "$GITHUB_TOKEN"] [--max-releases 10]
 
 幂等：同一版本重跑只刷新该版本条目与 updated_at；预发布不改写索引（索引始终
@@ -29,7 +29,7 @@ import sys
 import urllib.request
 from datetime import datetime, timezone, timedelta
 
-DEFAULT_REPO = "javycoder/fnos_music_ext"
+DEFAULT_REPO = "woowss/fnos_music_ext"
 APP_KEY = "fnmusic-ext"
 # 沿用仓库文档的时区口径（README/CHANGELOG 均为东八区）
 _TZ = timezone(timedelta(hours=8))
@@ -239,7 +239,7 @@ def update_index(index: dict, releases: list[dict], updated_at: str) -> dict:
     source_info.update({
         "name": "fnmusic-ext 官方源",
         "homepage": f"https://github.com/{DEFAULT_REPO}",
-        "distributor": "javycoder",
+        "distributor": "woowss",
         "generated_by": "tools/update_moo_index.py",
         "description": "fnMusic 音源扩展（fnos_music_ext）官方协议源索引：发布产物与版本信息由 release 工作流自动回填。",
         "updated_at": updated_at,
@@ -251,9 +251,9 @@ def update_index(index: dict, releases: list[dict], updated_at: str) -> dict:
         "app_type": "docker",
         "platform": ["x86", "arm"],
         "desc": _DESC,
-        "author": "javycoder",
-        "distributor": "javycoder",
-        "maintainer": "javycoder",
+        "author": "woowss",
+        "distributor": "woowss",
+        "maintainer": "woowss",
         "maintainer_url": f"https://github.com/{DEFAULT_REPO}",
         "homepage": f"https://github.com/{DEFAULT_REPO}",
         "license": _LICENSE,

@@ -157,7 +157,7 @@ fi
 
 # ── 9. WebUI 关于页与日志导出（8774 直连 + 管理员头） ─────
 WEBUI="http://127.0.0.1:8774/app/fnmusic-ext"
-if curl -s --max-time 5 -H "X-Trim-Isadmin: true" "$WEBUI/api/about" | grep -q '"author":"javycoder"'; then
+if curl -s --max-time 5 -H "X-Trim-Isadmin: true" "$WEBUI/api/about" | grep -q '"author":"woowss"'; then
   ok "WebUI 关于页接口（版本/作者/免责声明）"
   EXPORT_FILE=$(mktemp "${TMPDIR:-/tmp}/fnmusic-e2e-export.XXXXXXXX") || exit 1
   trap 'rm -f -- "$EXPORT_FILE"' EXIT

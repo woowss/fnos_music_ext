@@ -6,12 +6,12 @@
 
 在原生 Web 与 App 中搜索、播放和收藏在线音乐，让在线发现与 NAS 曲库连在一起。
 
-[![CI](https://github.com/javycoder/fnos_music_ext/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/javycoder/fnos_music_ext/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/javycoder/fnos_music_ext?label=正式版)](https://github.com/javycoder/fnos_music_ext/releases/latest)
+[![CI](https://github.com/woowss/fnos_music_ext/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/woowss/fnos_music_ext/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/woowss/fnos_music_ext?label=正式版)](https://github.com/woowss/fnos_music_ext/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![GitHub Stars](https://img.shields.io/github/stars/javycoder/fnos_music_ext?style=flat&label=Stars)](https://github.com/javycoder/fnos_music_ext/stargazers)
+[![GitHub Stars](https://img.shields.io/github/stars/woowss/fnos_music_ext?style=flat&label=Stars)](https://github.com/woowss/fnos_music_ext/stargazers)
 
-[**下载安装**](https://github.com/javycoder/fnos_music_ext/releases) · [快速上手](#快速上手) · [使用教程](#使用教程) · [更新日志](CHANGELOG.md) · [问题反馈](https://github.com/javycoder/fnos_music_ext/issues) · [Gitee 镜像](https://gitee.com/javycoder/fnos_music_ext)
+[**下载安装**](https://github.com/woowss/fnos_music_ext/releases) · [快速上手](#快速上手) · [使用教程](#使用教程) · [更新日志](CHANGELOG.md) · [问题反馈](https://github.com/woowss/fnos_music_ext/issues)
 
 </div>
 
@@ -55,7 +55,7 @@
 
 ### 2. 安装扩展
 
-1. 前往 [GitHub Releases](https://github.com/javycoder/fnos_music_ext/releases) 下载正式版 `.fpk`。访问困难时可查看 [Gitee 发行页](https://gitee.com/javycoder/fnos_music_ext/releases)，以该页实际资产与下载说明为准。
+1. 前往 [GitHub Releases](https://github.com/woowss/fnos_music_ext/releases) 下载正式版 `.fpk`。
 2. 打开 fnOS **应用中心 → 手动安装**，选择 FPK，按向导选择初始音源并安装。
 3. 从飞牛桌面打开 **fnMusic 扩展管理**，完成下表中的配置并保存。
 
@@ -193,7 +193,7 @@ musicdl 平台编号与短名见 [平台清单](musicdl-service/PLATFORMS.md)。
 
 ```bash
 sudo apt-get update && sudo apt-get install -y python3 python3-venv git
-git clone https://github.com/javycoder/fnos_music_ext.git fnmusic_ext
+git clone https://github.com/woowss/fnos_music_ext.git fnmusic_ext
 cd fnmusic_ext
 chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 ./install.sh
@@ -348,7 +348,7 @@ FPK 用户从飞牛桌面以管理员身份打开；源码用户确认安装时�
 <details>
 <summary><strong>如何导出日志并反馈问题？</strong></summary>
 
-在管理页「关于 → 导出日志」下载近 3 天 `.logzip`，到 [GitHub Issues](https://github.com/javycoder/fnos_music_ext/issues) 提交：扩展版本、官方音乐版本、Docker / native、主音源、客户端、复现步骤及错误时间。
+在管理页「关于 → 导出日志」下载近 3 天 `.logzip`，到 [GitHub Issues](https://github.com/woowss/fnos_music_ext/issues) 提交：扩展版本、官方音乐版本、Docker / native、主音源、客户端、复现步骤及错误时间。
 
 日志包含脱敏处理，但**分享前仍需自行检查**，不要公开 Cookie、访问令牌、大模型密钥、私人路径或有隐私的歌单信息。安装排障可查看 `/var/log/apps/fnmusic-ext-install.log`；安全问题请参照 [SECURITY.md](SECURITY.md)，仅提交不含密钥、私人路径等敏感信息的影响与复现，不要在公开 Issue 中披露秘密。
 
@@ -398,12 +398,13 @@ python3 scripts/run_tests.py
 - **隐私与密钥**：登录态、API Key、歌单及日志可能包含敏感信息，请妥善保管配置、备份和导出文件。使用外部音源或大模型会向对应服务发送必要请求或推荐上下文，请先了解其隐私政策；日志脱敏不能替代人工检查，勿将内部管理端口暴露公网。
 - **数据与维护风险**：缓存、下载、转码、曲库扫描、文件整理、升级与清理可能占用资源、移动文件或影响官方收藏和歌单关联。执行前请核对路径并独立备份重要数据；扩展的备份和还原机制不能替代完整备份，也不保证恢复所有数据或业务关联。
 - **无担保与责任限制**：软件按 MIT 许可证以“原样”提供，不作适销性、特定用途适用性、不侵权或持续可用性等明示或默示担保。在适用法律允许的最大范围内，作者及版权持有人不对因使用或无法使用本软件造成的索赔、损害或其他责任负责；依法不得排除或限制的责任不受影响。
-- **权利与安全反馈**：如认为项目代码、文档或展示内容涉及权利问题，请通过 [Issues](https://github.com/javycoder/fnos_music_ext/issues) 提供可核验的权利及具体内容信息，维护者将核实处理。漏洞、密钥泄露等敏感问题请遵循 [安全反馈指引](SECURITY.md)，不要公开提交秘密或个人信息。
+- **权利与安全反馈**：如认为项目代码、文档或展示内容涉及权利问题，请通过 [Issues](https://github.com/woowss/fnos_music_ext/issues) 提供可核验的权利及具体内容信息，维护者将核实处理。漏洞、密钥泄露等敏感问题请遵循 [安全反馈指引](SECURITY.md)，不要公开提交秘密或个人信息。
 
 ## 致谢
 
 感谢以下开源项目、社区及所有贡献者，让这份扩展成为可能：
 
+- [javycoder/fnos_music_ext](https://github.com/javycoder/fnos_music_ext) — 原开源项目基础（MIT License）。
 - [CharlesPikachu/musicdl](https://github.com/CharlesPikachu/musicdl) — 多平台音乐能力。
 - [darknessomi/musicbox](https://github.com/darknessomi/musicbox) — 网易云音乐相关能力。
 - [XCQ0607/lxserver](https://github.com/XCQ0607/lxserver) 与洛雪音乐社区 — 自定义源兼容基础。
@@ -411,14 +412,14 @@ python3 scripts/run_tests.py
 
 ## Star 支持
 
-如果这个项目让你的飞牛音乐更好用了，欢迎点一个 **[⭐ Star](https://github.com/javycoder/fnos_music_ext)**。
+如果这个项目让你的飞牛音乐更好用了，欢迎点一个 **[⭐ Star](https://github.com/woowss/fnos_music_ext)**。
 
 Star 是支持，清晰的反馈、可靠的验证和文档贡献同样重要。
 
-[![Star History Chart](https://api.star-history.com/svg?repos=javycoder/fnos_music_ext&type=Date)](https://www.star-history.com/#javycoder/fnos_music_ext&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=woowss/fnos_music_ext&type=Date)](https://www.star-history.com/#woowss/fnos_music_ext&Date)
 
 <div align="center">
 
-[返回顶部](#fnmusic-ext--飞牛音乐扩展) · [下载扩展](https://github.com/javycoder/fnos_music_ext/releases) · [参与贡献](CONTRIBUTING.md)
+[返回顶部](#fnmusic-ext--飞牛音乐扩展) · [下载扩展](https://github.com/woowss/fnos_music_ext/releases) · [参与贡献](CONTRIBUTING.md)
 
 </div>
