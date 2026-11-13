@@ -3335,6 +3335,27 @@ async function manualSaveStatusRequest(path) {
   return response;
 }
 
+// 保存/搜索请求的同类重试：扩展服务或网关刚启动时，网关会短暂返回 501/503，
+// 502 表示网关到扩展的连接尚未建立。三者都代表请求未被后端受理，所以 POST
+// 重试不会产生重复保存；403 等权限/直连错误不重试，保持原有语义与文案。
+const MANUAL_SAVE_REQUEST_RETRIES = 2;
+const MANUAL_SAVE_REQUEST_RETRY_MS = 800;
+
+function manualSaveRetryableStatus(status) {
+  return status === 501 || status === 502 || status === 503;
+}
+
+async function manualSaveApiWithRetry(path, options = {}, onRetry = null) {
+  let response = await manualSaveApi(path, options);
+  for (let attempt = 0; attempt < MANUAL_SAVE_REQUEST_RETRIES; attempt += 1) {
+    if (!manualSaveRetryableStatus(response.status)) return response;
+    if (typeof onRetry === "function") onRetry(attempt + 1);
+    await manualSaveStatusSleep(MANUAL_SAVE_REQUEST_RETRY_MS);
+    response = await manualSaveApi(path, options);
+  }
+  return response;
+}
+
 async function loadSaveStatus() {
   const statusEl = $("#save-status");
   if (!statusEl) return;
@@ -3424,8 +3445,15 @@ async function searchSaveTracks() {
   if (button) button.disabled = true;
   if (resultEl) resultEl.textContent = "搜索中…";
   try {
-    const { ok, body } = await manualSaveApi(
+    const { ok, body } = await manualSaveApiWithRetry(
       "/api/manual-save/search?keyword=" + encodeURIComponent(keyword),
+      {},
+      (attempt) => {
+        if (resultEl) {
+          resultEl.textContent = "扩展服务正在启动，正在重试…（"
+            + attempt + "/" + MANUAL_SAVE_REQUEST_RETRIES + "）";
+        }
+      },
     );
     if (seq !== saveState.searchSeq) return;
     if (!ok || !body || body.ok !== true) {
@@ -3465,10 +3493,15 @@ async function saveOneTrack(button) {
   const resultEl = $("#save-result");
   if (resultEl) resultEl.textContent = "正在保存，请保持页面打开…";
   try {
-    const { body } = await manualSaveApi("/api/manual-save/track", {
+    const { body } = await manualSaveApiWithRetry("/api/manual-save/track", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ song_id: songId }),
+    }, (attempt) => {
+      if (stateEl) {
+        stateEl.textContent = "服务正在启动，重试中…（"
+          + attempt + "/" + MANUAL_SAVE_REQUEST_RETRIES + "）";
+      }
     });
     if (body && body.ok === true && body.code === "ok") {
       const data = body.data || {};
@@ -3542,11 +3575,17 @@ async function saveOneTrack(button) {
       if (resultEl) resultEl.textContent = "目标目录已存在同名文件，未覆盖。";
     } else {
       if (stateEl) stateEl.textContent = "失败";
-      if (resultEl) resultEl.textContent = "保存失败：" + manualSaveMessage(body, "内部错误");
+      if (resultEl) {
+        resultEl.textContent = "保存失败：" + manualSaveMessage(body, "内部错误")
+          + "；可点击该行「保存」重试。";
+      }
     }
   } catch (exc) {
     if (stateEl) stateEl.textContent = "失败";
-    if (resultEl) resultEl.textContent = "保存失败：" + (exc && exc.message ? exc.message : "网络错误");
+    if (resultEl) {
+      resultEl.textContent = "保存失败：" + (exc && exc.message ? exc.message : "网络错误")
+        + "；可点击该行「保存」重试。";
+    }
   } finally {
     saveState.saving.delete(songId);
     button.disabled = false;

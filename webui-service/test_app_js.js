@@ -3064,6 +3064,57 @@ test("手动保存状态：403 不重试，显示后端返回的信息", async (
   assert.ok(els.get("#save-status").textContent.includes("仅管理员可执行手动保存"));
 });
 
+/* N1（2026-11-12）：扩展重启后 30–60s 内网关对保存/搜索返回 501/502/503，
+ * 旧版只对状态接口重试，用户点「保存」/「搜索」直接看到失败。 */
+test("手动保存请求：501/502/503 自动重试，403 不重试（N1）", async () => {
+  for (const status of [501, 502, 503]) {
+    reset();
+    enqueue("/app/fnmusic-ext/api/manual-save/track", { __rawResponse: true, resp: {
+      ok: false, status, json: async () => ({ detail: "gateway starting" }),
+    } });
+    enqueue("/app/fnmusic-ext/api/manual-save/track", { ok: true, code: "ok" });
+    const response = await manualSaveApiWithRetry("/api/manual-save/track", { method: "POST" });
+    assert.strictEqual(response.status, 200, status + " 后应重试至成功");
+    assert.strictEqual(
+      fetchCalls.filter((c) => c.path.endsWith("/manual-save/track")).length, 2,
+      status + " 后应重试一次",
+    );
+  }
+  reset();
+  enqueue("/app/fnmusic-ext/api/manual-save/track", { __rawResponse: true, resp: {
+    ok: false, status: 403, json: async () => ({ detail: "仅管理员可执行手动保存" }),
+  } });
+  const denied = await manualSaveApiWithRetry("/api/manual-save/track", { method: "POST" });
+  assert.strictEqual(denied.status, 403);
+  assert.strictEqual(fetchCalls.length, 1, "403 不得自动重试");
+});
+
+test("手动保存：保存请求遇 503 自动重试后仍显示已保存（N1）", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/manual-save/status", {
+    ok: true, data: { enabled: true, target_dir: "/library" },
+  });
+  await global.loadSaveStatus();
+  enqueue("/app/fnmusic-ext/api/manual-save/track", { __rawResponse: true, resp: {
+    ok: false, status: 503, json: async () => ({ detail: "gateway starting" }),
+  } });
+  enqueue("/app/fnmusic-ext/api/manual-save/track", {
+    ok: true, code: "ok", data: {
+      status: "published", format: "flac", size: 1024,
+      basename: "歌 手 - 歌曲.flac", target_dir: "/library",
+      cover_status: "embedded", lyric_status: "published", artist_status: "tagged",
+      lyricist: "", lyricist_status: "unavailable", composer: "", composer_status: "unavailable",
+    },
+  });
+  const button = stubEl();
+  button.dataset.songId = "42";
+  const stateEl = stubEl();
+  button.closest = () => ({ querySelector: () => stateEl });
+  await global.saveOneTrack(button);
+  assert.strictEqual(stateEl.textContent, "已保存");
+  assert.ok(!els.get("#save-result").textContent.includes("失败"));
+});
+
 test("手动保存：显示封面/歌词/词曲状态并明确标注附加项部分失败", async () => {
   enqueue("/app/fnmusic-ext/api/manual-save/status", {
     ok: true, data: { enabled: true, target_dir: "/library" },
