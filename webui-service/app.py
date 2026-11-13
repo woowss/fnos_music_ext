@@ -211,6 +211,7 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_LLM_MAX_TOKENS": {"kind": "int", "default": "8192", "min": 256, "max": 131072, "group": "llm", "reload": "hot", "label": "单次输出上限（token）"},
     "FNMUSIC_LLM_DAILY_TOKEN_LIMIT": {"kind": "int", "default": "1000000", "min": 0, "max": 1000000000, "group": "llm", "reload": "hot", "label": "每日 token 上限（0=不限制）"},
     "FNMUSIC_LLM_EXTRA_BODY": {"kind": "str", "default": "", "group": "llm", "reload": "hot", "label": "附加请求参数（JSON 对象）"},
+    "FNMUSIC_LLM_EXTRA_HEADERS": {"kind": "str", "default": "", "group": "llm", "reload": "hot", "label": "附加请求头（JSON 对象）"},
     "FNMUSIC_LLM_LIKED_ENABLED": {"kind": "bool", "default": "false", "group": "llm", "reload": "hot", "label": "大模型用于猜你喜欢"},
     "FNMUSIC_LLM_DAILY_ENABLED": {"kind": "bool", "default": "false", "group": "llm", "reload": "hot", "label": "大模型用于每日推荐"},
     "FNMUSIC_LIKED_REFRESH_HOURS": {"kind": "float", "default": "0.5", "min": 0.5, "step": "any", "group": "llm", "reload": "hot", "label": "猜你喜欢生成间隔（小时）"},
@@ -1119,6 +1120,27 @@ def validate_updates(values: dict) -> dict[str, str]:
             updates["FNMUSIC_LLM_EXTRA_BODY"] = json.dumps(extra, ensure_ascii=False, separators=(",", ":"))
         else:
             updates["FNMUSIC_LLM_EXTRA_BODY"] = ""
+    if "FNMUSIC_LLM_EXTRA_HEADERS" in updates:
+        # 附加请求头必须是可解析的 JSON 对象（键=头名，值=标量）：
+        # OpenCode Go 需要 x-opencode-session，前置 Cloudflare 的网关还需要浏览器 UA。
+        raw = updates["FNMUSIC_LLM_EXTRA_HEADERS"].strip()
+        if raw:
+            try:
+                hdrs = json.loads(raw)
+            except Exception as exc:
+                raise ValueError(f"附加请求头不是合法 JSON: {exc}") from exc
+            if not isinstance(hdrs, dict) or not hdrs:
+                raise ValueError(
+                    "附加请求头必须是形如 {\"x-opencode-session\":\"ses_...\"} 的非空 JSON 对象")
+            for name, value in hdrs.items():
+                if not isinstance(name, str) or not name.strip():
+                    raise ValueError("附加请求头的键必须是非空字符串")
+                if not isinstance(value, (str, int, float, bool)):
+                    raise ValueError(f"附加请求头 {name} 的值必须是字符串/数字/布尔")
+            updates["FNMUSIC_LLM_EXTRA_HEADERS"] = json.dumps(
+                hdrs, ensure_ascii=False, separators=(",", ":"))
+        else:
+            updates["FNMUSIC_LLM_EXTRA_HEADERS"] = ""
     if "FNMUSIC_PUBLIC_PLAYLISTS_SELECTION" in updates:
         try:
             selection = json.loads(str(updates["FNMUSIC_PUBLIC_PLAYLISTS_SELECTION"] or "[]"))

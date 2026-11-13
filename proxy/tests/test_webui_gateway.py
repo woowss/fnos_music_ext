@@ -12,7 +12,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 
+import sys
+
 import pytest
+
+# 生产环境里 webui_gateway.py 以脚本方式启动，sys.path[0] 就是 proxy/，因此它能直接
+# import gateway_identity；pytest 从仓库根收集时没有这个路径，这里显式补上，让测试的
+# 模块解析与线上一致（否则在 Windows/Linux 本地都会收集失败）。
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="本模块验证 Unix socket 网关转发：Windows 无 AF_UNIX，需在 Linux runner 运行",
+)
 
 _SPEC = importlib.util.spec_from_file_location(
     "webui_gateway", Path(__file__).resolve().parents[1] / "webui_gateway.py")
