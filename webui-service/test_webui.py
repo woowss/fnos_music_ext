@@ -3438,3 +3438,43 @@ def test_scan_timing_ui_bindings():
     assert 'FNMUSIC_SCAN_DELAY_S: parseFloat($("#scan-delay").value)' in js
     assert 'FNMUSIC_SCAN_COOLDOWN_S: parseFloat($("#scan-cooldown").value)' in js
     assert "updateScanLabels" in js
+
+
+def test_manual_save_preferences_schema_roundtrip_and_ui_bindings(env_file):
+    """保存到 NAS 偏好（音质上限 / 封面 / 歌词）：Schema、round-trip 与前后端控件齐备。"""
+    with authed_client() as client:
+        r = client.get("/api/config")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["schema"]["FNMUSIC_MANUAL_SAVE_QUALITY"]["values"] == [
+            "jymaster", "hires", "lossless", "exhigh",
+        ]
+        assert body["schema"]["FNMUSIC_MANUAL_SAVE_QUALITY"]["default"] == "jymaster"
+        assert body["schema"]["FNMUSIC_MANUAL_SAVE_COVER_ENABLED"]["kind"] == "bool"
+        assert body["schema"]["FNMUSIC_MANUAL_SAVE_COVER_ENABLED"]["default"] == "true"
+        assert body["schema"]["FNMUSIC_MANUAL_SAVE_LYRIC_ENABLED"]["kind"] == "bool"
+        assert body["schema"]["FNMUSIC_MANUAL_SAVE_LYRIC_ENABLED"]["default"] == "true"
+        assert body["values"]["FNMUSIC_MANUAL_SAVE_QUALITY"] == "jymaster"
+        assert body["values"]["FNMUSIC_MANUAL_SAVE_COVER_ENABLED"] == "true"
+        assert body["values"]["FNMUSIC_MANUAL_SAVE_LYRIC_ENABLED"] == "true"
+
+        put = client.put("/api/config", json={"values": {
+            "FNMUSIC_MANUAL_SAVE_QUALITY": "lossless",
+            "FNMUSIC_MANUAL_SAVE_COVER_ENABLED": False,
+            "FNMUSIC_MANUAL_SAVE_LYRIC_ENABLED": False,
+        }})
+        assert put.status_code == 200
+        rj = client.get("/api/config").json()
+        assert rj["values"]["FNMUSIC_MANUAL_SAVE_QUALITY"] == "lossless"
+        assert rj["values"]["FNMUSIC_MANUAL_SAVE_COVER_ENABLED"] == "false"
+        assert rj["values"]["FNMUSIC_MANUAL_SAVE_LYRIC_ENABLED"] == "false"
+
+    html = open("webui-service/static/index.html", encoding="utf-8").read()
+    js = open("webui-service/static/app.js", encoding="utf-8").read()
+    for el in ("manual-save-quality", "manual-save-cover", "manual-save-lyric"):
+        assert f'id="{el}"' in html, el
+    assert 'data-help="save"' in html
+    assert 'data-help-id="save"' in html
+    assert "FNMUSIC_MANUAL_SAVE_QUALITY" in js
+    assert "FNMUSIC_MANUAL_SAVE_COVER_ENABLED" in js
+    assert "FNMUSIC_MANUAL_SAVE_LYRIC_ENABLED" in js

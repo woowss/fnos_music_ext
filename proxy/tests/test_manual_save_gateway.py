@@ -901,3 +901,12 @@ def test_admin_claim_still_requires_the_canonical_lower_case_value(value):
     assert status == 403
     assert payload["code"] == "forbidden"
     assert engine.status_calls == 0
+
+
+def test_sanitize_manual_save_data_allows_not_attempted_cover_and_lyric():
+    sample = _published_result()["data"]
+    sample["cover_status"] = "not_attempted"
+    sample["lyric_status"] = "not_attempted"
+    sanitized = gw._sanitize_manual_save_data(sample)
+    assert sanitized["cover_status"] == "not_attempted"
+    assert sanitized["lyric_status"] == "not_attempted"

@@ -91,6 +91,9 @@ ENABLED_KEY = "FNMUSIC_MANUAL_SAVE_ENABLED"
 TARGET_KEY = "FNMUSIC_MANUAL_SAVE_TARGET"
 STAGING_KEY = "FNMUSIC_MANUAL_SAVE_STAGING"
 MUSICBOX_KEY = "FNMUSIC_MUSICBOX_URL"
+QUALITY_KEY = "FNMUSIC_MANUAL_SAVE_QUALITY"
+COVER_ENABLED_KEY = "FNMUSIC_MANUAL_SAVE_COVER_ENABLED"
+LYRIC_ENABLED_KEY = "FNMUSIC_MANUAL_SAVE_LYRIC_ENABLED"
 FFMPEG_BIN = "/usr/bin/ffmpeg"
 FFPROBE_BIN = "/usr/bin/ffprobe"
 CURL_BIN = "/usr/bin/curl"
@@ -199,6 +202,9 @@ class Config:
     target_dir: str
     staging_dir: str
     musicbox_url: str
+    quality: str = QUALITY_ORDER[0]
+    cover_enabled: bool = True
+    lyric_enabled: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,6 +325,31 @@ def _parse_enabled(value: str | None) -> bool:
     return value.strip().casefold() in {"true", "1", "yes", "on"}
 
 
+def _parse_bool_default(value: object, *, default: bool) -> bool:
+    if type(value) is not str or not value.strip():
+        return default
+    normalized = value.strip().casefold()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off"}:
+        return False
+    return default
+
+
+def _normalize_quality(value: object) -> str:
+    if type(value) is not str:
+        return QUALITY_ORDER[0]
+    candidate = value.strip().casefold()
+    if candidate in QUALITY_ORDER:
+        return candidate
+    return QUALITY_ORDER[0]
+
+
+def _quality_order_for(max_quality: str) -> tuple[str, ...]:
+    normalized = _normalize_quality(max_quality)
+    return QUALITY_ORDER[QUALITY_ORDER.index(normalized):]
+
+
 def load_config(
     *,
     values: Mapping[str, str] | None = None,
@@ -328,11 +359,17 @@ def load_config(
     target = source.get(TARGET_KEY, "") if isinstance(source, Mapping) else ""
     staging = source.get(STAGING_KEY, "") if isinstance(source, Mapping) else ""
     musicbox = source.get(MUSICBOX_KEY, "") if isinstance(source, Mapping) else ""
+    quality = source.get(QUALITY_KEY) if isinstance(source, Mapping) else None
+    cover_raw = source.get(COVER_ENABLED_KEY) if isinstance(source, Mapping) else None
+    lyric_raw = source.get(LYRIC_ENABLED_KEY) if isinstance(source, Mapping) else None
     return Config(
         enabled=_parse_enabled(source.get(ENABLED_KEY) if isinstance(source, Mapping) else None),
         target_dir=target if type(target) is str else "",
         staging_dir=staging if type(staging) is str else "",
         musicbox_url=musicbox.strip() if type(musicbox) is str and musicbox.strip() else DEFAULT_MUSICBOX_URL,
+        quality=_normalize_quality(quality),
+        cover_enabled=_parse_bool_default(cover_raw, default=True),
+        lyric_enabled=_parse_bool_default(lyric_raw, default=True),
     )
 
 
@@ -428,7 +465,7 @@ def status(*, deps: SaveDeps | None = None) -> dict:
         "enabled": bool(config.enabled),
         "target_dir": config.target_dir,
         "staging_dir": config.staging_dir,
-        "quality_order": list(QUALITY_ORDER),
+        "quality_order": list(_quality_order_for(config.quality)),
         "max_bytes": MAX_BYTES,
     }
     if not config.enabled:
@@ -592,7 +629,8 @@ def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
     album = track_metadata.album
     track_number = track_metadata.track_number
     disc_number = track_metadata.disc_number
-    quality = _select_quality(http_json, config.musicbox_url, song_id)
+    quality_order = _quality_order_for(config.quality)
+    quality = _select_quality(http_json, config.musicbox_url, song_id, quality_order=quality_order)
     quality_data = quality.data
     media_url = quality.media_url
     api_type = _text(quality_data.get("type")).strip().casefold()
@@ -644,7 +682,10 @@ def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
         cover_asset = None
         cover_path = None
         cover_error = ""
-        if source_cover_indexes:
+        if not config.cover_enabled:
+            source_cover_indexes = ()
+            cover_status = "not_attempted"
+        elif source_cover_indexes:
             cover_status = "preserved"
         elif track_metadata.cover_url:
             try:
@@ -670,12 +711,15 @@ def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
             cover_status = "unavailable"
 
         lyric_bytes = None
-        try:
-            lyric_json = _field(deps, "lyric_json", _default_lyric_http_json)
-            lyric_bytes = _fetch_lyric_bytes(lyric_json, config.musicbox_url, song_id)
-            lyric_status = "unavailable" if lyric_bytes is None else "not_attempted"
-        except Exception:
-            lyric_status = "error"
+        if not config.lyric_enabled:
+            lyric_status = "not_attempted"
+        else:
+            try:
+                lyric_json = _field(deps, "lyric_json", _default_lyric_http_json)
+                lyric_bytes = _fetch_lyric_bytes(lyric_json, config.musicbox_url, song_id)
+                lyric_status = "unavailable" if lyric_bytes is None else "not_attempted"
+            except Exception:
+                lyric_status = "error"
 
         # The song-detail object has no credit fields; fall back to the credit
         # lines of the lyric text that is already fetched (and later saved as
@@ -1551,11 +1595,15 @@ def _evaluate_quality_response(
 
 
 def _select_quality(
-    http_json: Callable[[str], object], musicbox_url: str, song_id: int
+    http_json: Callable[[str], object],
+    musicbox_url: str,
+    song_id: int,
+    *,
+    quality_order: tuple[str, ...] = QUALITY_ORDER,
 ) -> _QualitySelection:
     base = musicbox_url.rstrip("/")
     trial_seen = False
-    for index, quality in enumerate(QUALITY_ORDER):
+    for index, quality in enumerate(quality_order):
         url = f"{base}/api/v1/song/{song_id}/url?quality={quality}"
         try:
             payload = http_json(url)

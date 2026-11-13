@@ -652,6 +652,19 @@ function applyConfigToForm() {
   $("#download-layout").disabled = !configSchema.FNMUSIC_DOWNLOAD_LAYOUT;
   $("#tee-save-mode").value = ["auto", "direct", "staged"].includes(v.FNMUSIC_TEE_SAVE_MODE) ? v.FNMUSIC_TEE_SAVE_MODE : "auto";
   $("#tee-save-mode").disabled = !configSchema.FNMUSIC_TEE_SAVE_MODE;
+  if ($("#manual-save-quality")) {
+    $("#manual-save-quality").value = ["jymaster", "hires", "lossless", "exhigh"].includes(v.FNMUSIC_MANUAL_SAVE_QUALITY)
+      ? v.FNMUSIC_MANUAL_SAVE_QUALITY : "jymaster";
+    $("#manual-save-quality").disabled = !configSchema.FNMUSIC_MANUAL_SAVE_QUALITY;
+  }
+  if ($("#manual-save-cover")) {
+    $("#manual-save-cover").checked = v.FNMUSIC_MANUAL_SAVE_COVER_ENABLED !== "false";
+    $("#manual-save-cover").disabled = !configSchema.FNMUSIC_MANUAL_SAVE_COVER_ENABLED;
+  }
+  if ($("#manual-save-lyric")) {
+    $("#manual-save-lyric").checked = v.FNMUSIC_MANUAL_SAVE_LYRIC_ENABLED !== "false";
+    $("#manual-save-lyric").disabled = !configSchema.FNMUSIC_MANUAL_SAVE_LYRIC_ENABLED;
+  }
   $("#dir-cache").value = v.FNMUSIC_CACHE_DIR || "";
   $("#tee-max").value = v.FNMUSIC_TEE_CACHE_MAX || "2";
   $("#bind-timeout").value = v.FNMUSIC_OFFICIAL_BIND_TIMEOUT_S || "120";
@@ -747,6 +760,9 @@ function collectConfig() {
     FNMUSIC_TEE_SAVE_DIR: $("#dir-download").value.trim(),
     ...(configSchema.FNMUSIC_DOWNLOAD_LAYOUT ? { FNMUSIC_DOWNLOAD_LAYOUT: $("#download-layout").value } : {}),
     ...(configSchema.FNMUSIC_TEE_SAVE_MODE ? { FNMUSIC_TEE_SAVE_MODE: ["auto", "direct", "staged"].includes($("#tee-save-mode").value) ? $("#tee-save-mode").value : "auto" } : {}),
+    ...(configSchema.FNMUSIC_MANUAL_SAVE_QUALITY ? { FNMUSIC_MANUAL_SAVE_QUALITY: ["jymaster", "hires", "lossless", "exhigh"].includes($("#manual-save-quality").value) ? $("#manual-save-quality").value : "jymaster" } : {}),
+    ...(configSchema.FNMUSIC_MANUAL_SAVE_COVER_ENABLED ? { FNMUSIC_MANUAL_SAVE_COVER_ENABLED: $("#manual-save-cover").checked } : {}),
+    ...(configSchema.FNMUSIC_MANUAL_SAVE_LYRIC_ENABLED ? { FNMUSIC_MANUAL_SAVE_LYRIC_ENABLED: $("#manual-save-lyric").checked } : {}),
     FNMUSIC_CACHE_DIR: $("#dir-cache").value.trim(),
     FNMUSIC_TEE_CACHE_MAX: parseInt($("#tee-max").value || "2", 10),
     FNMUSIC_OFFICIAL_BIND_TIMEOUT_S: parseInt($("#bind-timeout").value || "120", 10) || 120,
@@ -928,6 +944,7 @@ async function saveConfig() {
     await loadConfig();
     await loadStatus();
     refreshLlmUsage();
+    if (currentPage === "save" || saveState.statusLoaded) void loadSaveStatus();
   } catch (exc) {
     lxRuntimeSnapshot = null;
     renderLxSourceList();
@@ -2627,6 +2644,10 @@ const DIR_FIELDS = [
 $("#download-layout").addEventListener("change", () => {
   markDirty("存放方式需保存后生效；已有歌曲可稍后点击「整理」调整");
 });
+["#manual-save-quality", "#manual-save-cover", "#manual-save-lyric"].forEach((selector) => {
+  const el = $(selector);
+  if (el) el.addEventListener("change", () => markDirty("手动保存偏好需保存后生效"));
+});
 let _fsCheckSeq = 0;                // 防抖竞态：只采纳最后一次输入的校验结果
 const _authorizedDirs = new Set();  // authorizeUserFile 每个路径只尝试一次，避免重复弹授权框
 
@@ -3366,7 +3387,16 @@ async function loadSaveStatus() {
     saveState.statusLoaded = true;
     if (saveState.enabled) {
       const target = typeof data.target_dir === "string" && data.target_dir ? "，目标目录 " + data.target_dir : "";
-      statusEl.textContent = "手动保存已启用" + target + "；保存不会覆盖同名文件。";
+      const qualityLabels = {
+        jymaster: "超清母带",
+        hires: "Hi-Res",
+        lossless: "无损 FLAC",
+        exhigh: "极高 320k",
+      };
+      const qualityChain = Array.isArray(data.quality_order) && data.quality_order.length
+        ? "，音质阶梯 " + data.quality_order.map((q) => qualityLabels[q] || q).join("→")
+        : "";
+      statusEl.textContent = "手动保存已启用" + target + qualityChain + "；保存不会覆盖同名文件。";
       setSaveControlsEnabled(true);
     } else if (body && body.code === "disabled") {
       statusEl.textContent = "手动保存未启用：请在 .env 设置 FNMUSIC_MANUAL_SAVE_ENABLED=true，并填写 FNMUSIC_MANUAL_SAVE_TARGET / FNMUSIC_MANUAL_SAVE_STAGING 后重启代理。";
@@ -3529,7 +3559,7 @@ async function saveOneTrack(button) {
       const coverLabels = {
         embedded: "封面已嵌入", preserved: "源封面已保留",
         unavailable: "音源未提供封面", unsupported: "封面格式不受 MP3 支持",
-        error: "封面获取或嵌入失败",
+        error: "封面获取或嵌入失败", not_attempted: "封面未处理（已关闭或跳过）",
       };
       // 封面失败只展示固定原因，绝不回显 host/URL。
       const coverErrorLabels = {

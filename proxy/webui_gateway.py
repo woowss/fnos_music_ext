@@ -1009,7 +1009,7 @@ def _sanitize_manual_save_data(data: object) -> dict:
         "album_status": {"tagged", "unavailable"},
         "lyricist_status": {"tagged", "unavailable"},
         "composer_status": {"tagged", "unavailable"},
-        "cover_status": {"embedded", "preserved", "unavailable", "unsupported", "error", "not_published"},
+        "cover_status": {"embedded", "preserved", "unavailable", "unsupported", "error", "not_published", "not_attempted"},
         "lyric_status": {"published", "unavailable", "error", "conflict", "not_attempted", "unknown"},
     }
     for name, allowed in status_values.items():

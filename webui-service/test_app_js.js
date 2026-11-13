@@ -4215,6 +4215,57 @@ test("整歌单开关：Schema 暴露开关时提示页内开启（不再 .env �
   await global.loadConfig();
 });
 
+test("手动保存偏好：音质上限/封面/歌词按 Schema 回填、校验、收集与 dirty 标记", async () => {
+  enqueue("/app/fnmusic-ext/api/config", {
+    values: {
+      FNMUSIC_MANUAL_SAVE_QUALITY: "lossless",
+      FNMUSIC_MANUAL_SAVE_COVER_ENABLED: "false",
+      FNMUSIC_MANUAL_SAVE_LYRIC_ENABLED: "true",
+    },
+    schema: {
+      FNMUSIC_MANUAL_SAVE_QUALITY: { kind: "enum" },
+      FNMUSIC_MANUAL_SAVE_COVER_ENABLED: { kind: "bool" },
+      FNMUSIC_MANUAL_SAVE_LYRIC_ENABLED: { kind: "bool" },
+    },
+  });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#manual-save-quality").value, "lossless");
+  assert.strictEqual(els.get("#manual-save-quality").disabled, false);
+  assert.strictEqual(els.get("#manual-save-cover").checked, false);
+  assert.strictEqual(els.get("#manual-save-cover").disabled, false);
+  assert.strictEqual(els.get("#manual-save-lyric").checked, true);
+  assert.strictEqual(els.get("#manual-save-lyric").disabled, false);
+
+  els.get("#manual-save-quality").value = "hires";
+  els.get("#manual-save-cover").checked = true;
+  els.get("#manual-save-lyric").checked = false;
+  await els.get("#manual-save-quality").dispatch("change");
+  assert.ok(els.get("#save-bar").classList.contains("show"));
+
+  const collected = global.collectConfig();
+  assert.strictEqual(collected.FNMUSIC_MANUAL_SAVE_QUALITY, "hires");
+  assert.strictEqual(collected.FNMUSIC_MANUAL_SAVE_COVER_ENABLED, true);
+  assert.strictEqual(collected.FNMUSIC_MANUAL_SAVE_LYRIC_ENABLED, false);
+
+  enqueue("/app/fnmusic-ext/api/manual-save/status", {
+    ok: true,
+    data: { enabled: true, target_dir: "/library", quality_order: ["lossless", "exhigh"] },
+  });
+  await global.loadSaveStatus();
+  assert.ok(els.get("#save-status").textContent.includes("无损 FLAC→极高 320k"));
+
+  // 无 Schema 时禁用控件且不提交未知键
+  enqueue("/app/fnmusic-ext/api/config", { values: {}, schema: {} });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#manual-save-quality").disabled, true);
+  assert.strictEqual(els.get("#manual-save-cover").disabled, true);
+  assert.strictEqual(els.get("#manual-save-lyric").disabled, true);
+  const withoutSchema = global.collectConfig();
+  assert.ok(!("FNMUSIC_MANUAL_SAVE_QUALITY" in withoutSchema));
+  assert.ok(!("FNMUSIC_MANUAL_SAVE_COVER_ENABLED" in withoutSchema));
+  assert.ok(!("FNMUSIC_MANUAL_SAVE_LYRIC_ENABLED" in withoutSchema));
+});
+
 /* ------------------------------------------------ 运行 --------------------- */
 (async () => {
   let failed = 0;

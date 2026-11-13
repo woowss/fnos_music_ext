@@ -395,7 +395,23 @@
 
       <!-- 保存到 NAS -->
       <section class="page" id="page-save">
-        <h2>保存到 NAS</h2>
+        <h2><span>保存到 NAS</span><button class="help-btn" type="button" data-help="save" aria-label="保存到 NAS 帮助">?</button></h2>
+        <div class="card">
+          <div class="card-title">保存规则与偏好（单曲 / 整歌单共用）</div>
+          <label class="field"><span>保存目标音质（上限；高档不可用时自动向下探测）</span>
+            <select class="input" id="manual-save-quality">
+              <option value="jymaster">超清母带（jymaster，默认）</option>
+              <option value="hires">Hi-Res（hires）</option>
+              <option value="lossless">无损 FLAC（lossless）</option>
+              <option value="exhigh">极高 MP3 320k（exhigh）</option>
+            </select>
+          </label>
+          <label class="switch-row"><span>嵌入专辑封面</span><input type="checkbox" id="manual-save-cover"></label>
+          <label class="switch-row"><span>保存同名 .lrc 歌词</span><input type="checkbox" id="manual-save-lyric"></label>
+          <p class="hint">音质阶梯：按 jymaster → hires → lossless → exhigh 从所选上限开始顺次探测，跳过试听片段，并核对文件大小、MD5、容器格式与全曲解码。修改以上偏好后点击底部「保存并生效」即刻对下次保存生效。</p>
+          <p class="hint">封面与元数据：使用 ffmpeg 无损重封装写入歌名、歌手、专辑、音轨号与词曲信息。开启封面时优先保留源内嵌图，否则从 p1/p2.music.126.net 抓取（≤ 10 MB、≤ 8192×8192；MP3 自动跳过 WebP）；封面失败或关闭不阻断音频保存。</p>
+          <p class="hint">歌词与落盘：开启歌词时优先原文 lyric，次选翻译 tlyric（≤ 1 MB UTF-8）写为同名 .lrc（两者的作词/作曲行也会补充元数据）。所有文件经暂存区原子发布且不覆盖同名文件，并同步设置属主。</p>
+        </div>
         <div class="card">
           <div class="card-title">手动保存单曲</div>
           <p class="hint" id="save-status" role="status">正在读取手动保存状态…</p>
@@ -646,6 +662,11 @@
   </template>
   <template data-help-id="logs">
     <p>日志本地滚动保留 3 天，卸载时随应用删除。导出包含近 3 天全部日志与环境快照；密钥会脱敏，但仍建议只在需要排查问题时提供给可信对象。</p>
+  </template>
+  <template data-help-id="save">
+    <p>音质阶梯：从「保存目标音质」所选上限起按 jymaster（超清母带）→ hires（Hi-Res）→ lossless（无损 FLAC）→ exhigh（极高 MP3 320k）向下探测，自动跳过试听片段；下载后核对大小与 MD5 并执行 ffprobe 与全曲解码校验。</p>
+    <p>封面处理：音频经 ffmpeg -c copy 无损重封装写入基础标签与词曲信息。开启封面时优先保留源音频内置封面，否则仅从 p1.music.126.net / p2.music.126.net 抓取（≤ 10 MB、≤ 8192×8192，支持 JPEG/PNG/WebP，其中 MP3 自动跳过 WebP）；关闭封面后不抓取且移除内置图，封面异常不会阻断歌曲保存。</p>
+    <p>歌词与不覆盖落盘：开启歌词时优先取原文 lyric，缺失时回退 tlyric（≤ 1 MB UTF-8）写为同名 .lrc 歌词文件；此外作词/作曲信息优先取详情字段，缺失时尝试从歌词前排信息提取。音频与 .lrc 均通过暂存区原子发布，绝不覆盖已有同名文件，并在落盘后同步目标目录属主。</p>
   </template>
 
   <div class="modal-mask help-modal" id="help-modal" hidden>

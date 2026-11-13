@@ -1776,3 +1776,87 @@ def test_is_configured_path_rejects_real_nul_lf_cr():
     assert route._is_configured_path("relative/path") is False
     # A literal backslash-x sequence is a valid POSIX path character, not a control byte.
     assert route._is_configured_path("/vol1/literal" + chr(92) + "x00") is True
+
+
+def test_quality_ceiling_limits_ladder_and_updates_status(tmp_path):
+    status_res = route.status(
+        deps=route.SaveDeps(config=_config(FNMUSIC_MANUAL_SAVE_QUALITY="lossless"))
+    )
+    assert status_res["ok"] is True
+    assert status_res["data"]["quality_order"] == ["lossless", "exhigh"]
+
+    seen_urls = []
+
+    def fake_http(url_text):
+        seen_urls.append(url_text)
+        if url_text.endswith("/info"):
+            return _info_payload()
+        if "quality=lossless" in url_text:
+            return _url_payload(url=None, code=404, level="lossless")
+        if "quality=exhigh" in url_text:
+            return _url_payload(media_type="mp3", level="exhigh")
+        raise AssertionError(f"unexpected quality probe: {url_text}")
+
+    deps, _store, _workdir = _pipeline_deps(
+        tmp_path,
+        probe=lambda _path: {
+            "streams": [{"index": 0, "codec_type": "audio", "codec_name": "mp3"}],
+            "format": {"format_name": "mp3"},
+        },
+    )
+    deps = replace(
+        deps,
+        config=_config(FNMUSIC_MANUAL_SAVE_QUALITY="lossless"),
+        http_json=fake_http,
+    )
+    result = route.save_track(489970550, deps=deps)
+    assert result["ok"] is True
+    assert result["data"]["quality_requested"] == "exhigh"
+    assert result["data"]["quality_actual"] == "exhigh"
+    assert result["data"]["quality_fallback"] is True
+    assert [u.split("quality=")[-1] for u in seen_urls if "/url?" in u] == ["lossless", "exhigh"]
+
+
+def test_cover_disabled_skips_fetch_and_strips_source_cover(tmp_path):
+    info = _info_payload()
+    info["data"]["al"]["picUrl"] = "https://p1.music.126.net/cover.jpg"
+    seen = {}
+
+    def fake_tag(source, tagged, metadata):
+        seen["cover_path"] = metadata.cover_path
+        seen["source_cover_indexes"] = metadata.source_cover_indexes
+        tagged.write_bytes(b"TAGGED:" + source.read_bytes())
+
+    deps, _store, _workdir = _pipeline_deps(
+        tmp_path,
+        info=info,
+        probe=lambda _path: {
+            "streams": [
+                {"index": 0, "codec_type": "audio", "codec_name": "flac"},
+                {"index": 1, "codec_type": "video", "disposition": {"attached_pic": 1}},
+            ],
+            "format": {"format_name": "flac"},
+        },
+        cover=lambda _url: pytest.fail("cover must not be fetched when disabled"),
+        tag=fake_tag,
+    )
+    deps = replace(deps, config=_config(FNMUSIC_MANUAL_SAVE_COVER_ENABLED="false"))
+    result = route.save_track(489970550, deps=deps)
+    assert result["ok"] is True
+    assert seen["cover_path"] is None
+    assert seen["source_cover_indexes"] == ()
+    assert result["data"]["cover_status"] == "not_attempted"
+    assert result["data"]["cover_embedded"] is False
+
+
+def test_lyric_disabled_skips_fetch_and_sidecar_publish(tmp_path):
+    deps, store, _workdir = _pipeline_deps(
+        tmp_path,
+        lyric=lambda _url: pytest.fail("lyric must not be fetched when disabled"),
+    )
+    deps = replace(deps, config=_config(FNMUSIC_MANUAL_SAVE_LYRIC_ENABLED="false"))
+    result = route.save_track(489970550, deps=deps)
+    assert result["ok"] is True
+    assert result["data"]["lyric_status"] == "not_attempted"
+    assert len(store.published_names) == 1
+    assert store.published_names[0].endswith(".flac")

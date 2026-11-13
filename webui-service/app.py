@@ -191,6 +191,10 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_TEE_SAVE_ENABLED": {"kind": "bool", "default": "true", "group": "tee", "reload": "hot", "label": "边听边存"},
     # 整歌单保存开关：宿主网关每次请求都会重读 .env，保存后即生效，无需重启代理。
     "FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED": {"kind": "bool", "default": "false", "group": "storage", "reload": "hot", "label": "整歌单保存"},
+    # 手动保存（单曲/整歌单共用）：每次保存从 .env 实时读取上限音质及封面/歌词开关。
+    "FNMUSIC_MANUAL_SAVE_QUALITY": {"kind": "enum", "values": ["jymaster", "hires", "lossless", "exhigh"], "default": "jymaster", "group": "save", "reload": "hot", "label": "保存目标音质"},
+    "FNMUSIC_MANUAL_SAVE_COVER_ENABLED": {"kind": "bool", "default": "true", "group": "save", "reload": "hot", "label": "保存内嵌封面"},
+    "FNMUSIC_MANUAL_SAVE_LYRIC_ENABLED": {"kind": "bool", "default": "true", "group": "save", "reload": "hot", "label": "保存同名 .lrc 歌词"},
     "FNMUSIC_TEE_SAVE_DIR": {"kind": "dir", "default": "", "group": "storage", "reload": "hot", "label": "下载目录（留空自动探测共享曲库）"},
     "FNMUSIC_DOWNLOAD_LAYOUT": {"kind": "enum", "values": ["flat", "artist", "album", "artist_album"], "default": "flat", "group": "storage", "reload": "hot", "label": "存放方式（beta）"},
     "FNMUSIC_TEE_SAVE_MODE": {"kind": "enum", "values": ["auto", "direct", "staged"], "default": "auto", "group": "storage", "reload": "hot", "label": "落盘方式"},
