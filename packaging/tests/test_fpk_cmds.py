@@ -145,6 +145,7 @@ esac
             "FNMUSIC_DURABLE_LOG": str(self.durable_log),
             "FNMUSIC_UNIT_FILE": str(self.tmp / "absent-unit.service"),
             "FNMUSIC_DEPLOYMENT_FILE": str(self.tmp / "absent-deployment"),
+            "FNMUSIC_APPCENTER_CLI": "",
             "HOME": str(self.tmp),
         }
         env.update({k: v for k, v in extra.items() if v is not None})
@@ -897,3 +898,65 @@ def test_main_status_exit_codes(sb):
     sb.add_systemctl()
     assert sb.run("main", "status").returncode == 3
     assert sb.run("main", "bogus").returncode == 1
+
+
+def test_main_start_direct_cli_syncs_appcenter_status(sb):
+    # 直接通过 CLI 调用时（无 TRIM_APPDEST/TRIM_APPNAME），repo 位于 target/repo
+    repo = sb.root / "target" / "repo"
+    repo.mkdir(parents=True)
+    (repo / "install.sh").write_text(INSTALLER_STUB, encoding="utf-8")
+    (repo / "install.sh").chmod(0o755)
+    (repo / "extend.sh").write_text(EXTEND_STUB, encoding="utf-8")
+    (repo / "extend.sh").chmod(0o755)
+    (repo / ".env").write_text("X=1\n", encoding="utf-8")
+
+    ac_log = sb.tmp / "logs" / "appcenter-cli.log"
+    _write_stub(sb.bindir, "appcenter-cli", f"""#!/bin/bash
+printf '%s\\n' "$*" >> "{ac_log}"
+case "$1" in
+  start) exit 0 ;;
+  status) printf 'running\\n'; exit 0 ;;
+  *) exit 1 ;;
+esac
+""")
+    env = sb.env(FNMUSIC_APPCENTER_CLI=str(sb.bindir / "appcenter-cli"))
+    env.pop("TRIM_APPDEST", None)
+    env.pop("TRIM_APPNAME", None)
+    result = sb.run("main", "start", env=env)
+    assert result.returncode == 0, result.stderr
+    assert ac_log.read_text(encoding="utf-8").splitlines() == [
+        "start fnmusic-ext",
+        "status fnmusic-ext",
+    ]
+    log_text = (sb.pkgvar / "fnmusic-app.log").read_text(encoding="utf-8")
+    assert "已复核并对齐应用中心状态" in log_text
+
+
+def test_main_start_appcenter_invocation_skips_appcenter_cli(sb):
+    repo = sb.make_repo(env_text="X=1\n", stub=EXTEND_STUB)
+    (repo / "extend.sh").write_text(EXTEND_STUB, encoding="utf-8")
+    (repo / "extend.sh").chmod(0o755)
+    ac_log = sb.tmp / "logs" / "appcenter-cli.log"
+    _write_stub(sb.bindir, "appcenter-cli", f'#!/bin/bash\nprintf "%s\\n" "$*" >> "{ac_log}"\n')
+    result = sb.run("main", "start", FNMUSIC_APPCENTER_CLI=str(sb.bindir / "appcenter-cli"))
+    assert result.returncode == 0, result.stderr
+    assert not ac_log.exists()
+
+
+def test_main_start_direct_cli_warns_when_appcenter_cli_fails(sb):
+    repo = sb.root / "target" / "repo"
+    repo.mkdir(parents=True)
+    (repo / "install.sh").write_text(INSTALLER_STUB, encoding="utf-8")
+    (repo / "install.sh").chmod(0o755)
+    (repo / "extend.sh").write_text(EXTEND_STUB, encoding="utf-8")
+    (repo / "extend.sh").chmod(0o755)
+    (repo / ".env").write_text("X=1\n", encoding="utf-8")
+
+    _write_stub(sb.bindir, "appcenter-cli", "#!/bin/bash\nexit 1\n")
+    env = sb.env(FNMUSIC_APPCENTER_CLI=str(sb.bindir / "appcenter-cli"))
+    env.pop("TRIM_APPDEST", None)
+    env.pop("TRIM_APPNAME", None)
+    result = sb.run("main", "start", env=env)
+    assert result.returncode == 0, result.stderr
+    log_text = (sb.pkgvar / "fnmusic-app.log").read_text(encoding="utf-8")
+    assert "appcenter-cli start fnmusic-ext 未返回 0" in log_text

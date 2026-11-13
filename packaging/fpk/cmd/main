@@ -40,6 +40,32 @@ case "${1:-}" in
             tail -n 5 "${FNMUSIC_LOG}" >&2 || true
             fnmusic_fail "启动失败：详见 ${FNMUSIC_LOG}"
         fi
+        # 直接通过 CLI 调 cmd/main start 时（未带 TRIM_APPDEST / TRIM_APPNAME），
+        # App Center 可能仍记录 stopped / isOpen:false（桌面图标与 /app/fnmusic-ext/ 消失）。
+        # 调用 appcenter-cli start 触发一次幂等对齐（App Center 内层再次进入时带 TRIM_*，不会递归）。
+        if [ -z "${TRIM_APPDEST:-}" ] && [ -z "${TRIM_APPNAME:-}" ]; then
+            APP_NAME="${FNMUSIC_APP_NAME:-fnmusic-ext}"
+            if [ -z "${FNMUSIC_APPCENTER_CLI+x}" ]; then
+                APPCENTER_CLI="$(command -v appcenter-cli 2>/dev/null || true)"
+                if [ -z "${APPCENTER_CLI}" ] && [ -x /usr/local/bin/appcenter-cli ]; then
+                    APPCENTER_CLI="/usr/local/bin/appcenter-cli"
+                fi
+            else
+                APPCENTER_CLI="${FNMUSIC_APPCENTER_CLI}"
+            fi
+            if [ -n "${APPCENTER_CLI}" ] && [ -x "${APPCENTER_CLI}" ]; then
+                if "${APPCENTER_CLI}" start "${APP_NAME}" >> "${FNMUSIC_LOG}" 2>&1; then
+                    app_state="$("${APPCENTER_CLI}" status "${APP_NAME}" 2>/dev/null | tr -d '\r\n' || true)"
+                    if [ "${app_state}" = "running" ]; then
+                        echo "[INFO] 已复核并对齐应用中心状态 (${APP_NAME}: ${app_state})" >> "${FNMUSIC_LOG}"
+                    else
+                        echo "[WARN] 已调用 appcenter-cli start ${APP_NAME}，当前状态为 ${app_state:-unknown}，请复核桌面入口" >> "${FNMUSIC_LOG}"
+                    fi
+                else
+                    echo "[WARN] appcenter-cli start ${APP_NAME} 未返回 0，请复核应用中心状态与桌面入口" >> "${FNMUSIC_LOG}"
+                fi
+            fi
+        fi
         exit 0
         ;;
     stop)
