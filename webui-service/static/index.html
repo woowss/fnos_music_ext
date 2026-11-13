@@ -408,9 +408,11 @@
           </label>
           <label class="switch-row"><span>嵌入专辑封面</span><input type="checkbox" id="manual-save-cover"></label>
           <label class="switch-row"><span>保存同名 .lrc 歌词</span><input type="checkbox" id="manual-save-lyric"></label>
-          <p class="hint">音质阶梯：按 jymaster → hires → lossless → exhigh 从所选上限开始顺次探测，跳过试听片段，并核对文件大小、MD5、容器格式与全曲解码。修改以上偏好后点击底部「保存并生效」即刻对下次保存生效。</p>
-          <p class="hint">封面与元数据：使用 ffmpeg 无损重封装写入歌名、歌手、专辑、音轨号与词曲信息。开启封面时优先保留源内嵌图，否则从 p1/p2.music.126.net 抓取（≤ 10 MB、≤ 8192×8192；MP3 自动跳过 WebP）；封面失败或关闭不阻断音频保存。</p>
-          <p class="hint">歌词与落盘：开启歌词时优先原文 lyric，次选翻译 tlyric（≤ 1 MB UTF-8）写为同名 .lrc（两者的作词/作曲行也会补充元数据）。所有文件经暂存区原子发布且不覆盖同名文件，并同步设置属主。</p>
+          <div class="rule-callout" aria-label="保存规则说明">
+            <div class="rule-item"><b>音质阶梯</b><span>按 jymaster → hires → lossless → exhigh 从所选上限开始顺次探测，跳过试听片段，并核对文件大小、MD5、容器格式与全曲解码。修改偏好后点击底部「保存并生效」即刻对下次保存生效。</span></div>
+            <div class="rule-item"><b>封面与元数据</b><span>使用 ffmpeg 无损重封装写入歌名、歌手、专辑、音轨号与词曲信息。开启封面时优先保留源内嵌图，否则从 p1/p2.music.126.net 抓取（≤ 10 MB、≤ 8192×8192；MP3 自动跳过 WebP）；封面失败或关闭不阻断音频保存。</span></div>
+            <div class="rule-item"><b>歌词与落盘</b><span>开启歌词时优先原文 lyric，次选翻译 tlyric（≤ 1 MB UTF-8）写为同名 .lrc（作词/作曲行也会补充元数据）。所有文件经暂存区原子发布且不覆盖同名文件，并同步设置属主。</span></div>
+          </div>
         </div>
         <div class="card">
           <div class="card-title">手动保存单曲</div>
