@@ -172,6 +172,41 @@ def llm_extra_body() -> dict:
     return {}
 
 
+_EXTRA_HEADERS_WARNED = ""
+
+
+def llm_extra_headers() -> dict:
+    """附加请求头（JSON 对象，逐键合并进请求头）。
+
+    给必须带自定义头的服务商一个通用出口：OpenCode Go 要求
+    x-opencode-session 才能路由，前置 Cloudflare 的网关还会按客户端签名
+    拦截默认 UA。键必须是字符串，值允许标量；非法 JSON 或非对象告警一次
+    并忽略，不阻断推荐。
+    """
+    global _EXTRA_HEADERS_WARNED
+    raw = (os.environ.get("FNMUSIC_LLM_EXTRA_HEADERS") or "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        data = None
+    if isinstance(data, dict):
+        out: dict[str, str] = {}
+        for key, value in data.items():
+            if not isinstance(key, str) or not key.strip() or value is None:
+                continue
+            if not isinstance(value, (str, int, float, bool)):
+                continue
+            out[key.strip()] = str(value)
+        if out:
+            return out
+    if _EXTRA_HEADERS_WARNED != raw:
+        _EXTRA_HEADERS_WARNED = raw
+        logger.warning("FNMUSIC_LLM_EXTRA_HEADERS 不是非空 JSON 对象，已忽略: %.120s", raw)
+    return {}
+
+
 def verify_playable_enabled() -> bool:
     return (os.environ.get("FNMUSIC_RECOMMEND_VERIFY_PLAYABLE", "true").strip().lower()
             in ("true", "1", "yes"))
@@ -1088,6 +1123,8 @@ async def _llm_complete(
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
     }
+    # 服务商专属头（如 OpenCode Go 的 x-opencode-session、网关要求的 UA）
+    headers.update(llm_extra_headers())
     try:
         resp = await http_client.post(url, json=payload, headers=headers, timeout=llm_timeout_s())
     except LLMFailure:
