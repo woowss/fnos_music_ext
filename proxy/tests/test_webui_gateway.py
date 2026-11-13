@@ -907,3 +907,63 @@ def test_gateway_log_path_never_contains_query_or_user_data():
     head = b"GET /app/fnmusic-ext/api/manual-save/search?keyword=secret HTTP/1.1\r\nHost: x\r\n\r\n"
     assert _MOD._log_path_only(head) == "/app/fnmusic-ext/api/manual-save/search"
     assert _MOD._log_path_only(b"") == ""
+
+
+def test_force_connection_close_rewrites_keepalive_and_keeps_upgrade():
+    keepalive = (
+        b"PUT /app/fnmusic-ext/api/config HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Connection: keep-alive\r\n"
+        b"Proxy-Connection: keep-alive\r\n"
+        b"Content-Length: 2\r\n"
+        b"\r\n{}"
+    )
+    rewritten = _MOD._force_connection_close(keepalive)
+    head, _, body = rewritten.partition(b"\r\n\r\n")
+    assert body == b"{}"
+    assert b"Connection: keep-alive" not in head
+    assert b"Proxy-Connection" not in head
+    assert b"Connection: close" in head
+
+    implicit = b"GET /app/fnmusic-ext/ HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    assert b"Connection: close\r\n\r\n" in _MOD._force_connection_close(implicit)
+
+    ws = (
+        b"GET /app/fnmusic-ext/ws HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Connection: keep-alive, Upgrade\r\n"
+        b"Upgrade: websocket\r\n\r\n"
+    )
+    assert _MOD._force_connection_close(ws) == ws
+
+
+def test_socket_forces_connection_close_for_http11_keepalive(tmp_path: Path):
+    seen_connections = []
+
+    class _KeepAliveHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):  # noqa: N802
+            seen_connections.append(self.headers.get("Connection"))
+            body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, fmt, *args):
+            return
+
+    upstream = _TestHTTPServer(("127.0.0.1", 0), _KeepAliveHandler)
+    port = upstream.server_address[1]
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    sock_path = _start_gateway(tmp_path, port)
+    try:
+        # 不带 Connection: close 且显式发 keep-alive，服务端若不关闭会在 recv 超时
+        raw = b"GET /app/fnmusic-ext/api/config HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n"
+        data = _request(sock_path, raw, timeout=1.5)
+    finally:
+        upstream.shutdown()
+    assert seen_connections == ["close"]
+    assert b"200" in data.split(b"\r\n", 1)[0]
+    assert data.endswith(b"ok")

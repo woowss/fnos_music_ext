@@ -462,6 +462,46 @@ def _relay(src: socket.socket, dst: socket.socket, prefix: bytes = b"") -> None:
                 pass
 
 
+def _force_connection_close(head_raw: bytes) -> bytes:
+    """Strip keep-alive on forwarded non-Upgrade HTTP heads so nginx won't pool the tunnel.
+
+    ``_handle`` only inspects the first request head per accepted UDS connection before
+    handing the socket off to ``_relay``. Allowing HTTP/1.1 keep-alive lets the outer
+    nginx proxy reuse that tunnel for later ``/api/manual-save/*`` calls, bypassing
+    ``webui_gateway`` straight into WebUI's 501 placeholder.
+    """
+    head, sep, rest = head_raw.partition(b"\r\n\r\n")
+    if not sep:
+        return head_raw
+    lines = head.split(b"\r\n")
+    if not lines:
+        return head_raw
+    kept: list[bytes] = [lines[0]]
+    has_upgrade = False
+    for line in lines[1:]:
+        name, colon, value = line.partition(b":")
+        if not colon:
+            kept.append(line)
+            continue
+        lname = name.strip().lower()
+        if lname == b"upgrade":
+            has_upgrade = True
+            kept.append(line)
+            continue
+        if lname == b"connection":
+            tokens = {tok.strip().lower() for tok in value.split(b",") if tok.strip()}
+            if b"upgrade" in tokens:
+                has_upgrade = True
+            continue
+        if lname == b"proxy-connection":
+            continue
+        kept.append(line)
+    if has_upgrade:
+        return head_raw
+    kept.append(b"Connection: close")
+    return b"\r\n".join(kept) + sep + rest
+
+
 def _read_request_head(client: socket.socket) -> "tuple[bytes, dict[str, str]] | None":
     """读到 HTTP 头部结束；返回 (头部原始字节, 解析出的头)。超时/格式异常返回 None。"""
     buf = b""
@@ -2960,13 +3000,14 @@ def _handle(client: socket.socket, upstream: tuple[str, int],
     if rejection is not None:
         _reject_head(client, rejection)
         return
+    forward_raw = _force_connection_close(head_raw)
     try:
         remote = socket.create_connection(upstream, timeout=CONNECT_TIMEOUT)
         remote.settimeout(RELAY_TIMEOUT)
     except OSError:
         client.close()
         return
-    left = threading.Thread(target=_relay, args=(client, remote, head_raw), daemon=True)
+    left = threading.Thread(target=_relay, args=(client, remote, forward_raw), daemon=True)
     right = threading.Thread(target=_relay, args=(remote, client), daemon=True)
     left.start()
     right.start()
