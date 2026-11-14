@@ -150,6 +150,11 @@ _COVER_DECLARED_MIME_ALIASES = {
 _COVER_MIME_PARAM_TOKEN_RE = re.compile(r"[A-Za-z0-9._-]{1,32}")
 UNKNOWN_ARTIST = "未知歌手"
 ARTIST_SEPARATOR = "/"
+_AUDIO_DEDUP_EXTENSIONS = frozenset({
+    ".mp3", ".flac", ".wav", ".ogg", ".opus", ".m4a",
+    ".aac", ".ape", ".wv", ".dsf", ".dff", ".tta",
+})
+_ARTIST_DEDUP_JOINERS = ("/", ",", ", ", " _ ", "、")
 MD5_RE = re.compile(r"[0-9a-fA-F]{32}")
 DIGITS_RE = re.compile(r"[0-9]{1,18}")
 # A delivered quality is reported as a lowercase server token; anything else is
@@ -686,6 +691,18 @@ def _save_locked(
     media_url = quality.media_url
     api_type = _text(quality_data.get("type")).strip().casefold()
     source_type = api_type if api_type in {"flac", "mp3"} else ""
+    existing_basename = _find_existing_track(
+        config.target_dir, artist, title, source_type=source_type
+    )
+    if existing_basename is not None:
+        return _conflict_precheck_result(
+            song_id=song_id,
+            track_metadata=track_metadata,
+            quality=quality,
+            source_type=source_type,
+            existing_basename=existing_basename,
+            target_dir=config.target_dir,
+        )
     raw_br = quality_data.get("br")
     api_br = raw_br if type(raw_br) is int and not isinstance(raw_br, bool) and raw_br >= 0 else 0
     raw_sr = quality_data.get("sr")
@@ -1860,6 +1877,112 @@ def build_basename(artist: str, title: str, extension: str) -> str:
     if not stem:
         stem = UNKNOWN_ARTIST
     return stem + suffix
+
+
+def _dedup_stem_key(stem: str) -> str:
+    return " ".join(stem.split()).casefold()
+
+
+def _candidate_dedup_keys(artist: str, title: str, ext_hint: str = "flac") -> set[str]:
+    suffix = "." + (ext_hint.casefold() if ext_hint else "flac")
+    artist_variants = [artist]
+    if ARTIST_SEPARATOR in artist:
+        parts = [part.strip() for part in artist.split(ARTIST_SEPARATOR) if part.strip()]
+        if len(parts) > 1:
+            for joiner in _ARTIST_DEDUP_JOINERS:
+                artist_variants.append(joiner.join(parts))
+    keys: set[str] = set()
+    for variant in artist_variants:
+        name = build_basename(variant, title, suffix.lstrip("."))
+        if name.casefold().endswith(suffix):
+            stem = name[: -len(suffix)]
+        else:
+            stem = name.rsplit(".", 1)[0]
+        if stem:
+            keys.add(_dedup_stem_key(stem))
+    return keys
+
+
+def _find_existing_track(
+    target_dir: str,
+    artist: str,
+    title: str,
+    *,
+    source_type: str = "",
+) -> str | None:
+    """Return an existing matching audio basename in target_dir so duplicates never download or overwrite."""
+    if not target_dir:
+        return None
+    expected = build_basename(artist, title, source_type) if source_type else ""
+    expected_cf = expected.casefold() if expected else ""
+    candidate_keys = _candidate_dedup_keys(artist, title, source_type or "flac")
+    matches: list[str] = []
+    try:
+        with os.scandir(target_dir) as entries:
+            for entry in entries:
+                name = entry.name
+                if expected_cf and name.casefold() == expected_cf:
+                    return name
+                stem, dot, ext = name.rpartition(".")
+                if not dot or ("." + ext.casefold()) not in _AUDIO_DEDUP_EXTENSIONS:
+                    continue
+                if _dedup_stem_key(stem) not in candidate_keys:
+                    continue
+                try:
+                    if entry.is_file(follow_symlinks=False) and entry.stat(follow_symlinks=False).st_size > 0:
+                        matches.append(name)
+                except OSError:
+                    continue
+    except OSError:
+        return None
+    return sorted(matches)[0] if matches else None
+
+
+def _conflict_precheck_result(
+    *,
+    song_id: int,
+    track_metadata: _TrackMetadata,
+    quality: _QualitySelection,
+    source_type: str,
+    existing_basename: str,
+    target_dir: str,
+) -> dict:
+    data = _success_data(
+        status_value="conflict",
+        song_id=song_id,
+        title=track_metadata.title,
+        artist=track_metadata.artist,
+        album=track_metadata.album,
+        quality_requested=quality.requested,
+        quality_actual=quality.actual,
+        quality_actual_status=quality.actual_status,
+        quality_fallback=quality.fallback,
+        br=_positive_int(quality.data.get("br")) or 0,
+        sr=_positive_int(quality.data.get("sr")) or 0,
+        source_type=source_type,
+        actual_format=source_type,
+        size=0,
+        md5="",
+        basename=existing_basename,
+        target_dir=target_dir,
+        cover_error="",
+    )
+    data.update(
+        {
+            "title_status": "unavailable",
+            "artist_status": "unavailable",
+            "album_status": "unavailable",
+            "lyricist": track_metadata.lyricist,
+            "composer": track_metadata.composer,
+            "lyricist_status": "unavailable",
+            "composer_status": "unavailable",
+            "cover_status": "not_published",
+            "lyric_status": "not_attempted",
+            "tagged": False,
+            "cover_embedded": False,
+        }
+    )
+    return _result(False, "conflict", data)
 
 
 def _anonymous_module():

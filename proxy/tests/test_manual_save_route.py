@@ -1908,3 +1908,97 @@ def test_save_track_quality_override_and_br_sr_metadata(tmp_path):
     bad = route.save_track(489970550, quality="bogus", deps=deps)
     assert bad["ok"] is False
     assert bad["code"] == "invalid_quality"
+
+
+def _target_dir_deps(tmp_path: Path, monkeypatch, **overrides):
+    target_dir = tmp_path / "target"
+    staging_dir = tmp_path / "staging"
+    target_dir.mkdir(exist_ok=True)
+    staging_dir.mkdir(exist_ok=True)
+    if not str(target_dir).startswith("/"):
+        monkeypatch.setattr(route, "_is_configured_path", lambda p: bool(p))
+
+    def fake_stat(path):
+        if path == str(target_dir):
+            return _dir_stat(ino=1)
+        if path == str(staging_dir):
+            return _dir_stat(ino=2)
+        raise OSError("missing")
+
+    deps, store, workdir = _pipeline_deps(tmp_path, **overrides)
+    deps = replace(
+        deps,
+        config=_config(
+            FNMUSIC_MANUAL_SAVE_TARGET=str(target_dir),
+            FNMUSIC_MANUAL_SAVE_STAGING=str(staging_dir),
+        ),
+        stat=fake_stat,
+    )
+    return deps, store, workdir, target_dir
+
+
+def test_precheck_existing_exact_file_conflicts_without_downloading(tmp_path, monkeypatch):
+    deps, store, _workdir, target_dir = _target_dir_deps(
+        tmp_path,
+        monkeypatch,
+        download=lambda *_args: pytest.fail("must not download when exact track already exists"),
+    )
+    existing = target_dir / "歌手A_歌手B - 测试歌曲.flac"
+    existing.write_bytes(b"existing-flac-bytes")
+
+    result = route.save_track(489970550, deps=deps)
+    assert result["ok"] is False
+    assert result["code"] == "conflict"
+    assert result["data"]["status"] == "conflict"
+    assert result["data"]["basename"] == "歌手A_歌手B - 测试歌曲.flac"
+    assert result["data"]["cover_status"] == "not_published"
+    assert store.published_names == []
+    assert existing.read_bytes() == b"existing-flac-bytes"
+
+
+def test_precheck_existing_cross_extension_conflicts_without_downloading(tmp_path, monkeypatch):
+    deps, store, _workdir, target_dir = _target_dir_deps(
+        tmp_path,
+        monkeypatch,
+        download=lambda *_args: pytest.fail("must not download when mp3 version already exists"),
+    )
+    existing = target_dir / "歌手A_歌手B - 测试歌曲.mp3"
+    existing.write_bytes(b"existing-mp3-bytes")
+
+    result = route.save_track(489970550, deps=deps)
+    assert result["ok"] is False
+    assert result["code"] == "conflict"
+    assert result["data"]["status"] == "conflict"
+    assert result["data"]["basename"] == "歌手A_歌手B - 测试歌曲.mp3"
+    assert store.published_names == []
+    assert existing.read_bytes() == b"existing-mp3-bytes"
+
+
+def test_precheck_existing_comma_artist_variant_conflicts_without_downloading(tmp_path, monkeypatch):
+    deps, store, _workdir, target_dir = _target_dir_deps(
+        tmp_path,
+        monkeypatch,
+        download=lambda *_args: pytest.fail("must not download when comma-artist track already exists"),
+    )
+    existing = target_dir / "歌手A,歌手B - 测试歌曲.flac"
+    existing.write_bytes(b"existing-comma-flac-bytes")
+
+    result = route.save_track(489970550, deps=deps)
+    assert result["ok"] is False
+    assert result["code"] == "conflict"
+    assert result["data"]["status"] == "conflict"
+    assert result["data"]["basename"] == "歌手A,歌手B - 测试歌曲.flac"
+    assert store.published_names == []
+    assert existing.read_bytes() == b"existing-comma-flac-bytes"
+
+
+def test_precheck_orphan_lrc_sidecar_does_not_block_audio_save(tmp_path, monkeypatch):
+    deps, store, _workdir, target_dir = _target_dir_deps(tmp_path, monkeypatch)
+    orphan_lrc = target_dir / "歌手A_歌手B - 测试歌曲.lrc"
+    orphan_lrc.write_text("[00:00.00]existing lyric\n", encoding="utf-8")
+
+    result = route.save_track(489970550, deps=deps)
+    assert result["ok"] is True
+    assert result["data"]["status"] == "published"
+    assert "歌手A_歌手B - 测试歌曲.flac" in store.published_names
+
