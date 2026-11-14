@@ -4266,6 +4266,79 @@ test("手动保存偏好：音质上限/封面/歌词按 Schema 回填、校验�
   assert.ok(!("FNMUSIC_MANUAL_SAVE_LYRIC_ENABLED" in withoutSchema));
 });
 
+test("手动保存 B1-2：搜索结果渲染真实音质/VIP徽标并透传单曲音质选择与码率采样率", async () => {
+  global.renderSaveResults([
+    {
+      song_id: 501,
+      title: "Master Song",
+      artist: "Artist A",
+      album: "Album A",
+      max_quality: "jymaster",
+      playable_status: "vip_required",
+      fee: 1,
+      has_sky: false,
+      duration: 205000,
+    },
+    {
+      song_id: 502,
+      title: "Dolby Song",
+      artist: "Artist B",
+      album: "Album B",
+      max_quality: "sky",
+      playable_status: "ok",
+      fee: 0,
+      has_sky: true,
+      duration: 180000,
+    },
+  ]);
+  const html = els.get("#save-results").innerHTML;
+  assert.ok(html.includes("超清母带 · jymaster"));
+  assert.ok(html.includes("需黑胶VIP"));
+  assert.ok(html.includes("沉浸环绕声 · sky"));
+
+  enqueue("/app/fnmusic-ext/api/config", { values: { FNMUSIC_MANUAL_SAVE_QUALITY: "lossless" }, schema: {} });
+  enqueue("/app/fnmusic-ext/api/manual-save/status", { ok: true, data: { enabled: true } });
+  plEnqueueRaw(PL_PATH + "/playlists", 403, plErr("playlist_disabled"));
+  await global.loadSaveStatus();
+
+  enqueue("/app/fnmusic-ext/api/manual-save/track", {
+    ok: true,
+    code: "ok",
+    data: {
+      status: "published",
+      song_id: 501,
+      quality_requested: "hires",
+      quality_actual: "hires",
+      quality_actual_status: "reported",
+      quality_fallback: false,
+      br: 1920000,
+      sr: 96000,
+      format: "flac",
+      size: 4096,
+      basename: "Artist A - Master Song.flac",
+      target_dir: "/library",
+      cover_status: "embedded",
+      lyric_status: "published",
+      artist_status: "tagged",
+    },
+  });
+  const btn = stubEl();
+  btn.dataset.songId = "501";
+  const rowState = stubEl();
+  const rowSelect = stubEl();
+  rowSelect.value = "hires";
+  btn.closest = () => ({
+    querySelector: (sel) => (sel === ".save-track-quality" ? rowSelect : rowState),
+  });
+  await global.saveOneTrack(btn);
+  const posted = fetchCalls.filter((c) => c.path.endsWith("/manual-save/track")).pop();
+  assert.deepStrictEqual(JSON.parse(posted.body), { song_id: 501, quality: "hires" });
+  const resultText = els.get("#save-result").textContent;
+  assert.ok(resultText.includes("实际档位：hires"));
+  assert.ok(resultText.includes("1920 kbps"));
+  assert.ok(resultText.includes("96 kHz"));
+});
+
 /* ------------------------------------------------ 运行 --------------------- */
 (async () => {
   let failed = 0;

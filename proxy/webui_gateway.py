@@ -169,6 +169,7 @@ _MANUAL_SAVE_GATEWAY_MESSAGES = {
     "invalid_request": "请求无效",
     "invalid_keyword": "搜索关键词必须是 1-120 字符",
     "invalid_song_id": "song_id 必须是正整数",
+    "invalid_quality": "音质参数无效",
     "disabled": "手动保存未启用",
     "busy": "已有保存任务进行中",
     "timeout": "保存超时",
@@ -183,6 +184,7 @@ _MANUAL_SAVE_HTTP_STATUS = {
     "busy": 409,
     "disabled": 403,
     "invalid_song_id": 400,
+    "invalid_quality": 400,
     "invalid_keyword": 400,
     "service_unavailable": 503,
     "staging_unavailable": 503,
@@ -967,6 +969,10 @@ def _sanitize_manual_save_data(data: object) -> dict:
     sanitized["status"] = status_value if status_value in ("published", "conflict") else ""
     sanitized["song_id"] = _manual_save_int(source.get("song_id"))
     sanitized["size"] = _manual_save_int(source.get("size"))
+    raw_br = _manual_save_int(source.get("br"))
+    sanitized["br"] = raw_br if 0 <= raw_br <= (2**31 - 1) else 0
+    raw_sr = _manual_save_int(source.get("sr"))
+    sanitized["sr"] = raw_sr if 0 <= raw_sr <= (2**31 - 1) else 0
     md5 = source.get("md5")
     sanitized["md5"] = (
         md5 if type(md5) is str and re.fullmatch(r"[0-9a-fA-F]{32}", md5) else ""
@@ -1059,7 +1065,15 @@ def _manual_save_http_status(code: str, ok: bool) -> int:
     return _MANUAL_SAVE_HTTP_STATUS.get(code, 500)
 
 
-def _run_manual_save(engine, song_id: int, timeout: float):
+_MANUAL_SAVE_TRACK_QUALITY_OVERRIDES = frozenset({
+    "sky", "jymaster", "hires", "lossless", "exhigh",
+})
+_MANUAL_SAVE_SEARCH_PLAYABLE_STATUSES = frozenset({
+    "ok", "vip_required", "paid_album", "copyright", "trial", "unavailable",
+})
+
+
+def _run_manual_save(engine, song_id: int, timeout: float, *, quality: "str | None" = None):
     """Run one track save in a worker thread under the gateway execution lock.
 
     Contract §7.1: the single-track worker must acquire the same module-level
@@ -1076,7 +1090,10 @@ def _run_manual_save(engine, song_id: int, timeout: float):
             return
         try:
             try:
-                holder["value"] = engine.save_track(song_id)
+                if quality is None:
+                    holder["value"] = engine.save_track(song_id)
+                else:
+                    holder["value"] = engine.save_track(song_id, quality=quality)
             except BaseException as exc:  # noqa: BLE001 — worker errors become fixed JSON
                 # 固定 code 日志：只记异常类名，便于定位偶发 internal；不记异常文本。
                 gateway_log(f"manual-save worker-exception class={type(exc).__name__}")
@@ -1187,9 +1204,24 @@ def handle_manual_save_track(client: socket.socket, head_raw: bytes, *,
         if type(song_id) is not int or isinstance(song_id, bool) or song_id <= 0:
             client.sendall(_json_response(400, _manual_save_error("invalid_song_id")))
             return
+        override_quality = None
+        if "quality" in request and request["quality"] is not None:
+            raw_quality = request["quality"]
+            if type(raw_quality) is not str:
+                client.sendall(_json_response(400, _manual_save_error("invalid_quality")))
+                return
+            cleaned_quality = raw_quality.strip().casefold()
+            if cleaned_quality in ("", "auto"):
+                override_quality = None
+            elif cleaned_quality in _MANUAL_SAVE_TRACK_QUALITY_OVERRIDES:
+                override_quality = cleaned_quality
+            else:
+                client.sendall(_json_response(400, _manual_save_error("invalid_quality")))
+                return
         result = _run_manual_save(
             active_engine, song_id,
             MANUAL_SAVE_TIMEOUT if timeout is None else timeout,
+            quality=override_quality,
         )
         if result is None:
             gateway_log("manual-save track result code=timeout")
@@ -1250,6 +1282,27 @@ def _sanitize_manual_save_search_items(items: object) -> list[dict]:
         for name in ("title", "artist", "album", "quality"):
             value = item.get(name)
             sanitized_item[name] = value if type(value) is str else ""
+        raw_max_q = item.get("max_quality")
+        if type(raw_max_q) is str and raw_max_q.strip():
+            clean_mq = raw_max_q.strip().casefold()
+            sanitized_item["max_quality"] = (
+                clean_mq if _MANUAL_SAVE_QUALITY_TOKEN_RE.fullmatch(clean_mq) else sanitized_item["quality"]
+            )
+        else:
+            sanitized_item["max_quality"] = sanitized_item["quality"]
+        raw_playable = item.get("playable_status")
+        clean_playable = raw_playable.strip().casefold() if type(raw_playable) is str else ""
+        sanitized_item["playable_status"] = (
+            clean_playable if clean_playable in _MANUAL_SAVE_SEARCH_PLAYABLE_STATUSES else ""
+        )
+        raw_fee = item.get("fee")
+        sanitized_item["fee"] = (
+            raw_fee
+            if type(raw_fee) is int and not isinstance(raw_fee, bool) and raw_fee >= 0
+            else 0
+        )
+        for flag in ("has_sq", "has_hr", "has_jm", "has_sky"):
+            sanitized_item[flag] = item.get(flag) is True
         duration = item.get("duration")
         sanitized_item["duration"] = (
             duration

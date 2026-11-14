@@ -350,6 +350,7 @@ def test_track_success_returns_sanitized_engine_result():
     expected_fields = {
         "status", "song_id", "title", "artist", "album", "quality_requested",
         "quality_actual", "quality_actual_status", "quality_fallback",
+        "br", "sr",
         "source_type", "format", "size", "md5", "basename",
         "target_dir", "tagged", "cover_embedded", "published_size",
         "published_md5", "published_sha256", "title_status", "artist_status", "album_status",
@@ -703,7 +704,12 @@ def test_search_percent_decodes_keyword_and_sanitizes_output():
     assert set(payload["data"]) == {"items", "keyword", "limit"}
     assert len(payload["data"]["items"]) == 1
     item = payload["data"]["items"][0]
-    assert set(item) == {"song_id", "title", "artist", "album", "quality", "duration"}
+    assert set(item) == {
+        "song_id", "title", "artist", "album", "quality",
+        "max_quality", "playable_status", "fee",
+        "has_sq", "has_hr", "has_jm", "has_sky",
+        "duration",
+    }
     assert item["song_id"] == 111
     assert item["title"] == "歌曲一"
     rendered = client.data.decode("utf-8", "replace")
@@ -910,3 +916,90 @@ def test_sanitize_manual_save_data_allows_not_attempted_cover_and_lyric():
     sanitized = gw._sanitize_manual_save_data(sample)
     assert sanitized["cover_status"] == "not_attempted"
     assert sanitized["lyric_status"] == "not_attempted"
+    assert sanitized["br"] == 0
+    assert sanitized["sr"] == 0
+
+
+def test_track_forwards_quality_override_and_rejects_invalid_quality():
+    captured = []
+
+    class OverrideEngine(FakeEngine):
+        def save_track(self, song_id, *, quality=None):
+            captured.append((song_id, quality))
+            res = _published_result()
+            res["data"]["br"] = 999000
+            res["data"]["sr"] = 48000
+            return res
+
+    raw = _raw(
+        "POST",
+        gw.MANUAL_SAVE_TRACK_PATHS[0],
+        body=json.dumps({"song_id": SONG_ID, "quality": "hires"}).encode("utf-8"),
+    )
+    client = FakeClient(raw)
+    gw.handle_manual_save_track(client, raw, engine=OverrideEngine())
+    status, payload = _response(client)
+    assert status == 200
+    assert captured == [(SONG_ID, "hires")]
+    assert payload["data"]["br"] == 999000
+    assert payload["data"]["sr"] == 48000
+
+    # auto normalizes to omitting override (calls 1-arg save_track(song_id))
+    raw_auto = _raw(
+        "POST",
+        gw.MANUAL_SAVE_TRACK_PATHS[0],
+        body=json.dumps({"song_id": SONG_ID, "quality": "auto"}).encode("utf-8"),
+    )
+    client_auto = FakeClient(raw_auto)
+    legacy_engine = FakeEngine()
+    gw.handle_manual_save_track(client_auto, raw_auto, engine=legacy_engine)
+    status_auto, _ = _response(client_auto)
+    assert status_auto == 200
+    assert legacy_engine.save_calls == [SONG_ID]
+
+    # invalid quality fails closed with 400 invalid_quality
+    raw_bad = _raw(
+        "POST",
+        gw.MANUAL_SAVE_TRACK_PATHS[0],
+        body=json.dumps({"song_id": SONG_ID, "quality": "ultra-fake"}).encode("utf-8"),
+    )
+    client_bad = FakeClient(raw_bad)
+    gw.handle_manual_save_track(client_bad, raw_bad, engine=legacy_engine)
+    status_bad, payload_bad = _response(client_bad)
+    assert status_bad == 400
+    assert payload_bad["code"] == "invalid_quality"
+
+
+def test_search_sanitizes_rich_quality_and_entitlement_fields():
+    raw_items = [{
+        "song_id": 777,
+        "title": "HiRes Track",
+        "artist": "Artist",
+        "album": "Album",
+        "quality": "lossless",
+        "max_quality": "JYMASTER",
+        "playable_status": "vip_required",
+        "fee": 1,
+        "has_sq": True,
+        "has_hr": True,
+        "has_jm": True,
+        "has_sky": False,
+        "duration": 200000,
+        "extra_leak": "https://evil.example/leak",
+    }]
+    sanitized = gw._sanitize_manual_save_search_items(raw_items)
+    assert sanitized == [{
+        "song_id": 777,
+        "title": "HiRes Track",
+        "artist": "Artist",
+        "album": "Album",
+        "quality": "lossless",
+        "max_quality": "jymaster",
+        "playable_status": "vip_required",
+        "fee": 1,
+        "has_sq": True,
+        "has_hr": True,
+        "has_jm": True,
+        "has_sky": False,
+        "duration": 200000,
+    }]

@@ -350,6 +350,30 @@ def _quality_order_for(max_quality: str) -> tuple[str, ...]:
     return QUALITY_ORDER[QUALITY_ORDER.index(normalized):]
 
 
+TRACK_QUALITY_OVERRIDES = ("sky", *QUALITY_ORDER)
+
+
+def _normalize_override_quality(value: object) -> str | None:
+    if value is None:
+        return None
+    if type(value) is not str:
+        raise _SaveFailure("invalid_quality")
+    cleaned = value.strip().casefold()
+    if cleaned in ("", "auto"):
+        return None
+    if cleaned in TRACK_QUALITY_OVERRIDES:
+        return cleaned
+    raise _SaveFailure("invalid_quality")
+
+
+def _quality_order_with_override(config_quality: str, override: str | None) -> tuple[str, ...]:
+    if override == "sky":
+        return ("sky", *QUALITY_ORDER)
+    if override is not None:
+        return _quality_order_for(override)
+    return _quality_order_for(config_quality)
+
+
 def load_config(
     *,
     values: Mapping[str, str] | None = None,
@@ -521,6 +545,11 @@ def _search_item_duration(item: Mapping) -> int:
     return 0
 
 
+_ALLOWED_SEARCH_PLAYABLE_STATUSES = frozenset({
+    "ok", "vip_required", "paid_album", "copyright", "trial", "unavailable",
+})
+
+
 def _sanitize_search_item(item: object) -> "dict | None":
     if not isinstance(item, Mapping):
         return None
@@ -531,12 +560,24 @@ def _sanitize_search_item(item: object) -> "dict | None":
         return None
     title = _text(item.get("name")) or _text(item.get("title")) or _text(item.get("song_name"))
     quality = _text(item.get("quality")) or _text(item.get("level"))
+    max_quality = _text(item.get("max_quality")).strip().casefold() or quality.strip().casefold()
+    playable_raw = _text(item.get("playable_status")).strip().casefold()
+    playable_status = playable_raw if playable_raw in _ALLOWED_SEARCH_PLAYABLE_STATUSES else ""
+    fee_raw = item.get("fee")
+    fee = fee_raw if type(fee_raw) is int and not isinstance(fee_raw, bool) and fee_raw >= 0 else 0
     return {
         "song_id": song_id,
         "title": title.strip(),
         "artist": _search_item_artist(item),
         "album": _search_item_album(item),
         "quality": quality.strip(),
+        "max_quality": max_quality,
+        "playable_status": playable_status,
+        "fee": fee,
+        "has_sq": item.get("has_sq") is True,
+        "has_hr": item.get("has_hr") is True,
+        "has_jm": item.get("has_jm") is True,
+        "has_sky": item.get("has_sky") is True,
         "duration": _search_item_duration(item),
     }
 
@@ -558,6 +599,7 @@ def search_tracks(keyword: object, *, deps: SaveDeps | None = None) -> dict:
             config.musicbox_url.rstrip("/")
             + "/api/v1/search?keyword=" + quote(cleaned, safe="")
             + "&type=song&limit=" + str(SEARCH_LIMIT)
+            + "&mode=manual_save"
         )
         try:
             payload = http_json(url)
@@ -586,12 +628,13 @@ def search_tracks(keyword: object, *, deps: SaveDeps | None = None) -> dict:
         return _failure("internal")
 
 
-def save_track(song_id: object, *, deps: SaveDeps | None = None) -> dict:
+def save_track(song_id: object, *, quality: object = None, deps: SaveDeps | None = None) -> dict:
     try:
         if type(song_id) is not int or song_id <= 0:
             return _failure("invalid_song_id")
         if deps is not None and not isinstance(deps, SaveDeps):
             return _failure("internal")
+        quality_override = _normalize_override_quality(quality)
         config = load_config(values=_field(deps, "config", None))
         if not config.enabled:
             return _failure("disabled")
@@ -601,16 +644,24 @@ def save_track(song_id: object, *, deps: SaveDeps | None = None) -> dict:
         if not _SAVE_LOCK.acquire(blocking=False):
             return _failure("busy")
         try:
-            return _save_locked(song_id, config, deps)
+            return _save_locked(song_id, config, deps, quality_override=quality_override)
         finally:
             _SAVE_LOCK.release()
     except _SaveFailure as exc:
+        if exc.code == "invalid_quality":
+            return {"ok": False, "code": "invalid_quality", "message": "音质参数无效", "data": {}}
         return _failure(exc.code)
     except Exception:
         return _failure("internal")
 
 
-def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
+def _save_locked(
+    song_id: int,
+    config: Config,
+    deps: SaveDeps | None,
+    *,
+    quality_override: str | None = None,
+) -> dict:
     http_json = _field(deps, "http_json", _default_info_http_json)
     media_resolve = _field(deps, "media_resolve", None)
     download = _field(deps, "download", None)
@@ -629,12 +680,16 @@ def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
     album = track_metadata.album
     track_number = track_metadata.track_number
     disc_number = track_metadata.disc_number
-    quality_order = _quality_order_for(config.quality)
+    quality_order = _quality_order_with_override(config.quality, quality_override)
     quality = _select_quality(http_json, config.musicbox_url, song_id, quality_order=quality_order)
     quality_data = quality.data
     media_url = quality.media_url
     api_type = _text(quality_data.get("type")).strip().casefold()
     source_type = api_type if api_type in {"flac", "mp3"} else ""
+    raw_br = quality_data.get("br")
+    api_br = raw_br if type(raw_br) is int and not isinstance(raw_br, bool) and raw_br >= 0 else 0
+    raw_sr = quality_data.get("sr")
+    api_sr = raw_sr if type(raw_sr) is int and not isinstance(raw_sr, bool) and raw_sr >= 0 else 0
 
     store = None
     workdir = None
@@ -812,6 +867,8 @@ def _save_locked(song_id: int, config: Config, deps: SaveDeps | None) -> dict:
             basename=basename,
             target_dir=config.target_dir,
             cover_error=cover_error,
+            br=api_br,
+            sr=api_sr,
         )
         data.update({
             "title_status": "tagged",
@@ -1746,6 +1803,8 @@ def _success_data(
     basename: str,
     target_dir: str,
     cover_error: str,
+    br: int = 0,
+    sr: int = 0,
 ) -> dict:
     return {
         "status": status_value,
@@ -1757,6 +1816,8 @@ def _success_data(
         "quality_actual": quality_actual,
         "quality_actual_status": quality_actual_status,
         "quality_fallback": quality_fallback,
+        "br": br,
+        "sr": sr,
         "source_type": source_type,
         "format": actual_format,
         "size": size,

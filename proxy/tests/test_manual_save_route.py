@@ -405,6 +405,7 @@ def test_success_publishes_tagged_bytes_and_hides_signed_url(tmp_path):
     assert set(data) == {
         "status", "song_id", "title", "artist", "album", "quality_requested",
         "quality_actual", "quality_actual_status", "quality_fallback",
+        "br", "sr",
         "source_type", "format", "size", "md5", "basename",
         "target_dir", "tagged", "cover_embedded", "published_size",
         "published_md5", "published_sha256", "title_status", "artist_status", "album_status",
@@ -1565,13 +1566,25 @@ def test_search_tracks_sanitizes_items_and_hides_raw_payload():
     assert result["data"]["limit"] == route.SEARCH_LIMIT
     items = result["data"]["items"]
     assert [item["song_id"] for item in items] == [111, 222, 444]
-    assert set(items[0]) == {"song_id", "title", "artist", "album", "quality", "duration"}
+    assert set(items[0]) == {
+        "song_id", "title", "artist", "album", "quality",
+        "max_quality", "playable_status", "fee",
+        "has_sq", "has_hr", "has_jm", "has_sky",
+        "duration",
+    }
     assert items[0] == {
         "song_id": 111,
         "title": "歌曲一",
         "artist": "歌手A / 歌手B",
         "album": "专辑一",
         "quality": "lossless",
+        "max_quality": "lossless",
+        "playable_status": "",
+        "fee": 1,
+        "has_sq": False,
+        "has_hr": False,
+        "has_jm": False,
+        "has_sky": False,
         "duration": 215000,
     }
     assert items[1]["artist"] == "歌手C"
@@ -1580,7 +1593,7 @@ def test_search_tracks_sanitizes_items_and_hides_raw_payload():
     assert items[2]["duration"] == 215000
     assert calls == [
         "http://127.0.0.1:8770/api/v1/search?keyword="
-        "%E5%91%A8%E6%9D%B0%E4%BC%A6%20%E6%99%B4%E5%A4%A9&type=song&limit=20"
+        "%E5%91%A8%E6%9D%B0%E4%BC%A6%20%E6%99%B4%E5%A4%A9&type=song&limit=20&mode=manual_save"
     ]
     rendered = json.dumps(result, ensure_ascii=False)
     assert "https://" not in rendered
@@ -1860,3 +1873,38 @@ def test_lyric_disabled_skips_fetch_and_sidecar_publish(tmp_path):
     assert result["data"]["lyric_status"] == "not_attempted"
     assert len(store.published_names) == 1
     assert store.published_names[0].endswith(".flac")
+
+
+def test_save_track_quality_override_and_br_sr_metadata(tmp_path):
+    requested_qualities = []
+
+    def fake_http(url_text):
+        if url_text.endswith("/info"):
+            return {"ok": True, "code": 200, "data": {
+                "song_id": 489970550, "name": "测试歌曲",
+                "artists": ["歌手A"], "album": "测试专辑",
+            }}
+        if "/url?" in url_text:
+            q = url_text.split("quality=")[1].split("&")[0]
+            requested_qualities.append(q)
+            return {"ok": True, "code": 200, "data": {
+                "id": 489970550, "code": 200, "url": SIGNED_URL,
+                "size": len(PAYLOAD), "md5": PAYLOAD_MD5, "type": "flac",
+                "level": q, "br": 1920000, "sr": 96000, "freeTrialInfo": None,
+            }}
+        return {"ok": True, "code": 200, "data": {"lyric": "", "tlyric": ""}}
+
+    deps, _store, _workdir = _pipeline_deps(tmp_path)
+    deps = replace(deps, config=_config(FNMUSIC_MANUAL_SAVE_QUALITY="lossless"), http_json=fake_http)
+
+    res = route.save_track(489970550, quality="sky", deps=deps)
+    assert res["ok"] is True
+    assert requested_qualities == ["sky"]
+    assert res["data"]["quality_requested"] == "sky"
+    assert res["data"]["quality_actual"] == "sky"
+    assert res["data"]["br"] == 1920000
+    assert res["data"]["sr"] == 96000
+
+    bad = route.save_track(489970550, quality="bogus", deps=deps)
+    assert bad["ok"] is False
+    assert bad["code"] == "invalid_quality"

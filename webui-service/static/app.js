@@ -3430,6 +3430,48 @@ async function loadSaveStatus() {
   try { await loadPlaylistSaveStatus(); } catch (_) { /* 忽略：歌单卡片独立降级 */ }
 }
 
+function formatSaveTrackQualityBadge(item) {
+  const raw = String((item && (item.max_quality || item.quality)) || "").trim().toLowerCase();
+  const labels = {
+    sky: "沉浸环绕声 · sky",
+    jymaster: "超清母带 · jymaster",
+    hires: "Hi-Res · hires",
+    lossless: "无损 FLAC · lossless",
+    exhigh: "极高 320k · exhigh",
+    higher: "较高 192k · higher",
+    standard: "标准 128k · standard",
+  };
+  return labels[raw] || raw;
+}
+
+function formatSaveTrackPlayableBadge(item) {
+  const status = String((item && item.playable_status) || "").trim().toLowerCase();
+  const fee = Number(item && item.fee) || 0;
+  if (status === "vip_required") return { text: "需黑胶VIP", cls: "warn" };
+  if (status === "paid_album") return { text: "需数字专辑", cls: "warn" };
+  if (status === "copyright") return { text: "暂无版权", cls: "err" };
+  if (status === "trial") return { text: "仅试听", cls: "warn" };
+  if (status === "unavailable") return { text: "不可用", cls: "err" };
+  if (fee === 1 && status !== "ok") return { text: "VIP 曲目", cls: "dim" };
+  return null;
+}
+
+function renderSaveTrackQualityOptions(item) {
+  const rawMax = String((item && (item.max_quality || item.quality)) || "").trim().toLowerCase();
+  const hasSky = Boolean(item && item.has_sky) || rawMax === "sky";
+  const opts = [
+    ["auto", "跟随全局设置"],
+    ...(hasSky ? [["sky", "沉浸环绕声 · sky"]] : []),
+    ["jymaster", "超清母带 · jymaster"],
+    ["hires", "Hi-Res · hires"],
+    ["lossless", "无损 FLAC · lossless"],
+    ["exhigh", "极高 320k · exhigh"],
+  ];
+  return opts
+    .map(([value, label]) => `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`)
+    .join("");
+}
+
 function renderSaveResults(items) {
   const container = $("#save-results");
   if (!container) return;
@@ -3439,17 +3481,26 @@ function renderSaveResults(items) {
   }
   container.innerHTML = items.map((item) => {
     const title = escapeHtml(item.title || "未知标题");
-    const meta = [item.artist, item.album, item.quality, formatSaveDuration(item.duration)]
+    const qLabel = formatSaveTrackQualityBadge(item);
+    const qBadgeHtml = qLabel ? `<span class="badge save-q-badge">${escapeHtml(qLabel)}</span>` : "";
+    const pBadge = formatSaveTrackPlayableBadge(item);
+    const pBadgeHtml = pBadge
+      ? `<span class="badge save-p-badge ${escapeHtml(pBadge.cls)}">${escapeHtml(pBadge.text)}</span>`
+      : "";
+    const meta = [item.artist, item.album, formatSaveDuration(item.duration)]
       .filter((part) => typeof part === "string" && part)
       .map((part) => escapeHtml(part))
       .join(" · ");
     return `
       <div class="lx-item save-item">
         <div class="lx-item-main">
-          <div class="lx-item-header"><span class="lx-item-name">${title}</span></div>
+          <div class="lx-item-header"><span class="lx-item-name">${title}</span>${qBadgeHtml}${pBadgeHtml}</div>
           <div class="lx-item-url">${meta || "未知歌手"}</div>
         </div>
         <div class="lx-item-btns">
+          <select class="select small save-track-quality" aria-label="下载音质">
+            ${renderSaveTrackQualityOptions(item)}
+          </select>
           <button class="btn small save-track-btn" type="button" data-song-id="${Number(item.song_id) || 0}">保存</button>
           <span class="muted save-track-state"></span>
         </div>
@@ -3519,14 +3570,20 @@ async function saveOneTrack(button) {
   button.disabled = true;
   const row = button.closest(".save-item");
   const stateEl = row ? row.querySelector(".save-track-state") : null;
+  const qualityEl = row ? row.querySelector(".save-track-quality") : null;
+  const selectedQuality = qualityEl && typeof qualityEl.value === "string"
+    && ["sky", "jymaster", "hires", "lossless", "exhigh"].includes(qualityEl.value)
+    ? qualityEl.value
+    : "";
   if (stateEl) stateEl.textContent = "保存中…";
   const resultEl = $("#save-result");
   if (resultEl) resultEl.textContent = "正在保存，请保持页面打开…";
   try {
+    const postPayload = selectedQuality ? { song_id: songId, quality: selectedQuality } : { song_id: songId };
     const { body } = await manualSaveApiWithRetry("/api/manual-save/track", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ song_id: songId }),
+      body: JSON.stringify(postPayload),
     }, (attempt) => {
       if (stateEl) {
         stateEl.textContent = "服务正在启动，重试中…（"
@@ -3551,6 +3608,12 @@ async function saveOneTrack(button) {
         qualityParts.push(data.quality_actual);
       } else {
         qualityParts.push("档位未知");
+      }
+      if (Number.isInteger(data.br) && data.br > 0) {
+        qualityParts.push(Math.round(data.br / 1000) + " kbps");
+      }
+      if (Number.isInteger(data.sr) && data.sr > 0) {
+        qualityParts.push(String(Number((data.sr / 1000).toFixed(1))) + " kHz");
       }
       const parts = [
         ...qualityParts, data.format, formatSaveSize(data.size),

@@ -608,6 +608,14 @@ input[type="radio"]:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--f
 .usage-table td.numeric, .usage-table .tabular-nums, .usage-table td:nth-child(n+3) {
   font-variant-numeric: tabular-nums;
 }
+.save-track-quality {
+  width: auto;
+  min-width: 118px;
+  padding: 5px 8px;
+  font-size: 12px;
+}
+.badge.warn { background: rgba(245, 158, 11, 0.16); color: #b45309; }
+.badge.err { background: rgba(239, 68, 68, 0.14); color: var(--err); }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 0.01ms !important; }
