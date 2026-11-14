@@ -17,6 +17,7 @@ SERVICE_DIR = Path(__file__).resolve().parents[2] / "musicbox-service"
 if str(SERVICE_DIR) not in sys.path:
     sys.path.insert(0, str(SERVICE_DIR))
 
+import netease_client
 import netease_ext
 import playback
 import runner
@@ -177,7 +178,8 @@ def disallowed_attempt_guard(monkeypatch):
     except ImportError:
         pass
     monkeypatch.setattr(urllib.request, "urlopen", blocked("urllib.urlopen"))
-    monkeypatch.setattr(runner, "run_musicbox", blocked("runner.run_musicbox"))
+    monkeypatch.setattr(netease_client.NetEaseClient, "song_url_v1", blocked("netease_client.NetEaseClient.song_url_v1"))
+    monkeypatch.setattr(runner, "run_musicbox", blocked("runner.run_musicbox"), raising=False)
     monkeypatch.setattr(playback, "get_song_url_async", blocked("playback.get_song_url_async"))
     monkeypatch.setattr(netease_ext, "get_song_url", blocked("netease_ext.get_song_url"))
     monkeypatch.setattr(netease_ext, "_url_cache", _PlaybackCacheTripwire(recorder))
