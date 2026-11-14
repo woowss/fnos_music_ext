@@ -15,7 +15,16 @@ try:
 except ImportError:
     requests = None
 
-import netease_client
+try:
+    import netease_client
+except ModuleNotFoundError:
+    import os as _os
+    import sys as _sys
+
+    _svc_dir = _os.path.dirname(_os.path.abspath(__file__))
+    if _svc_dir not in _sys.path:
+        _sys.path.insert(0, _svc_dir)
+    import netease_client
 
 logger = logging.getLogger("musicbox_service.netease_ext")
 

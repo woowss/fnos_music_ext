@@ -37,6 +37,7 @@ jobs:
         run: >
           python -m pip install -r proxy/requirements.txt
           -r webui-service/requirements.txt
+          -r musicbox-service/requirements.txt
           pytest pytest-asyncio mutagen qrcode pillow zxing-cpp PyYAML pytest-cov
 
       - name: Shell script syntax check
@@ -50,7 +51,7 @@ jobs:
           python -m py_compile proxy/app.py proxy/recommend.py proxy/publicplaylists.py proxy/env_merge.py proxy/version.py
           lxmusic-service/app.py lxmusic-service/lxserver_client.py lxmusic-service/verify_source.py
           musicdl-service/app.py musicdl-service/hardening.py
-          musicbox-service/app.py musicbox-service/runner.py musicbox-service/netease_ext.py musicbox-service/playback.py
+          musicbox-service/app.py musicbox-service/runner.py musicbox-service/netease_client.py musicbox-service/netease_crypto.py musicbox-service/netease_ext.py musicbox-service/playback.py
           webui-service/app.py
 
       - name: Verify official music compatibility record

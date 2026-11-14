@@ -21,7 +21,15 @@ from urllib.parse import urlsplit
 
 import httpx
 
-import netease_crypto
+try:
+    import netease_crypto
+except ModuleNotFoundError:
+    import sys as _sys
+
+    _svc_dir = os.path.dirname(os.path.abspath(__file__))
+    if _svc_dir not in _sys.path:
+        _sys.path.insert(0, _svc_dir)
+    import netease_crypto
 
 logger = logging.getLogger("musicbox_service.netease_client")
 
