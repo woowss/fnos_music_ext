@@ -38,7 +38,7 @@ DEPLOYMENT_FILE="${FNMUSIC_DEPLOYMENT_FILE:-/var/lib/fnmusic-ext/deployment}"
 if [ -f "${DEPLOYMENT_FILE}" ]; then
     OLD_BASE="$(sed -n 's/.*"base"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${DEPLOYMENT_FILE}" | head -n1)"
     if [ -n "${OLD_BASE}" ] && [ -d "${OLD_BASE}" ] && [ "$(readlink -f -- "${OLD_BASE}")" != "$(readlink -f -- "${FNMUSIC_REPO_DIR}")" ]; then
-        for item in .env sources-data online_favorites online_favorites.json play_history; do
+        for item in .env sources-data online_favorites online_favorites.json play_history playlist_tracks llm_usage.json album_registry.json bind_registry.json; do
             if [ -e "${OLD_BASE}/${item}" ] && [ ! -e "${FNMUSIC_REPO_DIR}/${item}" ]; then
                 cp -a "${OLD_BASE}/${item}" "${FNMUSIC_REPO_DIR}/" 2>/dev/null || true
                 echo "[fnmusic-ext] 已从原部署 (${OLD_BASE}) 平滑继承数据: ${item}" >> "${FNMUSIC_LOG}" 2>&1

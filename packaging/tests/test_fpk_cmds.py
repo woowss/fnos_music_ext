@@ -829,6 +829,25 @@ def test_uninstall_init_keep_data_false_skips_archive_and_keep_dir(sb):
     assert not sb.tar_log.exists()
 
 
+def test_uninstall_init_preserves_llm_ledger_and_registries(sb):
+    """卸载留存目录除 .env 与播放历史外，还保留 LLM 用量账本、歌单补充曲目及绑定登记。"""
+    repo = sb.make_repo(env_text="SAVED_VAR=1\n", with_restore=True)
+    sb.add_data(repo)
+    (repo / "llm_usage.json").write_text('{"version": 2, "days": {}}\n', encoding="utf-8")
+    (repo / "playlist_tracks").mkdir()
+    (repo / "playlist_tracks" / "u1.json").write_text('{"items": {}}\n', encoding="utf-8")
+    (repo / "album_registry.json").write_text('{"a1": {}}\n', encoding="utf-8")
+    (repo / "bind_registry.json").write_text('{"b1": {}}\n', encoding="utf-8")
+    sb.add_tar()
+    keep_dir = sb.tmp / "vol" / "fnmusic-ext-data"
+    result = sb.run("uninstall_init", FNMUSIC_KEEP_DIR=str(keep_dir))
+    assert result.returncode == 0, result.stderr
+    assert (keep_dir / "llm_usage.json").read_text(encoding="utf-8") == '{"version": 2, "days": {}}\n'
+    assert (keep_dir / "playlist_tracks" / "u1.json").read_text(encoding="utf-8") == '{"items": {}}\n'
+    assert (keep_dir / "album_registry.json").read_text(encoding="utf-8") == '{"a1": {}}\n'
+    assert (keep_dir / "bind_registry.json").read_text(encoding="utf-8") == '{"b1": {}}\n'
+
+
 # ------------------------------------------------------ uninstall_callback ---
 
 def test_uninstall_callback_never_fails_even_if_all_cleanup_fails(sb):

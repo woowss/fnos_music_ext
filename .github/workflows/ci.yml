@@ -4,6 +4,7 @@ on:
   push:
     branches: [main, dev, v2.9.0, codex/fnmusic-prelaunch-20261025]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
