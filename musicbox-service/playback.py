@@ -139,26 +139,18 @@ async def _request(song_id: int, quality: str, generation: int) -> dict:
         "e_r": True,
         "header": json.dumps(header_cookie, separators=(",", ":")),
     }
-    cookie_header_kv = {
-        "os": netease_client.DEFAULT_OS,
-        "appver": netease_client.DEFAULT_APPVER,
-        "osver": header_cookie.get("osver", ""),
-        "deviceId": header_cookie.get("deviceId", ""),
-        "__csrf": header_cookie.get("__csrf", ""),
-    }
-    for cookie in cookies:
-        if cookie.name and cookie.value is not None:
-            cookie_header_kv[cookie.name] = str(cookie.value)
-
     eapi_headers = {
         "Content-Type": "application/x-www-form-urlencoded",
-        "User-Agent": "NeteaseMusic 9.0.90/5038 (iPhone; iOS 16.2; zh_CN)",
-        "Cookie": "; ".join(f"{key}={value}" for key, value in cookie_header_kv.items() if value),
+        "User-Agent": netease_client.DEFAULT_USER_AGENT,
         "Referer": f"{netease_client.EAPI_BASE_URL}/",
     }
     async with httpx.AsyncClient(timeout=PRIMARY_TIMEOUT_S, trust_env=False) as client:
         for cookie in cookies:
             client.cookies.jar.set_cookie(cookie)
+        for key in ("os", "osver", "deviceId", "appver", "versioncode"):
+            val = header_cookie.get(key)
+            if val and not client.cookies.get(key):
+                client.cookies.set(key, str(val))
         response = await asyncio.wait_for(client.post(
             f"{netease_client.EAPI_BASE_URL}/eapi/song/enhance/player/url/v1",
             data=netease_crypto.eapi_encrypt(api_path, payload),
@@ -179,7 +171,7 @@ async def _request(song_id: int, quality: str, generation: int) -> dict:
             }
             bitrate = bitrate_map.get(level)
             if bitrate:
-                csrf = cookie_header_kv.get("__csrf", "")
+                csrf = header_cookie.get("__csrf", "")
                 fallback_headers = {key: value for key, value in headers.items() if key.lower() != "host"}
                 response = await client.post(
                     f"{netease_client.WEAPI_BASE_URL}/weapi/song/enhance/player/url",
