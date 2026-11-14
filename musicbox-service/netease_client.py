@@ -8,7 +8,7 @@ side effects.
 from __future__ import annotations
 
 import hashlib
-from http.cookiejar import Cookie, LWPCookieJar
+from http.cookiejar import Cookie, LWPCookieJar, MozillaCookieJar
 import json
 import logging
 import os
@@ -129,7 +129,7 @@ class NetEaseClient:
             else os.environ.get(EXTERNAL_API_URL_ENV, "")
         ).strip().rstrip("/")
         self._lock = threading.RLock()
-        self._jar = LWPCookieJar(str(self._cookie_path))
+        self._jar: MozillaCookieJar = MozillaCookieJar(str(self._cookie_path))
         self._cookies_loaded = False
         self._http: httpx.Client | None = None
         self._account_cache: dict[str, Any] | None = None
@@ -145,12 +145,19 @@ class NetEaseClient:
         with self._lock:
             if self._cookies_loaded:
                 return
-            self._jar = LWPCookieJar(str(self._cookie_path))
+            jar = MozillaCookieJar(str(self._cookie_path))
             if self._cookie_path.exists():
                 try:
-                    self._jar.load(ignore_discard=True, ignore_expires=True)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Failed to load cookie jar %s: %s", self._cookie_path, exc)
+                    jar.load(ignore_discard=True, ignore_expires=True)
+                except Exception:  # noqa: BLE001
+                    lwp_jar = LWPCookieJar(str(self._cookie_path))
+                    try:
+                        lwp_jar.load(ignore_discard=True, ignore_expires=True)
+                        for cookie in lwp_jar:
+                            jar.set_cookie(cookie)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Failed to load cookie jar %s: %s", self._cookie_path, exc)
+            self._jar = jar
             self._cookies_loaded = True
 
     def reload_cookies(self) -> None:
@@ -273,7 +280,7 @@ class NetEaseClient:
 
     def clear_cookies(self) -> None:
         with self._lock:
-            self._jar = LWPCookieJar(str(self._cookie_path))
+            self._jar = MozillaCookieJar(str(self._cookie_path))
             self._cookies_loaded = True
             self._account_cache = None
             self._account_cache_at = 0.0

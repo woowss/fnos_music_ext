@@ -246,3 +246,61 @@ def test_external_api_hook_optional_and_fault_tolerant(tmp_path, monkeypatch):
     monkeypatch.delenv(netease_client.EXTERNAL_API_URL_ENV, raising=False)
     client = netease_client.NetEaseClient(cookie_path=tmp_path / "cookie.txt")
     assert client.external_api_get("/song/url/v1", {"id": 56}) is None
+
+
+def test_legacy_netscape_and_lwp_cookie_jars_both_load(tmp_path):
+    from http.cookiejar import Cookie, LWPCookieJar, MozillaCookieJar
+
+    netscape_path = tmp_path / "netscape_cookie.txt"
+    moz = MozillaCookieJar(str(netscape_path))
+    moz.set_cookie(
+        Cookie(
+            version=0,
+            name="MUSIC_U",
+            value="legacy_u_token",
+            port=None,
+            port_specified=False,
+            domain=".music.163.com",
+            domain_specified=True,
+            domain_initial_dot=True,
+            path="/",
+            path_specified=True,
+            secure=False,
+            expires=4102444800,
+            discard=False,
+            comment=None,
+            comment_url=None,
+            rest={},
+        )
+    )
+    moz.save(ignore_discard=True, ignore_expires=True)
+    client_moz = netease_client.NetEaseClient(cookie_path=netscape_path)
+    assert client_moz.has_auth_cookie() is True
+    assert client_moz._cookie_value("MUSIC_U") == "legacy_u_token"
+
+    lwp_path = tmp_path / "lwp_cookie.txt"
+    lwp = LWPCookieJar(str(lwp_path))
+    lwp.set_cookie(
+        Cookie(
+            version=0,
+            name="MUSIC_U",
+            value="lwp_u_token",
+            port=None,
+            port_specified=False,
+            domain=".music.163.com",
+            domain_specified=True,
+            domain_initial_dot=True,
+            path="/",
+            path_specified=True,
+            secure=False,
+            expires=4102444800,
+            discard=False,
+            comment=None,
+            comment_url=None,
+            rest={},
+        )
+    )
+    lwp.save(ignore_discard=True, ignore_expires=True)
+    client_lwp = netease_client.NetEaseClient(cookie_path=lwp_path)
+    assert client_lwp.has_auth_cookie() is True
+    assert client_lwp._cookie_value("MUSIC_U") == "lwp_u_token"

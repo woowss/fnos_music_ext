@@ -731,6 +731,35 @@ def search_web_fallback(keyword: str, stype: str = "song", limit: int = 20, offs
             "duration": dur,
             "quality": "lossless",
         })
+    if stype == "song" and out:
+        try:
+            details = batch_song_details([item["song_id"] for item in out])
+            by_id = {
+                int(d["song_id"]): d
+                for d in details
+                if isinstance(d, dict) and d.get("song_id")
+            }
+            for item in out:
+                detail = by_id.get(item["song_id"])
+                if not detail:
+                    continue
+                for k in (
+                    "max_quality",
+                    "playable_status",
+                    "fee",
+                    "has_sq",
+                    "has_hr",
+                    "has_jm",
+                    "has_sky",
+                ):
+                    if k in detail:
+                        item[k] = detail[k]
+                if detail.get("max_quality"):
+                    item["quality"] = detail["max_quality"]
+                if not item.get("album_pic_url") and detail.get("album_pic_url"):
+                    item["album_pic_url"] = detail["album_pic_url"]
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("search_web_fallback quality enrich skipped: %s", exc)
     return out
 
 
