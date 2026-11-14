@@ -5,6 +5,19 @@
 
 ## [Unreleased]
 
+## [2.14.0] - 2026-11-14
+
+本版本为 `woowss/fnos_music_ext` 正式发行版本。FPK 安装版本 `2.14.0-0`，tag / WebUI 显示 `v2.14.0`，发布通道 `stable`；适配飞牛音乐 `1.0.10`–`1.1.19`。
+
+### 新增
+- 纯 Python 网易云 WEAPI/EAPI 协议客户端（`musicbox-service/netease_crypto.py`、`netease_client.py`）：通过 `httpx` + `cryptography` 替代 2018 年时代 `NetEase-MusicBox==0.5.3` / `NEMbox` 子进程栈，支持 `cloudsearch`、`song/enhance/player/url/v1`、`v3/song/detail` 及 `v6/playlist/detail`。
+- 手动保存单曲支持真实音质/权益展示与单曲音质覆盖：`mode=manual_save` 搜索结果返回 `max_quality`、`playable_status`、`fee` 及 `has_sq`/`has_hr`/`has_jm`/`has_sky` 徽标，支持单曲下行选择 `auto`/`sky`/`jymaster`/`hires`/`lossless`/`exhigh` 并回显实际码率与采样率。
+- 手动保存歌单新增任意公开歌单链接/ID 解析、曲目展开与勾选批量下载（`GET /api/manual-save/playlist/tracks`）：可直接在 WebUI 粘贴网易云歌单 URL 或 ID，展开最多 1000 首曲目详情及音质/VIP 徽标并选择性逐首保存。
+
+### 修复
+- 解除网关与手动保存路由对 32 位网易云歌单 ID 的上限限制，完整支持 64 位歌单 ID（最高 `0x7FFFFFFFFFFFFFFF`）。
+- 解除 `source_artifact` 对已移除 `NetEase-MusicBox==0.5.3` wheel 的版本锁死，并将 `FNMUSIC_PLAYLIST_MANIFEST_READONLY` 默认回退联动至 WebUI「整歌单保存」开关。
+
 ## [2.13.0] - 2026-11-13
 
 本版本为 `woowss/fnos_music_ext` 正式发行版本。FPK 安装版本 `2.13.0-0`，tag / WebUI 显示 `v2.13.0`，发布通道 `stable`；适配飞牛音乐 `1.0.10`–`1.1.19`。
