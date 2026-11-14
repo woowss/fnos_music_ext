@@ -214,6 +214,8 @@ def test_cloudsearch_quality_modes_and_64bit_playlist_ids(tmp_path, monkeypatch)
         transport=httpx.MockTransport(handler),
     )
     monkeypatch.setattr(netease_client, "get_client", lambda reset=False: client)
+    monkeypatch.setattr(netease_ext, "_api_instance", None)
+    monkeypatch.setattr(netease_ext, "_login_state", None)
 
     songs = netease_ext.search_catalog(keyword="9-nine", stype="song", limit=20)
     assert len(songs) == 2

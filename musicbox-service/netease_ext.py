@@ -47,19 +47,29 @@ _URL_CACHE_MAX = 4096
 
 
 class _AdapterSession:
-    def __init__(self, client: netease_client.NetEaseClient) -> None:
-        self._client = client
+    def __init__(self, adapter: "NetEaseApiAdapter") -> None:
+        self._adapter = adapter
 
     def close(self) -> None:
-        self._client.close()
+        self._adapter._client.close()
 
 
 class NetEaseApiAdapter:
     """Thread-safe adapter exposing NetEaseClient under legacy internal method names."""
 
     def __init__(self, client: netease_client.NetEaseClient | None = None) -> None:
-        self._client = client or netease_client.get_client()
-        self.session = _AdapterSession(self._client)
+        self._explicit_client = client
+        self.session = _AdapterSession(self)
+
+    @property
+    def _client(self) -> netease_client.NetEaseClient:
+        if self._explicit_client is not None:
+            return self._explicit_client
+        return netease_client.get_client()
+
+    @_client.setter
+    def _client(self, client: netease_client.NetEaseClient | None) -> None:
+        self._explicit_client = client
 
     def get_account_info(self) -> dict[str, Any]:
         return self._client.get_account_info()
@@ -154,7 +164,7 @@ def _get_api_locked():
         from runner import ensure_xdg_dirs
 
         ensure_xdg_dirs()
-        _api_instance = NetEaseApiAdapter(netease_client.get_client())
+        _api_instance = NetEaseApiAdapter()
     return _api_instance
 
 
