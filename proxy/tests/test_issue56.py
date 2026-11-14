@@ -29,7 +29,6 @@ def anyio_backend():
 def isolate(monkeypatch, tmp_path):
     monkeypatch.setattr(playback, "_tasks", {})
     monkeypatch.setattr(playback, "_cache", {})
-    monkeypatch.setattr(playback, "_api", None)
     monkeypatch.setattr(proxy, "_NETEASE_URL_INFLIGHT", {})
     monkeypatch.setattr(proxy, "_NETEASE_PREFETCH", set())
     monkeypatch.setattr(proxy, "_NETEASE_PREHEATED_PINS", {})
@@ -87,11 +86,13 @@ async def test_service_reset_rejects_old_result(monkeypatch):
 
 
 def test_old_login_generation_cannot_merge_response_cookies(monkeypatch):
+    import netease_client
+
     class Jar:
-        def load(self):
+        def set_cookie(self, *args, **kwargs):
             raise AssertionError("旧登录态不得读取或写入 cookie")
 
-    monkeypatch.setattr(playback, "_api", types.SimpleNamespace(cookie_jar=Jar()))
+    monkeypatch.setattr(netease_client, "get_client", lambda: types.SimpleNamespace(_jar=Jar()))
     playback._merge_cookies(playback._generation - 1, httpx.Cookies({"MUSIC_U": "fixture"}))
 
 
@@ -131,22 +132,22 @@ async def test_service_budget_cancels_work(monkeypatch):
 
 @pytest.mark.anyio
 async def test_service_wire_encoding_and_global_lock_independence(monkeypatch):
+    import netease_crypto
     import netease_ext
-    module = types.ModuleType("NEMbox.api")
+
     payloads, requests = [], []
-    module.BASE_URL = "https://music.163.com"
-    module.EAPI_BASE_URL = "https://interface.music.163.com"
 
     def encode(path, payload):
         payloads.append(payload)
         return {"params": "encrypted+payload"}
 
-    module.eapi_encrypt = encode
-    module.encrypted_request = lambda params: {"params": "fallback", "encSecKey": "rsa"}
-    module.eapi_response_decrypt = lambda value: {"code": 200, "data": []}
-    module.music_quality_to_level = lambda quality: quality
-    module.level_to_encode_type = lambda quality: "flac"
-    monkeypatch.setitem(sys.modules, "NEMbox.api", module)
+    monkeypatch.setattr(netease_crypto, "eapi_encrypt", encode)
+    monkeypatch.setattr(
+        netease_crypto,
+        "weapi_encrypt",
+        lambda params: {"params": "fallback", "encSecKey": "rsa"},
+    )
+    monkeypatch.setattr(netease_crypto, "eapi_response_decrypt", lambda value: {"code": 200, "data": []})
     monkeypatch.setattr(playback, "_snapshot", lambda generation: ({"__csrf": "fixture"}, {}, []))
     client_type = httpx.AsyncClient
 
@@ -299,19 +300,12 @@ async def test_proxy_total_budget_cancels_endpoint_without_downgrade(monkeypatch
 
 @pytest.mark.anyio
 async def test_service_cli_only_for_unavailable_protocol(monkeypatch):
-    calls = []
-
     async def request(*args):
-        raise playback.CapabilityError()
-
-    async def cli(song_id, quality):
-        calls.append((song_id, quality))
-        return {"code": 200, "url": "https://cdn.test/fallback.flac"}
+        raise playback.CapabilityError("protocol unavailable")
 
     monkeypatch.setattr(playback, "_request", request)
-    monkeypatch.setattr(playback, "_cli", cli)
-    await playback.get_song_url_async(56, "lossless")
-    assert calls == [(56, "lossless")]
+    with pytest.raises(playback.CapabilityError):
+        await playback.get_song_url_async(56, "lossless")
 
     async def timeout(*args):
         raise httpx.ReadTimeout("slow")
@@ -319,7 +313,6 @@ async def test_service_cli_only_for_unavailable_protocol(monkeypatch):
     monkeypatch.setattr(playback, "_request", timeout)
     with pytest.raises(playback.ResolutionTimeout):
         await playback.get_song_url_async(57, "lossless")
-    assert len(calls) == 1
 
 
 @pytest.mark.anyio

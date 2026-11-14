@@ -112,26 +112,19 @@ async def test_netease_cache_and_inflight_include_purpose_and_context_generation
 def test_auth_login_qr_with_upstream_qr_ascii(monkeypatch):
     test_ascii = "█▀▀▀▀▀▀▀█\n█ █▀▀▀█ █\n▀▀▀▀▀▀▀▀▀"
 
-    def mock_run_musicbox(args, timeout=30.0):
-        assert args == ["auth", "login", "--no-wait", "--json"]
-        stdout = (
-            '{"ok": true, "data": {"unikey": "test-key-123", "qr_ascii": "'
-            + test_ascii.replace("\n", "\\n")
-            + '"}}'
-        )
-        return 0, stdout, ""
-
-    monkeypatch.setattr(runner, "run_musicbox", mock_run_musicbox)
+    monkeypatch.setattr(
+        musicbox_app,
+        "auth_login_qr",
+        lambda: {"ok": True, "data": {"unikey": "test-key-123", "qr_ascii": test_ascii}},
+    )
 
     with TestClient(app) as client:
-        # Test main endpoint /api/v1/auth/login/qr
         resp1 = client.get("/api/v1/auth/login/qr")
         assert resp1.status_code == 200
         assert "text/plain" in resp1.headers["content-type"]
         assert test_ascii in resp1.text
         assert resp1.text.endswith("\n")
 
-        # Test alias endpoint /api/v1/auth/qr
         resp2 = client.get("/api/v1/auth/qr")
         assert resp2.status_code == 200
         assert "text/plain" in resp2.headers["content-type"]
@@ -140,28 +133,23 @@ def test_auth_login_qr_with_upstream_qr_ascii(monkeypatch):
 
 
 def test_auth_login_qr_fallback_to_qrcode_generation(monkeypatch):
-    def mock_run_musicbox(args, timeout=30.0):
-        assert args == ["auth", "login", "--no-wait", "--json"]
-        # No qr_ascii in payload, only unikey
-        stdout = '{"ok": true, "data": {"unikey": "test-fallback-key"}}'
-        return 0, stdout, ""
-
-    monkeypatch.setattr(runner, "run_musicbox", mock_run_musicbox)
+    pytest.importorskip("qrcode")
+    monkeypatch.setattr(
+        musicbox_app,
+        "auth_login_qr",
+        lambda: {"ok": True, "data": {"unikey": "test-fallback-key"}},
+    )
 
     with TestClient(app) as client:
         resp = client.get("/api/v1/auth/login/qr")
         assert resp.status_code == 200
         assert "text/plain" in resp.headers["content-type"]
-        # Generated QR should contain black/white blocks
         assert len(resp.text) > 50
         assert resp.text.endswith("\n")
 
 
 def test_auth_login_qr_missing_unikey_and_ascii(monkeypatch):
-    def mock_run_musicbox(args, timeout=30.0):
-        return 0, '{"ok": true, "data": {}}', ""
-
-    monkeypatch.setattr(runner, "run_musicbox", mock_run_musicbox)
+    monkeypatch.setattr(musicbox_app, "auth_login_qr", lambda: {"ok": True, "data": {}})
 
     with TestClient(app) as client:
         resp = client.get("/api/v1/auth/login/qr")
@@ -172,61 +160,49 @@ def test_auth_login_qr_missing_unikey_and_ascii(monkeypatch):
 
 
 def test_auth_qr_png_endpoint_and_alias(monkeypatch):
-    def mock_run_musicbox(args, timeout=30.0):
-        assert args == ["auth", "login", "--no-wait", "--json"]
-        stdout = '{"ok": true, "data": {"unikey": "png-test-key"}}'
-        return 0, stdout, ""
-
-    monkeypatch.setattr(runner, "run_musicbox", mock_run_musicbox)
+    pytest.importorskip("qrcode")
+    monkeypatch.setattr(
+        musicbox_app,
+        "auth_login_qr",
+        lambda: {"ok": True, "data": {"unikey": "png-test-key"}},
+    )
 
     with TestClient(app) as client:
-        # Test original endpoint /api/v1/auth/login/qr.png
         resp1 = client.get("/api/v1/auth/login/qr.png")
         assert resp1.status_code == 200
         assert resp1.headers["content-type"] == "image/png"
         assert resp1.content[:8] == b"\x89PNG\r\n\x1a\n"
 
-        # Test alias endpoint /api/v1/auth/qr.png
         resp2 = client.get("/api/v1/auth/qr.png")
         assert resp2.status_code == 200
         assert resp2.headers["content-type"] == "image/png"
         assert resp2.content[:8] == b"\x89PNG\r\n\x1a\n"
 
 
-def test_run_musicbox_missing_binary(monkeypatch):
-    monkeypatch.setenv("PATH", "")
-    code, stdout, stderr = runner.run_musicbox(["health"])
-    assert code == 127
-    assert "musicbox executable not found" in stderr
+def test_get_clean_env_strips_proxy_vars(monkeypatch):
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:7890")
+    monkeypatch.setenv("https_proxy", "http://127.0.0.1:7890")
+    cleaned = runner.get_clean_env()
+    assert "HTTP_PROXY" not in cleaned
+    assert "https_proxy" not in cleaned
 
 
-def test_run_musicbox_calls_ensure_xdg_dirs(monkeypatch):
-    called = []
-    monkeypatch.setattr(runner, "ensure_xdg_dirs", lambda: called.append(True))
-    monkeypatch.setattr(runner.subprocess, "run", lambda *a, **kw: runner.subprocess.CompletedProcess([], 0, "ok", ""))
-    runner.run_musicbox(["version"])
-    assert len(called) == 1
+def test_ensure_xdg_dirs_creates_cookie_parent(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    runner.ensure_xdg_dirs()
+    assert (tmp_path / "data" / "netease-musicbox").is_dir()
 
 
 def test_musicbox_search_filters_unplayable_songs(monkeypatch):
     import netease_ext
 
-    # Mock CLI search output: 4 items (free, vip-no-url, trial, empty-url)
-    mock_search_data = {
-        "ok": True,
-        "data": [
-            {"song_id": 101, "song_name": "Free Song", "artist": "Singer", "quality": "exhigh"},
-            {"song_id": 102, "song_name": "VIP Song No URL", "artist": "Singer", "quality": "lossless"},
-            {"song_id": 103, "song_name": "Trial Snippet Song", "artist": "Singer", "quality": "standard"},
-            {"song_id": 104, "song_name": "Dead Song", "artist": "Singer", "quality": "standard"},
-        ],
-    }
+    mock_search_rows = [
+        {"song_id": 101, "song_name": "Free Song", "artist": "Singer", "quality": "exhigh"},
+        {"song_id": 102, "song_name": "VIP Song No URL", "artist": "Singer", "quality": "lossless"},
+        {"song_id": 103, "song_name": "Trial Snippet Song", "artist": "Singer", "quality": "standard"},
+        {"song_id": 104, "song_name": "Dead Song", "artist": "Singer", "quality": "standard"},
+    ]
 
-    def mock_run_musicbox(args, timeout=30.0):
-        import json
-        return 0, json.dumps(mock_search_data), ""
-
-    # Mock songs_url responses
     def mock_songs_url(ids):
         return [
             {"id": 101, "url": "http://audio.126.net/101.mp3", "code": 200, "fee": 0, "freeTrialInfo": None},
@@ -242,7 +218,7 @@ def test_musicbox_search_filters_unplayable_songs(monkeypatch):
         def get_account_info(self):
             return {"code": 200, "account": None, "profile": None}
 
-    monkeypatch.setattr(runner, "run_musicbox", mock_run_musicbox)
+    monkeypatch.setattr(musicbox_app, "search_catalog", lambda *a, **kw: mock_search_rows)
     monkeypatch.setattr(netease_ext, "_get_api_locked", lambda: MockApi())
 
     with TestClient(app) as client:
@@ -250,7 +226,6 @@ def test_musicbox_search_filters_unplayable_songs(monkeypatch):
         assert resp.status_code == 200
         data = resp.json()
         assert data["ok"] is True
-        # Only 101 is playable
         assert len(data["data"]) == 1
         assert data["data"][0]["song_id"] == 101
 
@@ -305,23 +280,14 @@ def test_musicbox_songs_detail_returns_all_rows_with_covers(monkeypatch):
 def test_musicbox_search_logged_in_vip_playable(monkeypatch):
     import netease_ext
 
-    mock_search_data = {
-        "ok": True,
-        "data": [
-            {"song_id": 201, "song_name": "VIP Song With Perm", "artist": "Singer", "quality": "lossless"},
-            {"song_id": 202, "song_name": "Paid Album Without Perm", "artist": "Singer", "quality": "lossless"},
-        ],
-    }
-
-    def mock_run_musicbox(args, timeout=30.0):
-        import json
-        return 0, json.dumps(mock_search_data), ""
+    mock_search_rows = [
+        {"song_id": 201, "song_name": "VIP Song With Perm", "artist": "Singer", "quality": "lossless"},
+        {"song_id": 202, "song_name": "Paid Album Without Perm", "artist": "Singer", "quality": "lossless"},
+    ]
 
     def mock_songs_url(ids):
         return [
-            # 201 has full valid url and no trial
             {"id": 201, "url": "http://audio.126.net/vip_full.mp3", "code": 200, "fee": 1, "freeTrialInfo": None},
-            # 202 has no url (account didn't buy album)
             {"id": 202, "url": None, "code": 404, "fee": 4, "freeTrialInfo": None},
         ]
 
@@ -330,10 +296,9 @@ def test_musicbox_search_logged_in_vip_playable(monkeypatch):
             return mock_songs_url(ids)
 
         def get_account_info(self):
-            # Logged in
             return {"code": 200, "account": {"id": 12345}, "profile": {"nickname": "VIPUser"}}
 
-    monkeypatch.setattr(runner, "run_musicbox", mock_run_musicbox)
+    monkeypatch.setattr(musicbox_app, "search_catalog", lambda *a, **kw: mock_search_rows)
     monkeypatch.setattr(netease_ext, "_get_api_locked", lambda: MockApi())
 
     with TestClient(app) as client:
@@ -344,16 +309,14 @@ def test_musicbox_search_logged_in_vip_playable(monkeypatch):
         assert data["data"][0]["song_id"] == 201
 
 
-def test_musicbox_search_fallback_on_405_upstream_exception(monkeypatch):
-    import netease_ext
-
-    def mock_run_musicbox(args, timeout=30.0):
-        # 模拟 CLI 触发 405 操作频繁
-        return 1, '{"code": 405, "message": "操作频繁，请稍候再试"}', "405 Too Many Requests"
-
+def test_musicbox_search_fallback_on_cloudsearch_failure(monkeypatch):
     fallback_called = []
-    def mock_search_web_fallback(keyword, stype="song", limit=20):
-        fallback_called.append((keyword, stype, limit))
+
+    def boom_catalog(*a, **kw):
+        raise RuntimeError("cloudsearch blocked")
+
+    def mock_search_web_fallback(keyword, stype="song", limit=20, offset=0):
+        fallback_called.append((keyword, stype, limit, offset))
         return [
             {
                 "song_id": 99901,
@@ -368,7 +331,7 @@ def test_musicbox_search_fallback_on_405_upstream_exception(monkeypatch):
             }
         ]
 
-    monkeypatch.setattr(runner, "run_musicbox", mock_run_musicbox)
+    monkeypatch.setattr(musicbox_app, "search_catalog", boom_catalog)
     monkeypatch.setattr(musicbox_app, "search_web_fallback", mock_search_web_fallback)
     monkeypatch.setattr(musicbox_app, "filter_playable_song_ids", lambda ids: set(ids))
 
@@ -384,20 +347,8 @@ def test_musicbox_search_fallback_on_405_upstream_exception(monkeypatch):
         assert fallback_called[0][0] == "海阔天空"
 
 
-def test_musicbox_search_fallback_on_filtered_empty(monkeypatch):
-    import netease_ext
-
-    # 主接口返回了曲目，但全部不可播，过滤后为空
-    mock_search_data = {
-        "ok": True,
-        "data": [{"song_id": 301, "song_name": "Unplayable", "artist": "A", "quality": "standard"}],
-    }
-
-    def mock_run_musicbox(args, timeout=30.0):
-        import json
-        return 0, json.dumps(mock_search_data), ""
-
-    def mock_search_web_fallback(keyword, stype="song", limit=20):
+def test_musicbox_search_fallback_on_cloudsearch_empty(monkeypatch):
+    def mock_search_web_fallback(keyword, stype="song", limit=20, offset=0):
         return [
             {
                 "song_id": 88801,
@@ -412,9 +363,8 @@ def test_musicbox_search_fallback_on_filtered_empty(monkeypatch):
             }
         ]
 
-    monkeypatch.setattr(runner, "run_musicbox", mock_run_musicbox)
+    monkeypatch.setattr(musicbox_app, "search_catalog", lambda *a, **kw: [])
     monkeypatch.setattr(musicbox_app, "search_web_fallback", mock_search_web_fallback)
-    # filter_playable_song_ids: 301 is not playable, but 88801 is playable
     monkeypatch.setattr(musicbox_app, "filter_playable_song_ids", lambda ids: {88801} if 88801 in ids else set())
 
     with TestClient(app) as client:
@@ -481,7 +431,8 @@ def test_healthz_endpoint():
     assert resp.status_code == 200
     rj = resp.json()
     assert rj["status"] == "ok"
-    assert "musicbox" in rj["source"]
+    assert rj["package"] == "fnmusic-netease"
+    assert rj["protocol"] == "pure-python-weapi-eapi"
 
 
 def test_reset_api_invalidates_vip_entitlement(monkeypatch):
@@ -518,56 +469,41 @@ def test_song_url_forwards_quality_and_fresh_to_async_resolver(monkeypatch):
     assert captured["args"] == (123, "lossless", True, "download", 9)
 
 
-def test_song_info_artist_album_playlist_cli_args(monkeypatch):
+def test_song_info_artist_album_playlist_inproc(monkeypatch):
     captured = []
 
-    def mock_run(args, timeout=30.0):
-        captured.append(args)
-        return 0, '{"ok": true, "data": {"id": 1}}', ""
-
-    # 本测试校验 CLI 参数透传：进程内详情路径置为失败，强制走 CLI 兜底
-    monkeypatch.setattr(musicbox_app, "song_detail_raw", lambda sid: None)
-    monkeypatch.setattr(runner, "run_musicbox", mock_run)
+    monkeypatch.setattr(musicbox_app, "song_detail_raw", lambda sid: captured.append(("song", sid)) or {"id": sid})
+    monkeypatch.setattr(musicbox_app, "artist_detail", lambda aid, limit=20: captured.append(("artist", aid, limit)) or {"ok": True, "data": {}})
+    monkeypatch.setattr(musicbox_app, "album_detail", lambda alid: captured.append(("album", alid)) or {"ok": True, "data": {}})
+    monkeypatch.setattr(musicbox_app, "playlist_detail_raw", lambda pid: captured.append(("playlist", pid)) or {"ok": True, "data": {}})
     with TestClient(app) as client:
         assert client.get("/api/v1/song/123/info").status_code == 200
         assert client.get("/api/v1/artist/456", params={"limit": 50}).status_code == 200
         assert client.get("/api/v1/album/789").status_code == 200
         assert client.get("/api/v1/playlist/1000").status_code == 200
     assert captured == [
-        ["song", "info", "123", "--json"],
-        ["artist", "456", "--limit", "50", "--json"],
-        ["album", "789", "--json"],
-        ["playlist", "show", "1000", "--json"],
+        ("song", 123),
+        ("artist", 456, 50),
+        ("album", 789),
+        ("playlist", 1000),
     ]
 
 
-def test_song_info_in_process_raw_detail_first(monkeypatch):
-    """/song/{id}/info 进程内直取优先（毫秒级）：CLI 子进程冷启动会超代理 4s 预算。"""
+def test_song_info_in_process_raw_detail_and_404(monkeypatch):
     raw = {
         "name": "晴天", "ar": [{"name": "周杰伦"}],
         "al": {"name": "叶惠美", "picUrl": "http://img.test/yhm.jpg"},
         "dt": 269000, "sq": {"size": 25000000},
     }
-    cli_calls = []
-
-    def mock_run(args, timeout=30.0):
-        cli_calls.append(args)
-        return 0, '{"ok": true, "data": {}}', ""
-
     monkeypatch.setattr(musicbox_app, "song_detail_raw", lambda sid: raw if sid == 186016 else None)
-    monkeypatch.setattr(runner, "run_musicbox", mock_run)
     with TestClient(app) as client:
         resp = client.get("/api/v1/song/186016/info")
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["ok"] is True and body["data"] == raw
-    assert cli_calls == []
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is True and body["data"] == raw
 
-    # 进程内拿不到（返回 None）时降级 CLI
-    with TestClient(app) as client:
-        resp = client.get("/api/v1/song/42/info")
-    assert resp.status_code == 200
-    assert cli_calls == [["song", "info", "42", "--json"]]
+        resp404 = client.get("/api/v1/song/42/info")
+        assert resp404.status_code == 404
 
 
 def test_search_web_fallback_row_carries_album_cover(monkeypatch):
@@ -637,33 +573,31 @@ def test_song_lyric_ok_and_upstream_error(monkeypatch):
 
 
 def test_auth_status_and_login_check(monkeypatch):
-    captured = {}
-
-    def mock_run(args, timeout=30.0):
-        captured["args"] = args
-        return 0, '{"ok": true, "data": {"logged_in": true}}', ""
-
-    monkeypatch.setattr(runner, "run_musicbox", mock_run)
+    monkeypatch.setattr(musicbox_app, "fetch_auth_status", lambda: {"ok": True, "data": {"logged_in": True}})
+    monkeypatch.setattr(
+        musicbox_app,
+        "auth_login_check",
+        lambda unikey: {"ok": True, "data": {"code": 801, "unikey": unikey}},
+    )
     with TestClient(app) as client:
         resp = client.get("/api/v1/auth/status")
         assert resp.status_code == 200
         assert resp.json()["data"]["logged_in"] is True
-        assert captured["args"] == ["auth", "status", "--json"]
 
-        # 空 unikey 直接 400，不触达上游
         resp2 = client.get("/api/v1/auth/login/check", params={"unikey": "   "})
         assert resp2.status_code == 400
 
         resp3 = client.get("/api/v1/auth/login/check", params={"unikey": "key-1"})
         assert resp3.status_code == 200
-        assert captured["args"] == ["auth", "login", "--check", "key-1", "--json"]
+        assert resp3.json()["data"]["unikey"] == "key-1"
 
 
 def test_auth_login_post_builds_qr_url(monkeypatch):
-    def mock_run(args, timeout=30.0):
-        return 0, '{"ok": true, "data": {"unikey": "key-abc", "qr_ascii": "x"}}', ""
-
-    monkeypatch.setattr(runner, "run_musicbox", mock_run)
+    monkeypatch.setattr(
+        musicbox_app,
+        "auth_login_qr",
+        lambda: {"ok": True, "data": {"unikey": "key-abc", "qr_url": "https://music.163.com/login?codekey=key-abc"}},
+    )
     with TestClient(app) as client:
         resp = client.post("/api/v1/auth/login")
     assert resp.status_code == 200
@@ -672,26 +606,25 @@ def test_auth_login_post_builds_qr_url(monkeypatch):
 
 
 def test_upstream_failure_maps_to_502(monkeypatch):
-    def mock_run(args, timeout=30.0):
-        return 3, "", "musicbox exploded"
+    def boom():
+        raise RuntimeError("netease exploded")
 
-    monkeypatch.setattr(runner, "run_musicbox", mock_run)
+    monkeypatch.setattr(musicbox_app, "fetch_auth_status", boom)
     with TestClient(app) as client:
         resp = client.get("/api/v1/auth/status")
     assert resp.status_code == 502
     rj = resp.json()
     assert rj["error"] == "upstream_error"
-    assert rj["exit_code"] == 3
-    assert "musicbox exploded" in rj["stderr"]
+    assert "netease exploded" in rj["stderr"]
 
 
 def test_upstream_timeout_maps_to_504(monkeypatch):
-    def mock_run(args, timeout=30.0):
-        raise runner.MusicboxTimeoutError("musicbox timed out after 30s")
+    async def boom_url(*a, **kw):
+        raise musicbox_app.playback.ResolutionTimeout("playback timed out")
 
-    monkeypatch.setattr(runner, "run_musicbox", mock_run)
+    monkeypatch.setattr(musicbox_app, "get_song_url_async", boom_url)
     with TestClient(app) as client:
-        resp = client.get("/api/v1/auth/status")
+        resp = client.get("/api/v1/song/123/url", params={"quality": "exhigh"})
     assert resp.status_code == 504
 
 
@@ -716,17 +649,11 @@ def _mock_netease_api(monkeypatch, detail_rows, url_rows, logged_in=False):
 
 
 def test_recommend_songs_hydrates_and_filters_playable(monkeypatch):
-    import json as _json
-
-    cli_rows = [
+    raw_rows = [
         {"song_id": 301, "song_name": "日推免费", "artist": "S1", "duration": 210},
         {"song_id": 302, "song_name": "日推VIP", "artist": "S1", "duration": 210},
         {"song_id": "bad", "song_name": "畸形id", "artist": "S1", "duration": 210},
     ]
-
-    def mock_run(args, timeout=30.0):
-        assert args == ["recommend", "songs", "--limit", "30", "--json"]
-        return 0, _json.dumps({"ok": True, "data": cli_rows}), ""
 
     detail_rows = [
         {"id": 301, "name": "日推免费", "ar": [{"name": "S1"}], "al": {"name": "专辑", "picUrl": "http://img/1.jpg"}, "dt": 210000},
@@ -736,7 +663,7 @@ def test_recommend_songs_hydrates_and_filters_playable(monkeypatch):
         {"id": 301, "url": "http://audio.126.net/301.mp3", "code": 200, "fee": 0, "freeTrialInfo": None},
         {"id": 302, "url": None, "code": 404, "fee": 1, "freeTrialInfo": None},
     ]
-    monkeypatch.setattr(runner, "run_musicbox", mock_run)
+    monkeypatch.setattr(musicbox_app, "recommend_songs_raw", lambda limit=30: raw_rows)
     _mock_netease_api(monkeypatch, detail_rows, url_rows, logged_in=False)
 
     with TestClient(app) as client:
@@ -745,38 +672,28 @@ def test_recommend_songs_hydrates_and_filters_playable(monkeypatch):
     data = resp.json()
     assert data["ok"] is True
     assert data["logged_in"] is False
-    # VIP 无 URL 曲目被可播过滤剔除；畸形 id 不进入批量详情
     assert [row["song_id"] for row in data["data"]] == [301]
     assert data["data"][0]["name"] == "日推免费"
     assert data["data"][0]["duration_ms"] == 210000
 
 
 def test_recommend_songs_not_logged_in_passthrough(monkeypatch):
-    """CLI 退出码 3 + stderr JSON（not_logged_in）原样透传，供代理降级判断。"""
-    import json as _json
-
-    def mock_run(args, timeout=30.0):
-        return 3, "", _json.dumps(
-            {"ok": False, "error": {"type": "not_logged_in", "message": "未登录或登录已过期", "hint": "musicbox auth login"}}
-        )
-
-    monkeypatch.setattr(runner, "run_musicbox", mock_run)
+    monkeypatch.setattr(musicbox_app, "recommend_songs_raw", lambda limit=30: [])
+    _mock_netease_api(monkeypatch, [], [], logged_in=False)
     with TestClient(app) as client:
         resp = client.get("/api/v1/recommend/songs")
     assert resp.status_code == 200
     data = resp.json()
     assert data["ok"] is False
-    assert data["error"]["type"] == "not_logged_in"
+    assert data["error"] == "not_logged_in"
 
 
 def test_toplist_without_index_returns_chart_list(monkeypatch):
-    import json as _json
-
-    def mock_run(args, timeout=30.0):
-        assert args == ["toplist", "--json"]
-        return 0, _json.dumps({"ok": True, "data": [{"index": 0, "name": "飙升榜", "id": 19723756}]}), ""
-
-    monkeypatch.setattr(runner, "run_musicbox", mock_run)
+    monkeypatch.setattr(
+        musicbox_app,
+        "toplist_raw",
+        lambda index=-1, limit=60: {"ok": True, "data": [{"index": 0, "name": "飙升榜", "id": 19723756}]},
+    )
     with TestClient(app) as client:
         resp = client.get("/api/v1/toplist")
     assert resp.status_code == 200
@@ -784,16 +701,13 @@ def test_toplist_without_index_returns_chart_list(monkeypatch):
 
 
 def test_toplist_with_index_hydrates_playable_songs(monkeypatch):
-    import json as _json
-
-    def mock_run(args, timeout=30.0):
-        assert args == ["toplist", "--index", "3", "--json"]
-        rows = [{"song_id": 501, "song_name": "热歌", "artist": "S", "duration": 200}]
-        return 0, _json.dumps({"ok": True, "data": rows}), ""
-
     detail_rows = [{"id": 501, "name": "热歌", "ar": [{"name": "S"}], "al": {"name": "A", "picUrl": ""}, "dt": 200000}]
     url_rows = [{"id": 501, "url": "http://audio.126.net/501.mp3", "code": 200, "fee": 0, "freeTrialInfo": None}]
-    monkeypatch.setattr(runner, "run_musicbox", mock_run)
+    monkeypatch.setattr(
+        musicbox_app,
+        "toplist_raw",
+        lambda index=-1, limit=60: {"ok": True, "data": [{"song_id": 501, "song_name": "热歌", "artist": "S", "duration": 200}]},
+    )
     _mock_netease_api(monkeypatch, detail_rows, url_rows, logged_in=False)
 
     with TestClient(app) as client:
@@ -806,14 +720,17 @@ def test_toplist_with_index_hydrates_playable_songs(monkeypatch):
 
 
 def test_auth_login_check_resets_resident_api_on_803(monkeypatch):
-    """扫码成功（803）必须丢弃常驻 NetEase 实例，否则服务进程内仍是旧登录态。"""
+    """扫码成功（803）必须重置常驻 NetEase 实例，否则服务进程内仍是旧登录态。"""
+    import netease_ext
+
     resets = []
-    monkeypatch.setattr(musicbox_app, "reset_api", lambda reason="": resets.append(reason))
+    monkeypatch.setattr(netease_ext, "reset_api", lambda reason="": resets.append(reason))
 
-    def mock_run_musicbox(args, timeout=30.0):
-        return 0, json.dumps({"ok": True, "data": {"status": "success", "code": 803, "nickname": "u"}}), ""
+    class FakeClient:
+        def qr_check(self, unikey):
+            return {"ok": True, "data": {"code": 803, "nickname": "u", "logged_in": True}}
 
-    monkeypatch.setattr(runner, "run_musicbox", mock_run_musicbox)
+    monkeypatch.setattr(netease_ext.netease_client, "get_client", lambda: FakeClient())
     with TestClient(app) as client:
         resp = client.get("/api/v1/auth/login/check", params={"unikey": "k1"})
         assert resp.status_code == 200
@@ -823,13 +740,16 @@ def test_auth_login_check_resets_resident_api_on_803(monkeypatch):
 
 def test_auth_login_check_keeps_api_before_803(monkeypatch):
     """待扫码（801）/已扫待确认（802）不重置实例。"""
+    import netease_ext
+
     resets = []
-    monkeypatch.setattr(musicbox_app, "reset_api", lambda reason="": resets.append(reason))
+    monkeypatch.setattr(netease_ext, "reset_api", lambda reason="": resets.append(reason))
 
-    def mock_run_musicbox(args, timeout=30.0):
-        return 0, json.dumps({"ok": True, "data": {"code": 801, "message": "waiting"}}), ""
+    class FakeClient:
+        def qr_check(self, unikey):
+            return {"ok": True, "data": {"code": 801, "message": "waiting", "logged_in": False}}
 
-    monkeypatch.setattr(runner, "run_musicbox", mock_run_musicbox)
+    monkeypatch.setattr(netease_ext.netease_client, "get_client", lambda: FakeClient())
     with TestClient(app) as client:
         resp = client.get("/api/v1/auth/login/check", params={"unikey": "k1"})
         assert resp.json()["data"]["code"] == 801
@@ -910,14 +830,10 @@ def test_get_song_url_inproc_with_quality_and_cache(monkeypatch):
 
 
 def test_song_url_async_success_preserves_response_without_sync_cli(monkeypatch):
-    def boom(args, timeout=30.0):
-        raise AssertionError("CLI 不应被调用")
-
     async def inproc(sid, quality, fresh=False, purpose="playback", context_generation=0):
         return {"url": "http://inproc/1.flac", "code": 200}
 
     monkeypatch.setattr(musicbox_app, "get_song_url_async", inproc)
-    monkeypatch.setattr(runner, "run_musicbox", boom)
     with TestClient(app) as client:
         r2 = client.get("/api/v1/song/42/url", params={"quality": "exhigh"})
         assert r2.json() == {"ok": True, "data": {"url": "http://inproc/1.flac", "code": 200}}
@@ -1184,7 +1100,7 @@ def test_public_playlists_endpoint_search_and_deep_pages(monkeypatch):
 
 
 def test_search_offset_routes_to_web_fallback(monkeypatch):
-    """offset>0（深分页）直接走官方 web 搜索接口：offset/limit 透传，可播过滤沿用。"""
+    """cloudsearch 空时深分页安全降级到 web 搜索接口：offset/limit 透传，可播过滤沿用。"""
     captured: dict = {}
 
     def fake_fallback(keyword, stype="song", limit=20, offset=0):
@@ -1194,6 +1110,7 @@ def test_search_offset_routes_to_web_fallback(monkeypatch):
             {"song_id": 186016, "song_name": "晴天 (Live)", "artist": "周杰伦", "duration": 301},
         ]
 
+    monkeypatch.setattr(musicbox_app, "search_catalog", lambda *a, **kw: [])
     monkeypatch.setattr(musicbox_app, "search_web_fallback", fake_fallback)
     monkeypatch.setattr(musicbox_app, "filter_playable_song_ids", lambda ids: set(ids))
 
@@ -1205,28 +1122,28 @@ def test_search_offset_routes_to_web_fallback(monkeypatch):
     assert [it["song_id"] for it in data] == [33894312, 186016]
 
 
-def test_search_offset_zero_keeps_cli_path(monkeypatch):
-    """offset=0 优先走 CLI；全部上游桩化，不能只检查真实网络降级后返回 200。"""
+def test_search_offset_zero_uses_cloudsearch_inproc(monkeypatch):
+    """offset=0 优先走 EAPI cloudsearch；fallback 不应被触发。"""
     calls = []
     fallback_calls = []
     rows = [{"song_id": 33894312, "name": "晴天"}]
 
-    def cli(args):
-        calls.append(args)
-        return {"ok": True, "code": 200, "data": rows}
+    def catalog(keyword, stype="song", limit=20, offset=0):
+        calls.append((keyword, stype, limit, offset))
+        return rows
 
     def fallback(*args, **kwargs):
         fallback_calls.append((args, kwargs))
         return []
 
-    monkeypatch.setattr(musicbox_app, "exec_musicbox", cli)
+    monkeypatch.setattr(musicbox_app, "search_catalog", catalog)
     monkeypatch.setattr(musicbox_app, "search_web_fallback", fallback)
     monkeypatch.setattr(musicbox_app, "filter_playable_song_ids", lambda ids: set(ids))
     with TestClient(app) as client:
         r = client.get("/api/v1/search", params={"keyword": "周杰伦", "offset": 0})
     assert r.status_code == 200
     assert r.json()["data"] == rows
-    assert calls == [["search", "周杰伦", "--type", "song", "--limit", "20", "--json"]]
+    assert calls == [("周杰伦", "song", 20, 0)]
     assert fallback_calls == []
 
 

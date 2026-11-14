@@ -1,7 +1,7 @@
-# https://github.com/darknessomi/musicbox (PyPI: NetEase-MusicBox)
-NetEase-MusicBox==0.5.3
+# Pure-Python NetEase WEAPI/EAPI client stack (zero Node.js / legacy NEMbox runtime)
 fastapi>=0.110
 uvicorn>=0.29
 httpx>=0.27
+cryptography>=42.0
 qrcode>=7.4
 pillow>=10.0

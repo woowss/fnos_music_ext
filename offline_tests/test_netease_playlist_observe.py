@@ -140,8 +140,8 @@ def test_dry_run_never_touches_network(tmp_path, monkeypatch):
     module_dir = tmp_path / "musicbox-service"
     module_dir.mkdir()
     (module_dir / "netease_playlist_snapshot.py").write_text(
-        'PINNED_VERSION = "0.5.3"\n'
-        'WHEEL_SHA256 = "7f695b358ee22eda8433ca31503ae60e461b00e636392f366123810afadf5e12"\n'
+        'PINNED_VERSION = "1.0.0"\n'
+        'WHEEL_SHA256 = "0000000000000000000000000000000000000000000000000000000000000000"\n'
         "def live_fetchers():\n"
         "    raise AssertionError(\"dry-run must not fetch\")\n",
         encoding="utf-8",
@@ -157,7 +157,7 @@ def test_confirm_observe_required(tmp_path, capsys, monkeypatch):
     module_dir = tmp_path / "musicbox-service"
     module_dir.mkdir()
     (module_dir / "netease_playlist_snapshot.py").write_text(
-        'PINNED_VERSION = "0.5.3"\nWHEEL_SHA256 = "x"\n', encoding="utf-8",
+        'PINNED_VERSION = "1.0.0"\nWHEEL_SHA256 = "x"\n', encoding="utf-8",
     )
     monkeypatch.delenv("FNMUSIC_MANUAL_SAVE_ENABLED", raising=False)
     monkeypatch.delenv("FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED", raising=False)
@@ -172,7 +172,7 @@ def test_save_switch_on_fails_closed(tmp_path, monkeypatch):
     module_dir = tmp_path / "musicbox-service"
     module_dir.mkdir()
     (module_dir / "netease_playlist_snapshot.py").write_text(
-        'PINNED_VERSION = "0.5.3"\nWHEEL_SHA256 = "x"\n', encoding="utf-8",
+        'PINNED_VERSION = "1.0.0"\nWHEEL_SHA256 = "x"\n', encoding="utf-8",
     )
     calls = []
     monkeypatch.setattr(OBSERVE, "_observe_once", lambda playlist_id: calls.append(playlist_id))

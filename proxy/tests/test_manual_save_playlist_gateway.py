@@ -29,9 +29,7 @@ FINGERPRINT = "a" * 64
 OTHER_FINGERPRINT = "b" * 64
 JOB_ID = "0" * 48
 UNKNOWN_JOB_ID = "f" * 48
-WHEEL_SHA256 = (
-    "7f695b358ee22eda8433ca31503ae60e461b00e636392f366123810afadf5e12"
-)
+WHEEL_SHA256 = "0" * 64
 SIGNED_URL = "https://signed.example.com/secret?token=TOPSECRETTAIL"
 SECRET_COOKIE = "SECRETCOOKIE"
 SCOPE_USER = adapter.derive_actor_scope("1000")
@@ -93,8 +91,8 @@ def _failure(code):
 def _artifact(**overrides):
     artifact = {
         "provider": "netease",
-        "package": "NetEase-MusicBox",
-        "version": "0.5.3",
+        "package": "fnmusic-netease",
+        "version": "1.0.0",
         "wheel_sha256": WHEEL_SHA256,
         "dist_info_present": True,
     }
@@ -542,8 +540,8 @@ def test_snapshot_query_rejects_structural_errors(tmp_path, query):
     assert payload["code"] == "invalid_request"
 
 
-@pytest.mark.parametrize("value", ["0", "-1", "+1", "1.5", "abc", "4294967296",
-                                   "99999999999", ""])
+@pytest.mark.parametrize("value", ["0", "-1", "+1", "1.5", "abc", "9223372036854775808",
+                                   "99999999999999999999", ""])
 def test_snapshot_invalid_playlist_id_uses_fixed_400(tmp_path, value):
     _producer, deps = _deps(tmp_path)
     raw = _get(gw.MANUAL_SAVE_PLAYLIST_SNAPSHOT_PATHS[0],
@@ -603,11 +601,31 @@ def test_snapshot_success_shape_and_values(tmp_path):
     assert data["manifest_schema_version"] == 1
     assert data["source_artifact"] == {
         "provider": "netease",
-        "package": "NetEase-MusicBox",
-        "version": "0.5.3",
+        "package": "fnmusic-netease",
+        "version": "1.0.0",
         "wheel_sha256": WHEEL_SHA256,
     }
     assert producer.calls == [PLAYLIST_ID]
+
+
+def test_snapshot_and_create_support_64bit_playlist_ids(tmp_path):
+    large_id = 7368514547
+    payload = _snapshot_payload(playlist_id=large_id)
+    producer, deps = _deps(tmp_path, [payload])
+    raw = _get(gw.MANUAL_SAVE_PLAYLIST_SNAPSHOT_PATHS[0], query=f"playlist_id={large_id}")
+    client = FakeClient(raw)
+    gw.handle_manual_save_playlist_snapshot(client, raw, engine=FakeEngine(), deps=deps)
+    status, body = _response(client)
+    assert status == 200
+    assert body["data"]["playlist_id"] == large_id
+
+    producer2, deps2 = _deps(tmp_path, [payload])
+    raw2 = _create_raw(playlist_id=large_id)
+    client2 = FakeClient(raw2)
+    gw.handle_manual_save_playlist_create(client2, raw2, engine=FakeEngine(), deps=deps2)
+    status2, body2 = _response(client2)
+    assert status2 == 200
+    assert body2["data"]["manifest"]["collection_id"] == f"netease-playlist-{large_id}"
 
 
 def test_snapshot_does_not_echo_producer_secrets_or_paths(tmp_path):
@@ -851,7 +869,7 @@ def test_create_success_shape_manifest_and_job_summary(tmp_path):
     assert manifest == {
         "kind": "playlist",
         "target_id": "manual-save",
-        "provider_id": "netease-0.5.3-7f695b35",
+        "provider_id": "netease-1.0.0-fnmusic",
         "collection_id": "netease-playlist-" + str(PLAYLIST_ID),
         "collection_version": "sha256-" + FINGERPRINT,
         "enumeration_complete": True,

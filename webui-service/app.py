@@ -283,6 +283,13 @@ def _write_env_unlocked(updates: dict[str, str]) -> list[str]:
     merged = [(k, updates.get(k, v)) if k in updates else (k, v) for k, v in existing_kv]
     seen = {k for k, _ in merged}
     merged.extend((k, v) for k, v in updates.items() if k not in seen)
+    # 整歌单保存开启/关闭时同步 FNMUSIC_PLAYLIST_MANIFEST_READONLY（不污染 changed 返回清单）
+    if "FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED" in updates and "FNMUSIC_PLAYLIST_MANIFEST_READONLY" not in updates:
+        ro_val = updates["FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED"]
+        if "FNMUSIC_PLAYLIST_MANIFEST_READONLY" in seen:
+            merged = [(k, ro_val if k == "FNMUSIC_PLAYLIST_MANIFEST_READONLY" else v) for k, v in merged]
+        else:
+            merged.append(("FNMUSIC_PLAYLIST_MANIFEST_READONLY", ro_val))
     write_env_atomic(
         ENV_PATH,
         render_env(

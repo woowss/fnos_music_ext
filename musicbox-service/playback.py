@@ -5,6 +5,8 @@ import asyncio
 import copy
 import json
 import logging
+from pathlib import Path
+import sys
 import threading
 import time
 
@@ -16,7 +18,6 @@ PRIMARY_TIMEOUT_S = 10.0
 CACHE_MAX = 4096
 _lock = threading.Lock()
 _generation = 0
-_api = None
 _cache: dict = {}
 _tasks: dict = {}
 
@@ -33,53 +34,65 @@ class ResolutionTimeout(Exception):
     pass
 
 
+def _ensure_local_path() -> None:
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+
+
 def reset() -> None:
-    global _generation, _api
+    global _generation
     with _lock:
         _generation += 1
-        if _api is not None:
-            _api.session.close()
-        _api = None
         _cache.clear()
+    _ensure_local_path()
+    import netease_client
+
+    netease_client.reset_client("playback reset")
 
 
 def _snapshot(generation: int):
-    global _api
+    _ensure_local_path()
+    import netease_client
     from runner import ensure_xdg_dirs
 
     ensure_xdg_dirs()
-    try:
-        from NEMbox.api import NetEase
-    except ImportError as exc:
-        raise CapabilityError("NEMbox playback protocol unavailable") from exc
+    client = netease_client.get_client()
     with _lock:
         if generation != _generation:
             raise UpstreamError("login state changed")
-        if _api is None:
-            _api = NetEase()
-        return (
-            dict(_api._eapi_header_cookie()), dict(_api.header),
-            [copy.copy(cookie) for cookie in _api.cookie_jar],
+        client._ensure_cookies_loaded()
+        cookie_dict = client.cookie_dict()
+        csrf = cookie_dict.get("__csrf", "")
+        header_cookie = netease_client._eapi_header_payload(
+            csrf=csrf,
+            device_id=netease_client.default_device_id(client.cookie_path),
         )
+        headers = {
+            "User-Agent": netease_client.DEFAULT_USER_AGENT,
+            "Referer": f"{netease_client.WEAPI_BASE_URL}/",
+        }
+        cookies = [copy.copy(cookie) for cookie in client._jar]
+        return header_cookie, headers, cookies
 
 
 def _merge_cookies(generation: int, cookies: httpx.Cookies) -> None:
+    _ensure_local_path()
+    import netease_client
+
+    client = netease_client.get_client()
     with _lock:
-        if generation != _generation or _api is None:
+        if generation != _generation:
             return
-        try:
-            _api.cookie_jar.load()
-        except OSError:
-            logger.warning("playback cookie reload failed")
         changed = False
         for cookie in cookies.jar:
-            if cookie.domain.lstrip(".") not in ("music.163.com", "interface.music.163.com", "163.com"):
+            if cookie.domain.lstrip(".") not in ("music.163.com", "interface.music.163.com", "interface3.music.163.com", "163.com"):
                 continue
-            _api.cookie_jar.set_cookie(copy.copy(cookie))
+            client._jar.set_cookie(copy.copy(cookie))
             changed = True
         if changed:
             try:
-                _api.cookie_jar.save()
+                client.save_cookies()
             except OSError:
                 logger.warning("playback cookie persistence failed")
 
@@ -104,72 +117,61 @@ _STANDARD_ENCODE_TYPES = {
 
 
 def _safe_level_and_encode_type(quality: str) -> tuple[str, str]:
-    """验证真实 NEMbox helper 能力；未知档位（特别是 sky）绝不能被静默改低。"""
+    """Authoritative 7-tier NetEase quality mapping (no silent downgrade)."""
     clean_q = str(quality or "").strip().lower()
-    # 七档是本服务的固定协议契约；旧版 helper 对未知档位返回非空默认值，
-    # 尤其 sky 可能被编码为 mp3，不能让默认值静默改写请求。
     if clean_q in _STANDARD_LEVELS:
         return _STANDARD_LEVELS[clean_q], _STANDARD_ENCODE_TYPES[clean_q]
-    level = None
-    try:
-        from NEMbox.api import music_quality_to_level
-        cand_level = music_quality_to_level(clean_q)
-        # 若 NEMbox helper 不认识 sky 并将其静默改低，则纠正为 sky
-        if clean_q == "sky" and cand_level != "sky":
-            level = "sky"
-        else:
-            level = cand_level or _STANDARD_LEVELS.get(clean_q, clean_q)
-    except Exception:
-        level = _STANDARD_LEVELS.get(clean_q, clean_q)
-
-    try:
-        from NEMbox.api import level_to_encode_type
-        cand_encode = level_to_encode_type(level)
-        encode_type = cand_encode or _STANDARD_ENCODE_TYPES.get(level, "mp3")
-    except Exception:
-        encode_type = _STANDARD_ENCODE_TYPES.get(level, "mp3")
-
-    return str(level), str(encode_type)
+    return clean_q or "exhigh", _STANDARD_ENCODE_TYPES.get(clean_q, "mp3")
 
 
 async def _request(song_id: int, quality: str, generation: int) -> dict:
-    try:
-        from NEMbox.api import (
-            BASE_URL, EAPI_BASE_URL, eapi_encrypt, eapi_response_decrypt,
-            encrypted_request,
-        )
-    except ImportError as exc:
-        raise CapabilityError("NEMbox playback protocol unavailable") from exc
+    _ensure_local_path()
+    import netease_client
+    import netease_crypto
+
     header_cookie, headers, cookies = await asyncio.to_thread(_snapshot, generation)
     level, encode_type = _safe_level_and_encode_type(quality)
     api_path = "/api/song/enhance/player/url/v1"
     payload = {
         "ids": json.dumps([song_id], separators=(",", ":")),
-        "level": level, "encodeType": encode_type,
-        "e_r": True, "header": header_cookie,
+        "level": level,
+        "encodeType": encode_type,
+        "e_r": True,
+        "header": json.dumps(header_cookie, separators=(",", ":")),
     }
+    cookie_header_kv = {
+        "os": netease_client.DEFAULT_OS,
+        "appver": netease_client.DEFAULT_APPVER,
+        "osver": header_cookie.get("osver", ""),
+        "deviceId": header_cookie.get("deviceId", ""),
+        "__csrf": header_cookie.get("__csrf", ""),
+    }
+    for cookie in cookies:
+        if cookie.name and cookie.value is not None:
+            cookie_header_kv[cookie.name] = str(cookie.value)
+
     eapi_headers = {
         "Content-Type": "application/x-www-form-urlencoded",
         "User-Agent": "NeteaseMusic 9.0.90/5038 (iPhone; iOS 16.2; zh_CN)",
-        "Cookie": "; ".join(f"{key}={value}" for key, value in header_cookie.items() if value is not None),
-        "X-Real-IP": headers.get("X-Real-IP", ""),
-        "X-Forwarded-For": headers.get("X-Forwarded-For", ""),
+        "Cookie": "; ".join(f"{key}={value}" for key, value in cookie_header_kv.items() if value),
+        "Referer": f"{netease_client.EAPI_BASE_URL}/",
     }
     async with httpx.AsyncClient(timeout=PRIMARY_TIMEOUT_S, trust_env=False) as client:
         for cookie in cookies:
             client.cookies.jar.set_cookie(cookie)
         response = await asyncio.wait_for(client.post(
-            f"{EAPI_BASE_URL}/eapi/song/enhance/player/url/v1",
-            data=eapi_encrypt(api_path, payload), headers=eapi_headers,
+            f"{netease_client.EAPI_BASE_URL}/eapi/song/enhance/player/url/v1",
+            data=netease_crypto.eapi_encrypt(api_path, payload),
+            headers=eapi_headers,
         ), PRIMARY_TIMEOUT_S)
         response.raise_for_status()
         response_cookies = httpx.Cookies(response.cookies)
         try:
             data = response.json()
         except ValueError:
-            data = eapi_response_decrypt(response.content.hex().upper())
+            data = netease_crypto.eapi_response_decrypt(response.content)
         rows = _rows(data)
-        # 尊重账号权益与源能力限制：sky 与 jymaster 没有对应 weapi 码率，绝不走旧 weapi 伪造高档
+        # Respect account entitlement and tier boundaries: never forge sky/jymaster via weapi 999k
         if not rows and level not in ("sky", "jymaster"):
             bitrate_map = {
                 "standard": 128000, "higher": 192000, "exhigh": 320000,
@@ -177,17 +179,16 @@ async def _request(song_id: int, quality: str, generation: int) -> dict:
             }
             bitrate = bitrate_map.get(level)
             if bitrate:
-                csrf = header_cookie.get("__csrf", "")
+                csrf = cookie_header_kv.get("__csrf", "")
                 fallback_headers = {key: value for key, value in headers.items() if key.lower() != "host"}
                 response = await client.post(
-                    f"{BASE_URL}/weapi/song/enhance/player/url",
-                    data=encrypted_request({"ids": [song_id], "br": bitrate, "csrf_token": csrf}),
+                    f"{netease_client.WEAPI_BASE_URL}/weapi/song/enhance/player/url",
+                    data=netease_crypto.weapi_encrypt({"ids": [song_id], "br": bitrate, "csrf_token": csrf}),
                     headers=fallback_headers,
                 )
                 response.raise_for_status()
                 response_cookies.update(response.cookies)
                 rows = _rows(response.json())
-        # 只合并响应更新；请求快照里的旧 cookie 不得覆盖 CLI 刚写入的登录态。
         if response_cookies:
             await asyncio.to_thread(_merge_cookies, generation, response_cookies)
     if not rows:
@@ -204,41 +205,12 @@ async def _request(song_id: int, quality: str, generation: int) -> dict:
     return item
 
 
-async def _cli(song_id: int, quality: str) -> dict:
-    from runner import get_clean_env
-    try:
-        process = await asyncio.create_subprocess_exec(
-            "musicbox", "song", "url", str(song_id), "--quality", quality, "--json",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=get_clean_env(),
-        )
-    except OSError as exc:
-        raise UpstreamError("musicbox playback command unavailable") from exc
-    try:
-        stdout, _stderr = await process.communicate()
-        if process.returncode:
-            raise UpstreamError("musicbox playback command failed")
-        payload = json.loads(stdout)
-        if not isinstance(payload, dict) or payload.get("ok") is False or not isinstance(payload.get("data"), dict):
-            raise UpstreamError("invalid musicbox playback response")
-        return payload["data"]
-    finally:
-        if process.returncode is None:
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
-            await process.wait()
-
-
 async def _resolve(song_id: int, quality: str, generation: int,
                    purpose: str, context_generation: int) -> dict:
     started = time.monotonic()
     try:
         async with asyncio.timeout(BUDGET_S):
-            try:
-                item = await _request(song_id, quality, generation)
-            except CapabilityError:
-                item = await _cli(song_id, quality)
+            item = await _request(song_id, quality, generation)
     except (TimeoutError, httpx.TimeoutException) as exc:
         raise ResolutionTimeout("NetEase playback resolution timed out") from exc
     except (httpx.HTTPError, ValueError, KeyError) as exc:

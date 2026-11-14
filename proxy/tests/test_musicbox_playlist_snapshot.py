@@ -92,14 +92,14 @@ def _module():
 
 
 def _ok_probe():
-    return ("0.5.3", True)
+    return ("1.0.0", True)
 
 
 def _artifact_ok(payload):
     artifact = payload["source_artifact"]
     return (
         payload["artifact_error_code"] is None
-        and artifact["installed_version"] == "0.5.3"
+        and artifact["installed_version"] == "1.0.0"
         and artifact["dist_info_present"] is True
     )
 
@@ -214,10 +214,10 @@ def test_complete_consistent_snapshot_payload():
     assert payload["provider_verified"] is False
     assert payload["source_artifact"] == {
         "provider": "netease",
-        "package": "NetEase-MusicBox",
-        "version": "0.5.3",
-        "wheel_sha256": "7f695b358ee22eda8433ca31503ae60e461b00e636392f366123810afadf5e12",
-        "installed_version": "0.5.3",
+        "package": "fnmusic-netease",
+        "version": "1.0.0",
+        "wheel_sha256": "0" * 64,
+        "installed_version": "1.0.0",
         "dist_info_present": True,
     }
     assert _artifact_ok(payload)
@@ -241,8 +241,8 @@ def test_requested_position_count_is_1001_not_preview_1000():
     module = _module()
     assert module.PLAYLIST_DETAIL_POSITION_REQUEST == 1001
     assert module.MAX_LEDGER_POSITIONS == 1000
-    assert module.PINNED_VERSION == "0.5.3"
-    assert module.WHEEL_SHA256 == "7f695b358ee22eda8433ca31503ae60e461b00e636392f366123810afadf5e12"
+    assert module.PINNED_VERSION == "1.0.0"
+    assert module.WHEEL_SHA256 == "0" * 64
 
 
 # —— Count / order / duplicate / invalid ——————————————————————————————————————
@@ -373,7 +373,7 @@ def test_artifact_version_mismatch_fails_closed_before_any_read():
     fetch_account, fetch_playlist = _never_called_fetchers()
 
     payload = _module().build_snapshot(
-        42, fetch_account, fetch_playlist, artifact_probe=lambda: ("0.5.4", True),
+        42, fetch_account, fetch_playlist, artifact_probe=lambda: ("1.0.1", True),
     )
 
     # Envelope flag stays true: only the fixed `status`/`error_code` carry the
@@ -382,8 +382,8 @@ def test_artifact_version_mismatch_fails_closed_before_any_read():
     assert payload["status"] == "unsupported"
     assert payload["error_code"] == "UNSUPPORTED_SOURCE"
     assert payload["artifact_error_code"] == "source_artifact_mismatch"
-    assert payload["source_artifact"]["version"] == "0.5.3"
-    assert payload["source_artifact"]["installed_version"] == "0.5.4"
+    assert payload["source_artifact"]["version"] == "1.0.0"
+    assert payload["source_artifact"]["installed_version"] == "1.0.1"
     assert payload["source_artifact"]["dist_info_present"] is True
     assert payload["enumeration_complete"] is False
     assert payload["account_uid"] is None
@@ -395,12 +395,12 @@ def test_artifact_metadata_missing_fails_closed():
     fetch_account, fetch_playlist = _never_called_fetchers()
 
     payload = _module().build_snapshot(
-        42, fetch_account, fetch_playlist, artifact_probe=lambda: ("0.5.3", False),
+        42, fetch_account, fetch_playlist, artifact_probe=lambda: ("1.0.0", False),
     )
 
     assert payload["status"] == "unsupported"
     assert payload["artifact_error_code"] == "source_artifact_mismatch"
-    assert payload["source_artifact"]["installed_version"] == "0.5.3"
+    assert payload["source_artifact"]["installed_version"] == "1.0.0"
     assert payload["source_artifact"]["dist_info_present"] is False
 
 
@@ -429,20 +429,12 @@ def test_artifact_probe_with_unknown_shape_fails_closed():
     assert payload["artifact_error_code"] == "source_artifact_mismatch"
 
 
-def test_default_artifact_probe_shape_and_fail_closed_when_absent():
+def test_default_artifact_probe_shape_and_succeeds_with_netease_client():
     module = _module()
-    version, metadata_present = module._default_artifact_probe()  # noqa: SLF001  (contract §4.1 item 3)
+    version, metadata_present = module._default_artifact_probe()  # noqa: SLF001
 
-    assert version is None or isinstance(version, str)
-    assert isinstance(metadata_present, bool)
-    if version == module.PINNED_VERSION and metadata_present:
-        pytest.skip("NetEase-MusicBox 0.5.3 is installed in this test environment")
-
-    fetch_account, fetch_playlist = _never_called_fetchers()
-    payload = module.build_snapshot(42, fetch_account, fetch_playlist)
-
-    assert payload["status"] == "unsupported"
-    assert payload["artifact_error_code"] == "source_artifact_mismatch"
+    assert version == module.PINNED_VERSION
+    assert metadata_present is True
 
 
 # —— Upstream failure folding ——————————————————————————————————————————————————
@@ -708,7 +700,7 @@ def _not_logged_in_payload():
 def _artifact_mismatch_payload():
     fetch_account, fetch_playlist = _never_called_fetchers()
     return _module().build_snapshot(
-        42, fetch_account, fetch_playlist, artifact_probe=lambda: ("0.5.4", True),
+        42, fetch_account, fetch_playlist, artifact_probe=lambda: ("1.0.1", True),
     )
 
 

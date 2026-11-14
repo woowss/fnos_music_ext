@@ -491,7 +491,7 @@ def test_build_manifest_happy_path_exact_shape():
     assert manifest == {
         "kind": "playlist",
         "target_id": "manual-save",
-        "provider_id": "netease-0.5.3-7f695b35",
+        "provider_id": "netease-1.0.0-fnmusic",
         "collection_id": "netease-playlist-987654321",
         "collection_version": "sha256-" + "a" * 64,
         "enumeration_complete": True,
@@ -2031,7 +2031,7 @@ def _producer_observed_payload(producer, *, playlist_id=42, track_ids=(11, 12), 
         playlist_id,
         fetch_account,
         fetch_playlist,
-        artifact_probe=lambda: ("0.5.3", True),
+        artifact_probe=lambda: ("1.0.0", True),
     )
 
 
@@ -2062,7 +2062,7 @@ def test_cross_module_snapshot_failures_never_become_malformed(monkeypatch):
         (
             producer.build_snapshot(
                 42, _must_not_read, _must_not_read,
-                artifact_probe=lambda: ("0.5.2", True),
+                artifact_probe=lambda: ("1.0.1", True),
             ),
             "source_artifact_mismatch",
         ),
@@ -2070,7 +2070,7 @@ def test_cross_module_snapshot_failures_never_become_malformed(monkeypatch):
         (
             producer.build_snapshot(
                 42, _upstream_explodes, _upstream_explodes,
-                artifact_probe=lambda: ("0.5.3", True),
+                artifact_probe=lambda: ("1.0.0", True),
             ),
             "playlist_unavailable",
         ),
@@ -2078,7 +2078,7 @@ def test_cross_module_snapshot_failures_never_become_malformed(monkeypatch):
         (
             producer.build_snapshot(
                 42, lambda: None, _must_not_read,
-                artifact_probe=lambda: ("0.5.3", True),
+                artifact_probe=lambda: ("1.0.0", True),
             ),
             "not_logged_in",
         ),
@@ -2131,7 +2131,7 @@ def test_cross_module_observed_incomplete_and_source_changed_are_accepted(monkey
         }
 
     changed = producer.build_snapshot(
-        42, fetch_account, fetch_playlist, artifact_probe=lambda: ("0.5.3", True),
+        42, fetch_account, fetch_playlist, artifact_probe=lambda: ("1.0.0", True),
     )
     assert changed["status"] == "source_changed"
     assert adapter._validate_snapshot_envelope(changed, 42) is changed
@@ -2144,10 +2144,10 @@ def test_cross_module_unsupported_limit_payload_maps_to_playlist_too_large(monke
     producer = _load_producer_module(monkeypatch)
     artifact = {
         "provider": "netease",
-        "package": "NetEase-MusicBox",
-        "version": "0.5.3",
+        "package": "fnmusic-netease",
+        "version": "1.0.0",
         "wheel_sha256": "0" * 64,
-        "installed_version": "0.5.3",
+        "installed_version": "1.0.0",
     }
     for error_code in ("POSITION_LIMIT_EXCEEDED", "SOURCE_LIMIT_REACHED"):
         payload = producer._payload(

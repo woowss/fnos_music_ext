@@ -1,21 +1,21 @@
-"""Optional NEMbox internals for batch detail / lyrics (NetEase-MusicBox)."""
+"""Pure-Python NetEase API facade for catalog, playlist, lyrics, and URL resolution."""
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import threading
 import time
 from typing import Any
 
-try:
-    import httpx
-except ImportError:
-    httpx = None
+import httpx
 
 try:
     import requests
 except ImportError:
     requests = None
+
+import netease_client
 
 logger = logging.getLogger("musicbox_service.netease_ext")
 
@@ -37,6 +37,107 @@ _URL_CACHE_TTL_FAIL_S = 60.0
 _URL_CACHE_MAX = 4096
 
 
+class _AdapterSession:
+    def __init__(self, client: netease_client.NetEaseClient) -> None:
+        self._client = client
+
+    def close(self) -> None:
+        self._client.close()
+
+
+class NetEaseApiAdapter:
+    """Thread-safe adapter exposing NetEaseClient under legacy internal method names."""
+
+    def __init__(self, client: netease_client.NetEaseClient | None = None) -> None:
+        self._client = client or netease_client.get_client()
+        self.session = _AdapterSession(self._client)
+
+    def get_account_info(self) -> dict[str, Any]:
+        return self._client.get_account_info()
+
+    def get_vip_info(self) -> dict[str, Any]:
+        return self._client.get_vip_info()
+
+    def check_is_logged_in(self) -> bool:
+        return bool(self._client.auth_status().get("data", {}).get("logged_in"))
+
+    def songs_detail(self, ids: list[int]) -> list[dict[str, Any]]:
+        data = self._client.song_detail(ids)
+        songs = data.get("songs") or []
+        privs = data.get("privileges") or []
+        priv_by_id = {
+            int(p["id"]): p
+            for p in privs
+            if isinstance(p, dict) and p.get("id") is not None
+        }
+        out: list[dict[str, Any]] = []
+        for song in songs:
+            if not isinstance(song, dict):
+                continue
+            sid = song.get("id")
+            if sid is not None and int(sid) in priv_by_id and "privilege" not in song:
+                merged = dict(song)
+                merged["privilege"] = priv_by_id[int(sid)]
+                out.append(merged)
+            else:
+                out.append(song)
+        return out
+
+    def songs_url(self, ids: list[int], quality: str = "exhigh") -> list[dict[str, Any]]:
+        clean_q = str(quality or "exhigh").strip().lower()
+        encode_type = "mp3" if clean_q in {"standard", "higher", "exhigh"} else "flac"
+        res = self._client.song_url_v1(ids, level=clean_q, encode_type=encode_type)
+        rows = res.get("data")
+        return rows if isinstance(rows, list) else []
+
+    def song_lyric(self, song_id: int) -> list[str]:
+        res = self._client.song_lyric(int(song_id))
+        text = ((res.get("lrc") or {}).get("lyric") or "") if isinstance(res, dict) else ""
+        return text.splitlines() if text else []
+
+    def song_tlyric(self, song_id: int) -> list[str]:
+        res = self._client.song_lyric(int(song_id))
+        text = ((res.get("tlyric") or {}).get("lyric") or "") if isinstance(res, dict) else ""
+        return text.splitlines() if text else []
+
+    def song_lyric_pair(self, song_id: int) -> dict[str, str]:
+        res = self._client.song_lyric(int(song_id))
+        lrc = ((res.get("lrc") or {}).get("lyric") or "") if isinstance(res, dict) else ""
+        tlrc = ((res.get("tlyric") or {}).get("lyric") or "") if isinstance(res, dict) else ""
+        return {"lyric": str(lrc), "tlyric": str(tlrc)}
+
+    def user_playlist(self, uid: int, offset: int = 0, limit: int = 100) -> list[dict[str, Any]]:
+        res = self._client.user_playlists(int(uid), limit=limit, offset=offset)
+        rows = res.get("playlist") if isinstance(res, dict) else None
+        return rows if isinstance(rows, list) else []
+
+    def playlist_songlist(self, playlist_id: int) -> list[dict[str, Any]]:
+        res = self._client.playlist_detail(int(playlist_id))
+        playlist = res.get("playlist") if isinstance(res, dict) else None
+        if not isinstance(playlist, dict):
+            return []
+        track_ids = playlist.get("trackIds")
+        if isinstance(track_ids, list):
+            return track_ids
+        tracks = playlist.get("tracks")
+        return tracks if isinstance(tracks, list) else []
+
+    def eapi_request(self, api_path: str, params: dict[str, Any]) -> dict[str, Any]:
+        return self._client.eapi_post(api_path, params)
+
+    def request(self, method: str, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        clean = str(path or "").strip()
+        if clean.startswith("/api/"):
+            return self._client.eapi_post(clean, params or {})
+        return self._client.weapi_post(clean, params or {})
+
+    def _raw_request(self, method: str, url: str, params: dict[str, Any] | None = None) -> httpx.Response:
+        http = self._client._get_http()
+        if str(method).upper() == "GET":
+            return http.get(url, params=params or {})
+        return http.request(method, url, data=params or {})
+
+
 def _get_api_locked():
     """调用方必须已持有 _api_lock：取实例 + 用实例在同一次持锁内完成。"""
     global _api_instance
@@ -44,9 +145,7 @@ def _get_api_locked():
         from runner import ensure_xdg_dirs
 
         ensure_xdg_dirs()
-        from NEMbox.api import NetEase
-
-        _api_instance = NetEase()
+        _api_instance = NetEaseApiAdapter(netease_client.get_client())
     return _api_instance
 
 
@@ -56,11 +155,7 @@ def _get_api():
 
 
 def reset_api(reason: str = "") -> None:
-    """丢弃常驻 NetEase 实例与相关缓存，下次 _get_api() 重建并重读磁盘 cookie。
-
-    登录由 CLI 子进程完成并写盘，而 NEMbox 的 NetEase 只在构造时读一次盘；
-    磁盘 cookie 变化（扫码成功等）后不重建实例，服务进程内就永远是旧登录态。
-    """
+    """丢弃常驻实例与相关缓存，下次 _get_api() 重建并重读磁盘 cookie。"""
     global _api_instance, _login_state, _vip_state
     import playback
 
@@ -101,10 +196,7 @@ def _map_song_detail(item: dict[str, Any]) -> dict[str, Any]:
         album_name = ""
         album_pic_url = ""
     duration_ms = int(item.get("dt") or item.get("duration") or 0)
-    try:
-        fee = int(item.get("fee") or 0)
-    except (TypeError, ValueError):
-        fee = 0
+    qinfo = _infer_song_quality_info(item)
     return {
         "song_id": song_id,
         "name": name,
@@ -112,11 +204,15 @@ def _map_song_detail(item: dict[str, Any]) -> dict[str, Any]:
         "album_name": album_name,
         "album_pic_url": album_pic_url,
         "duration_ms": duration_ms,
-        "has_sq": bool(item.get("sq")),
-        "has_hr": bool(item.get("hr")),
+        "has_sq": qinfo["has_sq"],
+        "has_hr": qinfo["has_hr"],
+        "has_jm": qinfo["has_jm"],
+        "has_sky": qinfo["has_sky"],
+        "max_quality": qinfo["max_quality"],
+        "playable_status": qinfo["playable_status"],
         # issue #57：fee 收费类型（0=免费 1=VIP 4=购买专辑 8=非会员免费低音质），
         # 供行级 needs_vip 标记——无 VIP 账号点 VIP 歌只有试听，标记让用户有预期
-        "fee": fee,
+        "fee": qinfo["fee"],
     }
 
 
@@ -240,16 +336,11 @@ def get_song_url(song_id: int, quality: str, fresh: bool = False) -> "dict[str, 
     try:
         with _api_lock:
             api = _get_api_locked()
-            # songs_url 的音质取自全局 Config：临时改写再恢复（CLI cmd_song_url 同款做法）
-            from NEMbox.config import Config
-
-            config = Config()
-            old_quality = config.get("music_quality")
-            config.config.setdefault("music_quality", {})["value"] = quality
-            try:
+            sig = inspect.signature(api.songs_url)
+            if "quality" in sig.parameters:
+                urls = api.songs_url([int(song_id)], quality=quality)
+            else:
                 urls = api.songs_url([int(song_id)])
-            finally:
-                config.config["music_quality"]["value"] = old_quality
     except Exception:
         return None
     if not isinstance(urls, list) or not urls or not isinstance(urls[0], dict):
@@ -314,11 +405,220 @@ def song_detail_raw(song_id: int) -> "dict[str, Any] | None":
 def song_lyric_pair(song_id: int) -> dict[str, str]:
     with _api_lock:
         api = _get_api_locked()
+        if hasattr(api, "song_lyric_pair"):
+            return api.song_lyric_pair(int(song_id))
         raw_lyric = api.song_lyric(song_id)
         raw_tlyric = api.song_tlyric(song_id)
     lyric_str = "\n".join(str(line) for line in raw_lyric) if isinstance(raw_lyric, list) else ""
     tlyric_str = "\n".join(str(line) for line in raw_tlyric) if isinstance(raw_tlyric, list) else ""
     return {"lyric": lyric_str, "tlyric": tlyric_str}
+
+
+def _infer_song_quality_info(item: dict[str, Any]) -> dict[str, Any]:
+    """Derive honest NetEase max quality & entitlement metadata from song + privilege."""
+    priv = item.get("privilege") if isinstance(item.get("privilege"), dict) else {}
+    max_br_level = str(priv.get("maxBrLevel") or "").strip().lower()
+    pl_level = str(priv.get("plLevel") or "").strip().lower()
+    dl_level = str(priv.get("dlLevel") or "").strip().lower()
+    try:
+        maxbr = int(priv.get("maxbr") or 0)
+    except (TypeError, ValueError):
+        maxbr = 0
+    try:
+        fee = int(priv.get("fee") if priv.get("fee") is not None else (item.get("fee") or 0))
+    except (TypeError, ValueError):
+        fee = 0
+
+    has_sq = bool(item.get("sq")) or max_br_level in {"lossless", "hires", "jymaster", "sky"} or maxbr >= 999000
+    has_hr = bool(item.get("hr")) or max_br_level in {"hires", "jymaster"}
+    has_jm = bool(item.get("jm") or item.get("jyeff")) or max_br_level == "jymaster"
+    has_sky = max_br_level == "sky" or "sky" in {pl_level, dl_level}
+
+    if has_sky:
+        max_quality = "sky"
+    elif has_jm:
+        max_quality = "jymaster"
+    elif has_hr:
+        max_quality = "hires"
+    elif has_sq:
+        max_quality = "lossless"
+    elif item.get("h") or max_br_level == "exhigh" or maxbr >= 320000:
+        max_quality = "exhigh"
+    elif item.get("m") or max_br_level == "higher" or maxbr >= 192000:
+        max_quality = "higher"
+    else:
+        max_quality = "standard"
+
+    st = priv.get("st")
+    free_trial_priv = priv.get("freeTrialPrivilege") if isinstance(priv.get("freeTrialPrivilege"), dict) else {}
+    res_consumable = bool(free_trial_priv.get("resConsumable"))
+    if st is not None and int(st) < 0:
+        playable_status = "copyright"
+    elif fee == 4:
+        playable_status = "paid_album"
+    elif res_consumable or (pl_level == "none" and fee == 1):
+        playable_status = "vip_required"
+    elif fee == 1 and not vip_entitled():
+        playable_status = "vip_required"
+    else:
+        playable_status = "ok"
+
+    return {
+        "max_quality": max_quality,
+        "playable_status": playable_status,
+        "fee": fee,
+        "has_sq": has_sq,
+        "has_hr": has_hr,
+        "has_jm": has_jm,
+        "has_sky": has_sky,
+    }
+
+
+def _map_cloudsearch_song(s: dict[str, Any]) -> dict[str, Any] | None:
+    sid = s.get("id") or s.get("song_id")
+    if not sid:
+        return None
+    try:
+        sid_int = int(sid)
+    except (ValueError, TypeError):
+        return None
+    if sid_int <= 0:
+        return None
+
+    name = str(s.get("name") or s.get("title") or "")
+    artists = s.get("ar") or s.get("artists") or []
+    if isinstance(artists, list):
+        artist = " / ".join(str(a.get("name")) for a in artists if isinstance(a, dict) and a.get("name"))
+    else:
+        artist = str(s.get("artist") or "")
+    album = s.get("al") or s.get("album") or {}
+    album_name = str(album.get("name") or "") if isinstance(album, dict) else str(s.get("album_name") or "")
+    album_pic = str(album.get("picUrl") or album.get("pic_url") or "") if isinstance(album, dict) else ""
+    duration_raw = s.get("dt") or s.get("duration") or 0
+    try:
+        dur = float(duration_raw)
+        if dur > 10000:
+            dur = dur / 1000.0
+    except (ValueError, TypeError):
+        dur = 0.0
+
+    qinfo = _infer_song_quality_info(s)
+    return {
+        "song_id": sid_int,
+        "id": sid_int,
+        "song_name": name,
+        "title": name,
+        "name": name,
+        "artist": artist,
+        "album_name": album_name,
+        "album": album_name,
+        "album_pic_url": album_pic,
+        "duration": dur,
+        "quality": qinfo["max_quality"],
+        **qinfo,
+    }
+
+
+def search_catalog(keyword: str, stype: str = "song", limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
+    """Direct EAPI /api/cloudsearch/get/web search with full privilege & quality metadata."""
+    clean_kw = str(keyword or "").strip()
+    if not clean_kw:
+        return []
+    client = netease_client.get_client()
+    raw = client.cloudsearch(clean_kw, search_type=stype, limit=limit, offset=max(0, int(offset or 0)))
+    result = raw.get("result") if isinstance(raw, dict) else None
+    if not isinstance(result, dict):
+        return []
+    if stype == "song":
+        songs = result.get("songs") or []
+        out = []
+        for row in songs if isinstance(songs, list) else []:
+            if isinstance(row, dict):
+                mapped = _map_cloudsearch_song(row)
+                if mapped:
+                    out.append(mapped)
+        return out
+    if stype == "album":
+        return list(result.get("albums") or [])
+    if stype == "artist":
+        return list(result.get("artists") or [])
+    if stype == "playlist":
+        return list(result.get("playlists") or [])
+    return []
+
+
+def artist_detail(artist_id: int, limit: int = 20) -> dict[str, Any]:
+    raw = netease_client.get_client().artist_detail(int(artist_id))
+    artist = raw.get("artist") or {}
+    hot_songs = raw.get("hotSongs") or []
+    mapped = [_map_song_detail(s) for s in hot_songs[:limit] if isinstance(s, dict)]
+    return {"ok": True, "data": {"artist": artist, "hot_songs": mapped}}
+
+
+def album_detail(album_id: int) -> dict[str, Any]:
+    raw = netease_client.get_client().album_detail(int(album_id))
+    album = raw.get("album") or {}
+    songs = raw.get("songs") or []
+    mapped = [_map_song_detail(s) for s in songs if isinstance(s, dict)]
+    return {"ok": True, "data": {"album": album, "songs": mapped}}
+
+
+def playlist_detail_raw(playlist_id: int) -> dict[str, Any]:
+    raw = netease_client.get_client().playlist_detail(int(playlist_id))
+    playlist = raw.get("playlist") or {}
+    return {"ok": True, "data": playlist}
+
+
+def recommend_songs_raw(limit: int = 30) -> list[dict[str, Any]]:
+    raw = netease_client.get_client().recommend_songs()
+    data = raw.get("data") if isinstance(raw, dict) else None
+    songs = data.get("dailySongs") if isinstance(data, dict) else None
+    if not isinstance(songs, list):
+        songs = raw.get("recommend") if isinstance(raw, dict) else []
+    if not isinstance(songs, list):
+        return []
+    return [s for s in songs[:limit] if isinstance(s, dict)]
+
+
+def toplist_raw(index: int = -1, limit: int = 60) -> dict[str, Any]:
+    client = netease_client.get_client()
+    raw = client.toplist()
+    charts = raw.get("list") if isinstance(raw, dict) else []
+    charts = charts if isinstance(charts, list) else []
+    if index < 0:
+        return {"ok": True, "data": charts}
+    if index >= len(charts):
+        return {"ok": True, "data": []}
+    chart = charts[index] if isinstance(charts[index], dict) else {}
+    chart_id = _int_or_zero(chart.get("id"))
+    if chart_id <= 0:
+        return {"ok": True, "data": []}
+    pl = client.playlist_detail(chart_id, n=max(1, min(limit, 100)))
+    playlist = pl.get("playlist") if isinstance(pl, dict) else {}
+    track_ids = playlist.get("trackIds") or playlist.get("tracks") or []
+    return {"ok": True, "data": track_ids}
+
+
+def auth_status() -> dict[str, Any]:
+    return netease_client.get_client().auth_status()
+
+
+def auth_login_qr() -> dict[str, Any]:
+    return netease_client.get_client().qr_unikey()
+
+
+def auth_login_check(unikey: str) -> dict[str, Any]:
+    res = netease_client.get_client().qr_check(unikey)
+    payload = res.get("data") if isinstance(res, dict) else None
+    if isinstance(payload, dict) and payload.get("code") == 803:
+        reset_api("qr login success")
+    return res
+
+
+def auth_logout() -> dict[str, Any]:
+    res = netease_client.get_client().logout()
+    reset_api("logout")
+    return res
 
 
 def search_web_fallback(keyword: str, stype: str = "song", limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
@@ -801,11 +1101,11 @@ def user_playlist_preview(playlist_id: int) -> dict[str, Any]:
 
 
 def _public_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-    from NEMbox.api import BASE_URL
+    base_url = netease_client.WEAPI_BASE_URL
 
     with _api_lock:
         api = _get_api_locked()
-        resp = api._raw_request("GET", f"{BASE_URL}{path}", params or {})
+        resp = api._raw_request("GET", f"{base_url}{path}", params or {})
         resp.raise_for_status()
         return _validate_public_response(resp.json())
 

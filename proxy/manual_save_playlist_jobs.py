@@ -60,7 +60,7 @@ except ImportError:  # pragma: no cover - flat import style (PYTHONPATH=proxy).
 # ---------------------------------------------------------------------------
 
 TARGET_ID = "manual-save"
-PROVIDER_ID = "netease-0.5.3-7f695b35"
+PROVIDER_ID = "netease-1.0.0-fnmusic"
 PROVIDER_NAME = "netease"
 SNAPSHOT_SCHEMA_VERSION = 1
 PLAYLIST_COLLECTION_PREFIX = "netease-playlist-"

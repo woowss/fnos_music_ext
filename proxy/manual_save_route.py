@@ -151,7 +151,7 @@ _COVER_MIME_PARAM_TOKEN_RE = re.compile(r"[A-Za-z0-9._-]{1,32}")
 UNKNOWN_ARTIST = "未知歌手"
 ARTIST_SEPARATOR = "/"
 MD5_RE = re.compile(r"[0-9a-fA-F]{32}")
-DIGITS_RE = re.compile(r"[0-9]{1,10}")
+DIGITS_RE = re.compile(r"[0-9]{1,18}")
 # A delivered quality is reported as a lowercase server token; anything else is
 # "unknown", never translated or inferred from type/bitrate/sample-rate.
 QUALITY_LEVEL_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")

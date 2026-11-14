@@ -251,7 +251,7 @@ MANUAL_SAVE_PLAYLIST_READ_TIMEOUT = 120.0
 # Query/cancel are ledger-only; they get a short worker budget.
 MANUAL_SAVE_PLAYLIST_QUERY_TIMEOUT = 30.0
 MANUAL_SAVE_PLAYLIST_MAX_POSITIONS = 1000
-MANUAL_SAVE_PLAYLIST_MAX_PLAYLIST_ID = 0xFFFFFFFF
+MANUAL_SAVE_PLAYLIST_MAX_PLAYLIST_ID = 0x7FFFFFFFFFFFFFFF
 MANUAL_SAVE_PLAYLIST_MAX_LIST_ROWS = 100
 MANUAL_SAVE_PLAYLIST_MAX_NAME_CHARS = 256
 MANUAL_SAVE_PLAYLIST_MAX_JSON_BYTES = 1 << 20
@@ -259,17 +259,16 @@ MANUAL_SAVE_PLAYLIST_MAX_BASE_URL_CHARS = 2048
 MANUAL_SAVE_PLAYLIST_JOB_ID_RE = re.compile(r"^[0-9a-f]{48}$")
 MANUAL_SAVE_PLAYLIST_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 MANUAL_SAVE_PLAYLIST_IDEMPOTENCY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-MANUAL_SAVE_PLAYLIST_DECIMAL_RE = re.compile(r"^[1-9][0-9]{0,9}$")
+MANUAL_SAVE_PLAYLIST_DECIMAL_RE = re.compile(r"^[1-9][0-9]{0,18}$")
 MANUAL_SAVE_PLAYLIST_REASON_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 MANUAL_SAVE_PLAYLIST_SOURCE_ID_RE = re.compile(r"^[0-9]{1,128}$")
 MANUAL_SAVE_PLAYLIST_MANIFEST_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 MANUAL_SAVE_PLAYLIST_ENABLED_KEY = "FNMUSIC_MANUAL_SAVE_PLAYLIST_ENABLED"
 MANUAL_SAVE_JOBS_DB_KEY = "FNMUSIC_MANUAL_SAVE_JOBS_DB"
-# §4.1 fixed artifact provenance (producer-side assertion; the gateway only
-# checks the producer's reported version/flag, never the wheel digest).
+# §4.1 fixed provenance (producer-side assertion; gateway checks reported provider/package/version).
 MANUAL_SAVE_PLAYLIST_ARTIFACT_PROVIDER = "netease"
-MANUAL_SAVE_PLAYLIST_ARTIFACT_PACKAGE = "NetEase-MusicBox"
-MANUAL_SAVE_PLAYLIST_ARTIFACT_VERSION = "0.5.3"
+MANUAL_SAVE_PLAYLIST_ARTIFACT_PACKAGE = "fnmusic-netease"
+MANUAL_SAVE_PLAYLIST_ARTIFACT_VERSION = "1.0.0"
 MANUAL_SAVE_PLAYLIST_MANIFEST_SCHEMA_VERSION = 1
 # §7.1 gateway-wide execution lock: the single-track endpoint and the playlist
 # advance endpoint serialize on this exact object (acquired before any ledger

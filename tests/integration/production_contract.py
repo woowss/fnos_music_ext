@@ -13,62 +13,53 @@ import tempfile
 
 
 def check_musicbox():
-    from NEMbox import cli
-
-    parser = cli._build_parser()
-    commands = [
-        ["search", "fixture", "--type", "song", "--json"],
-        ["song", "url", "123", "--quality", "lossless", "--json"],
-        ["song", "info", "123", "--json"],
-        ["artist", "123", "--limit", "5", "--json"],
-        ["album", "123", "--json"],
-        ["playlist", "show", "123", "--json"],
-        ["auth", "login", "--no-wait", "--json"],
-    ]
-    for command in commands:
-        assert getattr(parser.parse_args(command), "handler", None), command
-
-    class Api:
-        def songs_url(self, ids):
-            assert ids == [123]
-            return [{"id": 123, "code": 200, "url": "https://audio.invalid/fixture.flac"}]
-
-    # Update notices are not part of the offline response contract.
-    cli._update_notice = lambda: None
-    output = io.StringIO()
-    with contextlib.redirect_stdout(output):
-        status = cli.dispatch(Api(), parser.parse_args(commands[1]))
-    payload = json.loads(output.getvalue())
-    assert status == 0 and payload["ok"] is True
-    assert payload["data"]["code"] == 200
-    assert payload["data"]["url"].endswith(".flac")
-    executable = Path(sys.executable).parent / "musicbox"
-    result = subprocess.run([str(executable), "song", "url", "--help"], capture_output=True, timeout=15)
-    assert result.returncode == 0, result.stderr.decode(errors="replace")
-    assert b"--quality" in result.stdout
-    import playback
-    import netease_ext
-    import httpx
+    from cryptography.hazmat.primitives import padding as sym_padding
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     from urllib.parse import parse_qs
-    from NEMbox.encrypt import AES, EAPI_KEY
+    import httpx
+    import netease_client
+    import netease_crypto
+    import netease_ext
+    import playback
 
+    # 1. Pure-Python crypto round-trip check
+    weapi_req = netease_crypto.weapi_encrypt({"type": 1})
+    assert "params" in weapi_req and len(weapi_req["encSecKey"]) == 256
+
+    eapi_req = netease_crypto.eapi_encrypt("/api/cloudsearch/get/web", {"s": "fixture", "type": 1})
+    assert eapi_req["params"].isupper()
+
+    # 2. Pure-Python playback EAPI -> WEAPI fallback contract (no NEMbox/CLI)
     client_type = httpx.AsyncClient
     captured = []
+
+    def _decrypt_eapi_form(hex_params: str) -> tuple[str, dict]:
+        cipher = Cipher(algorithms.AES(netease_crypto.EAPI_KEY), modes.ECB())
+        decryptor = cipher.decryptor()
+        padded = decryptor.update(bytes.fromhex(hex_params)) + decryptor.finalize()
+        unpadder = sym_padding.PKCS7(128).unpadder()
+        plain = (unpadder.update(padded) + unpadder.finalize()).decode("utf-8")
+        api_path, body_json, _digest = plain.split(netease_crypto.EAPI_SEPARATOR)
+        return api_path, json.loads(body_json)
+
+    def _encrypt_eapi_resp(obj: dict) -> bytes:
+        raw = json.dumps(obj, separators=(",", ":")).encode("utf-8")
+        padder = sym_padding.PKCS7(128).padder()
+        padded = padder.update(raw) + padder.finalize()
+        cipher = Cipher(algorithms.AES(netease_crypto.EAPI_KEY), modes.ECB())
+        encryptor = cipher.encryptor()
+        return encryptor.update(padded) + encryptor.finalize()
 
     def handler(request):
         form = parse_qs(request.content.decode())
         if request.url.path.endswith("/url/v1"):
-            decoded = AES.new(EAPI_KEY, AES.MODE_ECB).decrypt(bytes.fromhex(form["params"][0]))
-            decoded = decoded[:-decoded[-1]].decode().split("-36cd479b6b5-")
-            body = json.loads(decoded[1])
-            assert decoded[0] == "/api/song/enhance/player/url/v1"
+            api_path, body = _decrypt_eapi_form(form["params"][0])
+            header_obj = json.loads(body["header"]) if isinstance(body["header"], str) else body["header"]
+            assert api_path == "/api/song/enhance/player/url/v1"
             assert body["ids"] == "[123]" and body["level"] == "lossless"
-            assert body["encodeType"] == "flac" and body["header"]["deviceId"]
+            assert body["encodeType"] == "flac" and header_obj["deviceId"]
             captured.append("eapi")
-            plain = json.dumps({"code": 200, "data": []}).encode()
-            padding = 16 - len(plain) % 16
-            encrypted = AES.new(EAPI_KEY, AES.MODE_ECB).encrypt(plain + bytes([padding]) * padding)
-            return httpx.Response(200, content=encrypted)
+            return httpx.Response(200, content=_encrypt_eapi_resp({"code": 200, "data": []}))
         assert "params" in form and "encSecKey" in form
         assert request.headers["host"] == request.url.host
         captured.append("weapi")
@@ -89,6 +80,30 @@ def check_musicbox():
             playback.httpx.AsyncClient = original_client
 
     asyncio.run(verify())
+
+    # 3. 64-bit playlist ID support + honest search metadata in NetEaseClient
+    def search_handler(request):
+        return httpx.Response(200, content=_encrypt_eapi_resp({
+            "code": 200,
+            "result": {"songs": [{
+                "id": 7368514547,
+                "name": "Fixture",
+                "ar": [{"name": "Tester"}],
+                "al": {"name": "Album", "picUrl": "https://img.invalid/1.jpg"},
+                "dt": 180000,
+                "fee": 0,
+                "privilege": {"maxBrLevel": "jymaster", "maxbr": 1999000, "fee": 0},
+            }]},
+        }))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        c = netease_client.NetEaseClient(
+            cookie_path=Path(tmp) / "cookie.txt",
+            transport=httpx.MockTransport(search_handler),
+        )
+        res = c.cloudsearch("Fixture")
+        assert res["result"]["songs"][0]["privilege"]["maxBrLevel"] == "jymaster"
+        c.close()
 
 
 def main():

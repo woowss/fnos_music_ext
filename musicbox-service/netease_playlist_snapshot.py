@@ -72,19 +72,18 @@ Deliberate limits (contract §4.1/§4.2/§4.3):
 
 from __future__ import annotations
 
-import importlib.metadata
 import os
 from typing import Any, Callable
 
 import playlist_manifest
 
 
-# —— Fixed artifact selection (docs/NETEASE_DELIVERY_EVIDENCE.md) ————————————————
+# —— Fixed provider selection ——————————————————————————————————————————————————
 SCHEMA_VERSION = 1
 PROVIDER = "netease"
-PACKAGE_NAME = "NetEase-MusicBox"
-PINNED_VERSION = "0.5.3"
-WHEEL_SHA256 = "7f695b358ee22eda8433ca31503ae60e461b00e636392f366123810afadf5e12"
+PACKAGE_NAME = "fnmusic-netease"
+PINNED_VERSION = "1.0.0"
+WHEEL_SHA256 = "0" * 64
 
 # n = 1001 asks for one position beyond the ledger's 1000-position job limit so
 # that "exactly 1000 tracks" and "truncated at 1000" are distinguishable
@@ -148,27 +147,17 @@ def producer_enabled(environ: Any = None) -> bool:
 
 # —— Artifact assertion (§4.1 items 2 and 3) ——————————————————————————————————
 def _default_artifact_probe() -> "tuple[str | None, bool]":
-    """Return ``(installed version, dist-info/METADATA present)``; never raises.
-
-    Runtime can only assert the version string and that the distribution
-    metadata file exists; the wheel digest cannot be recomputed from an
-    unpacked install (§4.1 item 3).
-    """
+    """Return ``(client version, module present)`` without touching filesystem/network."""
     try:
-        distribution = importlib.metadata.distribution(PACKAGE_NAME)
+        import netease_client
     except Exception:
         return None, False
-    try:
-        raw_version = distribution.version
-    except Exception:
-        raw_version = None
-    version = raw_version if isinstance(raw_version, str) and raw_version else None
-    try:
-        metadata_text = distribution.read_text("METADATA")
-    except Exception:
-        metadata_text = None
-    metadata_present = isinstance(metadata_text, str) and bool(metadata_text.strip())
-    return version, metadata_present
+    pkg = getattr(netease_client, "PACKAGE_NAME", None)
+    ver = getattr(netease_client, "PACKAGE_VERSION", None)
+    client_cls = getattr(netease_client, "NetEaseClient", None)
+    if pkg != PACKAGE_NAME or not isinstance(ver, str) or not ver or client_cls is None:
+        return None, False
+    return ver, True
 
 
 def _artifact_state(artifact_probe: Any) -> "tuple[dict, str | None]":
