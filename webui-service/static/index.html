@@ -428,16 +428,30 @@
         <div class="card">
           <div class="card-title">手动保存歌单</div>
           <p class="hint" id="playlist-status" role="status">正在读取整歌单保存状态…</p>
-          <p class="hint">整歌单保存按「一首一次请求」逐首推进，进度记录在任务账本中；刷新页面后可继续。保存只写入新文件，同名文件不会被覆盖。最多显示 100 张歌单。</p>
+          <p class="hint">整歌单保存按「一首一次请求」逐首推进，进度记录在任务账本中；刷新页面后可继续。整单任务单次上限 1000 首；保存只写入新文件，同名文件不会被覆盖。最多显示 100 张个人歌单，也可粘贴任意公开歌单链接或 ID。</p>
           <div class="btn-row">
             <select class="input grow" id="playlist-select" aria-label="选择歌单"></select>
             <button class="btn" id="playlist-refresh-btn" type="button">刷新列表</button>
+          </div>
+          <div class="btn-row">
+            <input class="input grow" id="playlist-custom-input" placeholder="粘贴网易云歌单链接或数字 ID（如 https://music.163.com/playlist?id=7368514547）" aria-label="自定义歌单链接或 ID">
+            <button class="btn" id="playlist-load-tracks-btn" type="button">展开曲目</button>
           </div>
           <div class="btn-row">
             <button class="btn" id="playlist-snapshot-btn" type="button">读取清单</button>
             <button class="btn primary" id="playlist-start-btn" type="button">开始保存</button>
           </div>
           <p class="hint" id="playlist-snapshot-status" role="status" aria-live="polite"></p>
+          <div id="playlist-tracks-panel" hidden>
+            <p class="hint" id="playlist-tracks-summary" role="status" aria-live="polite"></p>
+            <div class="btn-row">
+              <button class="btn small" id="playlist-tracks-select-all-btn" type="button">全选/取消</button>
+              <button class="btn small" id="playlist-tracks-select-playable-btn" type="button">仅选可播</button>
+              <button class="btn small primary" id="playlist-tracks-save-btn" type="button">下载选中曲目</button>
+              <span class="muted" id="playlist-tracks-batch-status" role="status" aria-live="polite"></span>
+            </div>
+            <div class="stack" id="playlist-tracks-list"></div>
+          </div>
           <div id="playlist-job-panel" hidden>
             <p class="hint" id="playlist-job-state" role="status"></p>
             <p class="hint" id="playlist-progress" role="status" aria-live="polite"></p>

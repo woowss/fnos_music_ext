@@ -2201,3 +2201,73 @@ def test_resolve_deps_rejects_non_loopback_musicbox_url(monkeypatch):
     assert error.value.code == "config_invalid"
 
 
+def test_playlist_tracks_sanitizes_64bit_playlist_and_flags_truncation(tmp_path):
+    playlist_id = 7368514547
+    _producer, deps = _deps(tmp_path, [])
+
+    def fake_fetcher(pid, timeout):
+        assert pid == playlist_id
+        assert timeout > 0
+        return {
+            "ok": True,
+            "total": 1200,
+            "truncated": True,
+            "data": [
+                {
+                    "song_id": 10001,
+                    "name": "Track One",
+                    "artist": "Artist A",
+                    "album_name": "Album X",
+                    "album_pic_url": "https://p1.music.126.net/secret-pic.jpg",
+                    "duration_ms": 215000,
+                    "max_quality": "JYMASTER",
+                    "playable_status": "vip_required",
+                    "fee": 1,
+                    "has_sq": True,
+                    "has_hr": True,
+                    "has_jm": True,
+                    "has_sky": False,
+                    "leaked_url": "https://cdn.example/secret",
+                }
+            ],
+        }
+
+    raw = _get(gw.MANUAL_SAVE_PLAYLIST_TRACKS_PATHS[0], query=f"playlist_id={playlist_id}")
+    client = FakeClient(raw)
+    gw.handle_manual_save_playlist_tracks(
+        client, raw, engine=FakeEngine(), deps=deps, tracks_fetcher=fake_fetcher,
+    )
+    status, body = _response(client)
+    assert status == 200
+    assert body["ok"] is True
+    assert body["data"]["playlist_id"] == playlist_id
+    assert body["data"]["total"] == 1200
+    assert body["data"]["truncated"] is True
+    assert body["data"]["tracks"] == [{
+        "song_id": 10001,
+        "title": "Track One",
+        "artist": "Artist A",
+        "album": "Album X",
+        "max_quality": "jymaster",
+        "playable_status": "vip_required",
+        "fee": 1,
+        "has_sq": True,
+        "has_hr": True,
+        "has_jm": True,
+        "has_sky": False,
+        "duration": 215000,
+    }]
+    rendered = client.data.decode("utf-8", "replace")
+    assert "https://" not in rendered
+    assert "secret-pic" not in rendered
+
+    bad_raw = _get(gw.MANUAL_SAVE_PLAYLIST_TRACKS_PATHS[0], query="playlist_id=not-an-id")
+    bad_client = FakeClient(bad_raw)
+    gw.handle_manual_save_playlist_tracks(
+        bad_client, bad_raw, engine=FakeEngine(), deps=deps, tracks_fetcher=fake_fetcher,
+    )
+    bad_status, bad_body = _response(bad_client)
+    assert bad_status == 400
+    assert bad_body["code"] == "invalid_playlist_id"
+
+

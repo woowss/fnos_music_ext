@@ -614,6 +614,19 @@ input[type="radio"]:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--f
   padding: 5px 8px;
   font-size: 12px;
 }
+#playlist-tracks-panel {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+#playlist-tracks-list {
+  max-height: 420px;
+  overflow-y: auto;
+}
+.playlist-track-check {
+  flex: none;
+  margin-right: 4px;
+}
 .badge.warn { background: rgba(245, 158, 11, 0.16); color: #b45309; }
 .badge.err { background: rgba(239, 68, 68, 0.14); color: var(--err); }
 

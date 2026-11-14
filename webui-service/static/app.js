@@ -3965,10 +3965,15 @@ const playlistState = {
   job: null,
   positions: [],
   running: false,          // 推进循环在跑（串行守卫）
+  batchRunning: false,     // 勾选批量单曲下载在跑
   stopRequested: false,
   terminal: false,
   message: "",
   storageAvailable: true,
+  previewTracks: [],
+  previewTotal: 0,
+  previewTruncated: false,
+  allSelected: false,
 };
 
 function playlistSleep(ms) {
@@ -4098,21 +4103,58 @@ function playlistRenderPositions(positions) {
   }).join("");
 }
 
+function playlistParseInputId(rawValue) {
+  if (typeof rawValue !== "string") return "";
+  const trimmed = rawValue.trim();
+  if (!trimmed) return "";
+  let digits = "";
+  if (/^[1-9][0-9]{0,18}$/.test(trimmed)) {
+    digits = trimmed;
+  } else {
+    const idParam = trimmed.match(/[?&#/]id=([1-9][0-9]{0,18})(?:[&#/]|$)/i);
+    const pathParam = trimmed.match(/\/playlist\/([1-9][0-9]{0,18})(?:[?#/]|$)/i);
+    digits = (idParam && idParam[1]) || (pathParam && pathParam[1]) || "";
+  }
+  if (!digits) return "";
+  try {
+    const big = BigInt(digits);
+    if (big < 1n || big > 9223372036854775807n) return "";
+  } catch (_) {
+    return "";
+  }
+  return digits;
+}
+
+function playlistResolvedIdText() {
+  const customInput = $("#playlist-custom-input");
+  const customRaw = customInput && typeof customInput.value === "string" ? customInput.value.trim() : "";
+  if (customRaw) {
+    return playlistParseInputId(customRaw);
+  }
+  return Number.isInteger(playlistState.selectedId) && playlistState.selectedId > 0
+    ? String(playlistState.selectedId)
+    : "";
+}
+
 function playlistUpdateButtons() {
   const enabled = playlistState.enabled === true;
-  const busy = playlistState.running === true;
+  const busy = playlistState.running === true || playlistState.batchRunning === true;
   const job = playlistState.job;
   const state = job && typeof job.state === "string" ? job.state : "";
   const blockedForStart = state === "reconciliation_required" || state === "cancelling"
     || state === "paused" || state === "running";
+  const resolvedId = playlistResolvedIdText();
   const select = $("#playlist-select");
   if (select) select.disabled = !enabled || busy;
+  const customInput = $("#playlist-custom-input");
+  if (customInput) customInput.disabled = !enabled || busy;
+  const loadTracksBtn = $("#playlist-load-tracks-btn");
+  if (loadTracksBtn) loadTracksBtn.disabled = !enabled || busy || !resolvedId;
   const refreshBtn = $("#playlist-refresh-btn");
   if (refreshBtn) refreshBtn.disabled = !enabled || busy;
   const snapshotBtn = $("#playlist-snapshot-btn");
   if (snapshotBtn) {
-    snapshotBtn.disabled = !enabled || busy
-      || !Number.isInteger(playlistState.selectedId) || playlistState.selectedId <= 0;
+    snapshotBtn.disabled = !enabled || busy || !resolvedId;
   }
   const startBtn = $("#playlist-start-btn");
   if (startBtn) {
@@ -4121,7 +4163,7 @@ function playlistUpdateButtons() {
     startBtn.disabled = !canStart;
   }
   const stopBtn = $("#playlist-stop-btn");
-  if (stopBtn) stopBtn.disabled = !busy;
+  if (stopBtn) stopBtn.disabled = playlistState.running !== true;
   const cancelBtn = $("#playlist-cancel-btn");
   if (cancelBtn) {
     // §3.8：reconciliation_required 保留取消；cancelling 不再可取消
@@ -4130,6 +4172,13 @@ function playlistUpdateButtons() {
           || state === "reconciliation_required" || state === "paused");
     cancelBtn.disabled = !canCancel;
   }
+  const hasTracks = Array.isArray(playlistState.previewTracks) && playlistState.previewTracks.length > 0;
+  const selAllBtn = $("#playlist-tracks-select-all-btn");
+  if (selAllBtn) selAllBtn.disabled = !enabled || busy || !hasTracks;
+  const selPlayBtn = $("#playlist-tracks-select-playable-btn");
+  if (selPlayBtn) selPlayBtn.disabled = !enabled || busy || !hasTracks;
+  const batchSaveBtn = $("#playlist-tracks-save-btn");
+  if (batchSaveBtn) batchSaveBtn.disabled = !enabled || busy || !hasTracks;
   // 推进中禁用整歌单开关，避免任务运行期改配置
   renderPlaylistToggle();
 }
@@ -4383,6 +4432,7 @@ async function loadPlaylistSaveStatus() {
     playlistState.disabledCode = "disabled";
     if (wasEnabled) { playlistState.job = null; playlistState.positions = []; playlistState.jobId = ""; }
     if (statusEl) statusEl.textContent = "整歌单保存不可用：单曲手动保存未启用。";
+    playlistClearPreview();
     playlistRenderOptions();
     playlistRenderJob();
     playlistUpdateButtons();
@@ -4404,6 +4454,7 @@ async function loadPlaylistSaveStatus() {
     playlistState.positions = [];
     playlistState.message = "";
     playlistState.terminal = false;
+    playlistClearPreview();
     playlistRenderJob();
     playlistUpdateButtons();
     return false;
@@ -4434,27 +4485,51 @@ async function loadPlaylistSaveStatus() {
   return false;
 }
 
+function playlistClearPreview() {
+  playlistState.previewTracks = [];
+  playlistState.previewTotal = 0;
+  playlistState.previewTruncated = false;
+  playlistState.allSelected = false;
+  const panel = $("#playlist-tracks-panel");
+  if (panel) panel.hidden = true;
+  const summary = $("#playlist-tracks-summary");
+  if (summary) summary.textContent = "";
+  const batchStatus = $("#playlist-tracks-batch-status");
+  if (batchStatus) batchStatus.textContent = "";
+  const listEl = $("#playlist-tracks-list");
+  if (listEl) listEl.innerHTML = "";
+}
+
 function playlistSelectPlaylist(value) {
   const playlistId = Number(value);
   playlistState.selectedId = Number.isInteger(playlistId) && playlistId > 0 ? playlistId : 0;
   playlistState.snapshot = null;
   playlistSetSnapshotStatus("");
+  playlistClearPreview();
   playlistUpdateButtons();
 }
 
 async function playlistReadSnapshot() {
   if (!playlistState.enabled) return false;
-  const playlistId = playlistState.selectedId;
-  if (!Number.isInteger(playlistId) || playlistId <= 0) {
-    playlistSetSnapshotStatus("请先选择歌单。");
+  const resolvedIdText = playlistResolvedIdText();
+  const customInput = $("#playlist-custom-input");
+  const hasRawCustom = customInput && typeof customInput.value === "string" && customInput.value.trim();
+  if (hasRawCustom && !resolvedIdText) {
+    playlistSetSnapshotStatus("无法识别歌单链接或 ID，请输入网易云歌单链接或正整数 ID。");
     return false;
   }
+  const playlistId = resolvedIdText ? Number(resolvedIdText) : 0;
+  if (!resolvedIdText || !Number.isInteger(playlistId) || playlistId <= 0) {
+    playlistSetSnapshotStatus("请先选择歌单或输入歌单链接/ID。");
+    return false;
+  }
+  playlistState.selectedId = playlistId;
   playlistState.snapshot = null;
   playlistSetSnapshotStatus("正在读取歌单清单…");
   playlistUpdateButtons();
   let response;
   try {
-    response = await manualSaveApi(PLAYLIST_API + "/snapshot?playlist_id=" + playlistId);
+    response = await manualSaveApi(PLAYLIST_API + "/snapshot?playlist_id=" + encodeURIComponent(resolvedIdText));
   } catch (_) {
     playlistSetSnapshotStatus("读取清单失败：网络错误，请稍后重试；不能创建保存任务。");
     playlistUpdateButtons();
@@ -4484,6 +4559,11 @@ async function playlistReadSnapshot() {
     playlistUpdateButtons();
     return true;
   }
+  if (body && body.code === "playlist_too_large") {
+    playlistSetSnapshotStatus(playlistJobMessage(body, "歌单成员超过 1000 个") + "（可点击「展开曲目」分批勾选保存）；不能创建保存任务。");
+    playlistUpdateButtons();
+    return false;
+  }
   // 不完整/失败：固定文案 + 不进入可创建状态（snapshot 保持 null → 开始按钮 disabled）
   const sourceCode = data && typeof data.source_error_code === "string" && data.source_error_code
     ? "（" + escapeHtml(data.source_error_code) + "）" : "";
@@ -4493,6 +4573,173 @@ async function playlistReadSnapshot() {
   playlistSetSnapshotStatus(prefix + "；不能创建保存任务。");
   playlistUpdateButtons();
   return false;
+}
+
+function playlistRenderTracksPanel(tracks, total, truncated) {
+  const panel = $("#playlist-tracks-panel");
+  const summaryEl = $("#playlist-tracks-summary");
+  const listEl = $("#playlist-tracks-list");
+  const batchStatusEl = $("#playlist-tracks-batch-status");
+  if (batchStatusEl) batchStatusEl.textContent = "";
+  if (panel) panel.hidden = false;
+  const vipCount = tracks.filter((t) => t && t.playable_status === "vip_required").length;
+  const unavailableCount = tracks.filter(
+    (t) => t && ["paid_album", "copyright", "trial", "unavailable"].includes(t.playable_status)
+  ).length;
+  const summaryParts = ["已展开 " + tracks.length + " 首"];
+  if (total > tracks.length || truncated) {
+    summaryParts.push("原歌单共 " + total + " 首，当前预览与单批上限为 1000 首");
+  }
+  if (vipCount > 0) summaryParts.push("其中 " + vipCount + " 首需黑胶VIP");
+  if (unavailableCount > 0) summaryParts.push(unavailableCount + " 首受限/仅试听");
+  if (summaryEl) summaryEl.textContent = summaryParts.join(" · ");
+  if (!listEl) return;
+  if (!tracks.length) {
+    listEl.innerHTML = '<span class="muted pad">歌单暂无曲目</span>';
+    return;
+  }
+  listEl.innerHTML = tracks.map((track, idx) => {
+    const sid = Number(track && track.song_id) || 0;
+    const title = escapeHtml((track && track.title) || "未知曲目");
+    const qLabel = formatSaveTrackQualityBadge(track);
+    const qHtml = qLabel ? `<span class="badge save-q-badge">${escapeHtml(qLabel)}</span>` : "";
+    const pBadge = formatSaveTrackPlayableBadge(track);
+    const pHtml = pBadge
+      ? `<span class="badge save-p-badge ${escapeHtml(pBadge.cls)}">${escapeHtml(pBadge.text)}</span>`
+      : "";
+    const meta = [track && track.artist, track && track.album, formatSaveDuration(track && track.duration)]
+      .filter((part) => typeof part === "string" && part)
+      .map((part) => escapeHtml(part))
+      .join(" · ");
+    const playableAttr = (!track || !track.playable_status || track.playable_status === "ok") ? "1" : "0";
+    return `
+      <div class="lx-item playlist-track-item" data-song-id="${sid}">
+        <input class="playlist-track-check" type="checkbox" data-song-id="${sid}" data-playable="${playableAttr}" aria-label="选择曲目">
+        <div class="lx-item-main">
+          <div class="lx-item-header"><span class="badge dim">#${idx + 1}</span><span class="lx-item-name">${title}</span>${qHtml}${pHtml}</div>
+          <div class="lx-item-url">${meta || "未知歌手"}</div>
+        </div>
+        <div class="lx-item-btns">
+          <select class="select small playlist-track-quality" aria-label="曲目下载音质">
+            ${renderSaveTrackQualityOptions(track)}
+          </select>
+          <span class="muted playlist-track-state"></span>
+        </div>
+      </div>`;
+  }).join("");
+}
+
+async function playlistLoadTracks() {
+  if (!playlistState.enabled) return false;
+  const resolvedIdText = playlistResolvedIdText();
+  if (!resolvedIdText) {
+    playlistSetSnapshotStatus("请输入有效的网易云歌单链接或正整数 ID。");
+    return false;
+  }
+  playlistSetSnapshotStatus("正在展开歌单曲目…");
+  playlistUpdateButtons();
+  let response;
+  try {
+    response = await manualSaveApi(PLAYLIST_API + "/tracks?playlist_id=" + encodeURIComponent(resolvedIdText));
+  } catch (_) {
+    playlistSetSnapshotStatus("展开曲目失败：网络错误，请稍后重试。");
+    playlistUpdateButtons();
+    return false;
+  }
+  const body = (response && response.body) || {};
+  const data = (body && body.data) || {};
+  if (!(response && response.ok === true && body.ok === true && Array.isArray(data.tracks))) {
+    playlistSetSnapshotStatus("展开曲目失败：" + playlistJobMessage(body, "服务不可用") + "。");
+    playlistUpdateButtons();
+    return false;
+  }
+  playlistState.previewTracks = data.tracks;
+  playlistState.previewTotal = Number.isInteger(data.total) ? data.total : data.tracks.length;
+  playlistState.previewTruncated = data.truncated === true;
+  playlistState.allSelected = false;
+  playlistRenderTracksPanel(playlistState.previewTracks, playlistState.previewTotal, playlistState.previewTruncated);
+  playlistSetSnapshotStatus("已展开歌单曲目，可勾选曲目单独下载，或点击「读取清单」执行整单任务。");
+  playlistUpdateButtons();
+  return true;
+}
+
+function playlistApplyTrackSelection(mode) {
+  const listEl = $("#playlist-tracks-list");
+  if (!listEl) return;
+  const boxes = Array.from(listEl.querySelectorAll(".playlist-track-check"));
+  if (!boxes.length) return;
+  if (mode === "playable") {
+    boxes.forEach((box) => { box.checked = box.dataset.playable === "1"; });
+    playlistState.allSelected = boxes.every((box) => box.checked);
+  } else {
+    const next = !playlistState.allSelected;
+    boxes.forEach((box) => { box.checked = next; });
+    playlistState.allSelected = next;
+  }
+}
+
+async function playlistSaveSelectedTracks() {
+  if (!playlistState.enabled || !saveState.enabled || playlistState.batchRunning) return false;
+  const listEl = $("#playlist-tracks-list");
+  const batchStatusEl = $("#playlist-tracks-batch-status");
+  if (!listEl) return false;
+  const checked = Array.from(listEl.querySelectorAll(".playlist-track-check"))
+    .filter((box) => box.checked && Number(box.dataset.songId) > 0);
+  if (!checked.length) {
+    if (batchStatusEl) batchStatusEl.textContent = "请先勾选至少一首曲目";
+    return false;
+  }
+  playlistState.batchRunning = true;
+  playlistUpdateButtons();
+  let okCount = 0;
+  let conflictCount = 0;
+  let failCount = 0;
+  try {
+    for (let i = 0; i < checked.length; i += 1) {
+      const box = checked[i];
+      const sid = Number(box.dataset.songId);
+      const row = box.closest(".playlist-track-item");
+      const stateEl = row ? row.querySelector(".playlist-track-state") : null;
+      const qualityEl = row ? row.querySelector(".playlist-track-quality") : null;
+      const chosenQuality = qualityEl && typeof qualityEl.value === "string"
+        && ["sky", "jymaster", "hires", "lossless", "exhigh"].includes(qualityEl.value)
+        ? qualityEl.value
+        : "";
+      if (batchStatusEl) batchStatusEl.textContent = `正在保存 ${i + 1}/${checked.length}…`;
+      if (stateEl) stateEl.textContent = "保存中…";
+      try {
+        const postBody = chosenQuality ? { song_id: sid, quality: chosenQuality } : { song_id: sid };
+        const { body } = await manualSaveApiWithRetry("/api/manual-save/track", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(postBody),
+        });
+        if (body && body.ok === true && body.code === "ok") {
+          okCount += 1;
+          const d = body.data || {};
+          const actual = d.quality_actual_status === "reported" && d.quality_actual ? d.quality_actual : "已保存";
+          const kbps = Number.isInteger(d.br) && d.br > 0 ? " · " + Math.round(d.br / 1000) + "k" : "";
+          if (stateEl) stateEl.textContent = actual + kbps;
+        } else if (body && body.code === "conflict") {
+          conflictCount += 1;
+          if (stateEl) stateEl.textContent = "已存在";
+        } else {
+          failCount += 1;
+          if (stateEl) stateEl.textContent = manualSaveMessage(body, "失败");
+        }
+      } catch (_) {
+        failCount += 1;
+        if (stateEl) stateEl.textContent = "网络错误";
+      }
+    }
+    if (batchStatusEl) {
+      batchStatusEl.textContent = `完成：成功 ${okCount}，已存在 ${conflictCount}，失败 ${failCount}`;
+    }
+    return failCount === 0;
+  } finally {
+    playlistState.batchRunning = false;
+    playlistUpdateButtons();
+  }
 }
 
 async function playlistRefreshJob(jobId) {
@@ -4851,7 +5098,35 @@ if (playlistRefreshButton) {
 }
 const playlistSelectEl = $("#playlist-select");
 if (playlistSelectEl) {
-  playlistSelectEl.addEventListener("change", () => { playlistSelectPlaylist(playlistSelectEl.value); });
+  playlistSelectEl.addEventListener("change", () => {
+    const customInput = $("#playlist-custom-input");
+    if (customInput) customInput.value = "";
+    playlistSelectPlaylist(playlistSelectEl.value);
+  });
+}
+const playlistCustomInput = $("#playlist-custom-input");
+if (playlistCustomInput) {
+  playlistCustomInput.addEventListener("input", () => {
+    playlistState.snapshot = null;
+    playlistClearPreview();
+    playlistUpdateButtons();
+  });
+}
+const playlistLoadTracksButton = $("#playlist-load-tracks-btn");
+if (playlistLoadTracksButton) {
+  playlistLoadTracksButton.addEventListener("click", () => { void playlistLoadTracks(); });
+}
+const playlistTracksSelectAllBtn = $("#playlist-tracks-select-all-btn");
+if (playlistTracksSelectAllBtn) {
+  playlistTracksSelectAllBtn.addEventListener("click", () => { playlistApplyTrackSelection("toggle_all"); });
+}
+const playlistTracksSelectPlayableBtn = $("#playlist-tracks-select-playable-btn");
+if (playlistTracksSelectPlayableBtn) {
+  playlistTracksSelectPlayableBtn.addEventListener("click", () => { playlistApplyTrackSelection("playable"); });
+}
+const playlistTracksSaveBtn = $("#playlist-tracks-save-btn");
+if (playlistTracksSaveBtn) {
+  playlistTracksSaveBtn.addEventListener("click", () => { void playlistSaveSelectedTracks(); });
 }
 const playlistSnapshotButton = $("#playlist-snapshot-btn");
 if (playlistSnapshotButton) {

@@ -4339,6 +4339,98 @@ test("手动保存 B1-2：搜索结果渲染真实音质/VIP徽标并透传单�
   assert.ok(resultText.includes("96 kHz"));
 });
 
+plTest("B1-3：支持粘贴任意公开歌单链接/ID、展开曲目详情及勾选批量下载", async () => {
+  assert.strictEqual(global.playlistParseInputId("https://music.163.com/#/playlist?id=7368514547"), "7368514547");
+  assert.strictEqual(global.playlistParseInputId("7368514547"), "7368514547");
+  assert.strictEqual(global.playlistParseInputId("https://example.com/not-a-playlist"), "");
+
+  await plEnable([]);
+
+  const customInput = els.get("#playlist-custom-input");
+  customInput.value = "https://music.163.com/playlist?id=7368514547&userid=1001";
+  await customInput.dispatch("input");
+  assert.strictEqual(els.get("#playlist-load-tracks-btn").disabled, false);
+  assert.strictEqual(els.get("#playlist-snapshot-btn").disabled, false);
+
+  enqueue(PL_PATH + "/tracks", {
+    ok: true,
+    code: "ok",
+    message: "",
+    data: {
+      playlist_id: 7368514547,
+      total: 1250,
+      truncated: true,
+      tracks: [
+        {
+          song_id: 9001,
+          title: "Track One",
+          artist: "Artist 1",
+          album: "Album 1",
+          max_quality: "jymaster",
+          playable_status: "ok",
+          fee: 0,
+          has_sky: false,
+          duration: 200000,
+        },
+        {
+          song_id: 9002,
+          title: "VIP Track",
+          artist: "Artist 2",
+          album: "Album 2",
+          max_quality: "hires",
+          playable_status: "vip_required",
+          fee: 1,
+          has_sky: false,
+          duration: 180000,
+        },
+      ],
+    },
+  });
+  await global.playlistLoadTracks();
+  assert.strictEqual(els.get("#playlist-tracks-panel").hidden, false);
+  const summary = els.get("#playlist-tracks-summary").textContent;
+  assert.ok(summary.includes("1250") && summary.includes("1000"), summary);
+  const listHtml = els.get("#playlist-tracks-list").innerHTML;
+  assert.ok(listHtml.includes("超清母带 · jymaster"));
+  assert.ok(listHtml.includes("需黑胶VIP"));
+
+  // Snapshot returns tracks for 64-bit custom ID
+  enqueue(PL_PATH + "/snapshot", {
+    ok: true,
+    code: "ok",
+    message: "",
+    data: {
+      playlist_id: 7368514547,
+      track_count: 14,
+      position_count: 14,
+      duplicate_position_count: 0,
+      enumeration_complete: true,
+      source_fingerprint: PL_FP,
+    },
+  });
+  await global.playlistReadSnapshot();
+  const snapCall = fetchCalls.filter((c) => c.path.endsWith("/playlist/snapshot")).pop();
+  assert.ok(snapCall.url.includes("playlist_id=7368514547"), snapCall.url);
+
+  // Batch download selected playable track via playlistSaveSelectedTracks
+  const playableCheck = { checked: true, dataset: { songId: "9001", playable: "1" }, closest: () => null };
+  const rowState = stubEl();
+  const rowQuality = { value: "hires" };
+  playableCheck.closest = () => ({
+    querySelector: (sel) => (sel === ".playlist-track-quality" ? rowQuality : rowState),
+  });
+  els.get("#playlist-tracks-list").querySelectorAll = () => [playableCheck];
+  enqueue("/app/fnmusic-ext/api/manual-save/track", {
+    ok: true,
+    code: "ok",
+    data: { quality_actual_status: "reported", quality_actual: "hires", br: 1920000 },
+  });
+  await global.playlistSaveSelectedTracks();
+  const posted = fetchCalls.filter((c) => c.path.endsWith("/manual-save/track")).pop();
+  assert.deepStrictEqual(JSON.parse(posted.body), { song_id: 9001, quality: "hires" });
+  assert.ok(els.get("#playlist-tracks-batch-status").textContent.includes("成功 1"));
+});
+
 /* ------------------------------------------------ 运行 --------------------- */
 (async () => {
   let failed = 0;

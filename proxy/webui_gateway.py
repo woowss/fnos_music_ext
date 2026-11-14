@@ -246,6 +246,10 @@ MANUAL_SAVE_PLAYLIST_CANCEL_PATHS = (
     "/app/fnmusic-ext/api/manual-save/playlist/cancel",
     "/api/manual-save/playlist/cancel",
 )
+MANUAL_SAVE_PLAYLIST_TRACKS_PATHS = (
+    "/app/fnmusic-ext/api/manual-save/playlist/tracks",
+    "/api/manual-save/playlist/tracks",
+)
 # One advance is one track; §7.3 forbids any budget above the single-track one.
 MANUAL_SAVE_PLAYLIST_TIMEOUT = MANUAL_SAVE_TIMEOUT
 # Bounded read budget for the producer/list calls (§8.3 item 2).
@@ -2272,21 +2276,22 @@ def _manual_save_playlist_loopback_target(base_url: object) -> "tuple[str, int]"
     return parts.hostname, port
 
 
-def _manual_save_playlist_default_list_fetcher(timeout: float) -> object:
-    """GET musicbox ``/api/v1/user/playlists?limit=100`` over bounded loopback HTTP."""
+def _manual_save_playlist_loopback_get_json(
+    path: str,
+    timeout: float,
+    *,
+    max_bytes: int = MANUAL_SAVE_PLAYLIST_MAX_JSON_BYTES,
+) -> object:
+    """GET one bounded JSON response from musicbox-service over loopback HTTP."""
     host, port = _manual_save_playlist_loopback_target(
         _manual_save_playlist_musicbox_url())
     connection = http.client.HTTPConnection(host, port, timeout=timeout)
     try:
         try:
-            connection.request(
-                "GET",
-                "/api/v1/user/playlists?limit="
-                + str(MANUAL_SAVE_PLAYLIST_MAX_LIST_ROWS),
-            )
+            connection.request("GET", path)
             response = connection.getresponse()
             status = response.status
-            body = response.read(MANUAL_SAVE_PLAYLIST_MAX_JSON_BYTES + 1)
+            body = response.read(max_bytes + 1)
         except (socket.timeout, TimeoutError):
             raise manual_save_playlist_jobs.ProducerError(
                 manual_save_playlist_jobs.PRODUCER_TIMEOUT) from None
@@ -2298,7 +2303,7 @@ def _manual_save_playlist_default_list_fetcher(timeout: float) -> object:
             connection.close()
         except OSError:
             pass
-    if len(body) > MANUAL_SAVE_PLAYLIST_MAX_JSON_BYTES:
+    if len(body) > max_bytes:
         raise manual_save_playlist_jobs.ProducerError(
             manual_save_playlist_jobs.PRODUCER_RESPONSE_TOO_LARGE)
     if status != 200:
@@ -2309,6 +2314,23 @@ def _manual_save_playlist_default_list_fetcher(timeout: float) -> object:
     except (UnicodeError, ValueError):
         raise manual_save_playlist_jobs.ProducerError(
             manual_save_playlist_jobs.PRODUCER_MALFORMED_RESPONSE) from None
+
+
+def _manual_save_playlist_default_list_fetcher(timeout: float) -> object:
+    """GET musicbox ``/api/v1/user/playlists?limit=100`` over bounded loopback HTTP."""
+    return _manual_save_playlist_loopback_get_json(
+        "/api/v1/user/playlists?limit=" + str(MANUAL_SAVE_PLAYLIST_MAX_LIST_ROWS),
+        timeout,
+    )
+
+
+def _manual_save_playlist_default_tracks_fetcher(playlist_id: int, timeout: float) -> object:
+    """GET musicbox ``/api/v1/public-playlists/{id}/tracks`` over bounded loopback HTTP."""
+    return _manual_save_playlist_loopback_get_json(
+        f"/api/v1/public-playlists/{int(playlist_id)}/tracks",
+        timeout,
+        max_bytes=MANUAL_SAVE_PLAYLIST_MAX_JSON_BYTES * 4,
+    )
 
 
 def _manual_save_playlist_list_data(payload: object) -> dict:
@@ -2373,6 +2395,125 @@ def _manual_save_playlist_list_data(payload: object) -> dict:
 
 def _manual_save_playlist_list_result(fetcher, timeout: float) -> dict:
     return _manual_save_playlist_result(_manual_save_playlist_list_data(fetcher(timeout)))
+
+
+def _manual_save_playlist_tracks_data(playlist_id: int, payload: object) -> dict:
+    """Sanitize playlist track preview rows; drop URLs and raw upstream blobs."""
+    if not isinstance(payload, Mapping) or payload.get("ok") is not True:
+        raise manual_save_playlist_jobs.ServiceError("playlist_unavailable")
+    raw_tracks = payload.get("data")
+    if not isinstance(raw_tracks, list):
+        raise manual_save_playlist_jobs.ServiceError("playlist_unavailable")
+    tracks: list[dict] = []
+    for row in raw_tracks:
+        if len(tracks) >= MANUAL_SAVE_PLAYLIST_MAX_POSITIONS:
+            break
+        if not isinstance(row, Mapping):
+            continue
+        sid = row.get("song_id")
+        if type(sid) is not int or isinstance(sid, bool) or sid <= 0:
+            continue
+        title = row.get("name")
+        if type(title) is not str:
+            title = row.get("title")
+        title_str = title.strip()[:MANUAL_SAVE_PLAYLIST_MAX_NAME_CHARS] if type(title) is str else ""
+        artist = row.get("artist")
+        artist_str = artist.strip()[:MANUAL_SAVE_PLAYLIST_MAX_NAME_CHARS] if type(artist) is str else ""
+        album = row.get("album_name")
+        if type(album) is not str:
+            album = row.get("album")
+        album_str = album.strip()[:MANUAL_SAVE_PLAYLIST_MAX_NAME_CHARS] if type(album) is str else ""
+        raw_max_q = row.get("max_quality")
+        max_q = (
+            raw_max_q.strip().casefold()
+            if type(raw_max_q) is str and _MANUAL_SAVE_QUALITY_TOKEN_RE.fullmatch(raw_max_q.strip().casefold())
+            else ""
+        )
+        raw_playable = row.get("playable_status")
+        clean_playable = raw_playable.strip().casefold() if type(raw_playable) is str else ""
+        playable_status = (
+            clean_playable if clean_playable in _MANUAL_SAVE_SEARCH_PLAYABLE_STATUSES else ""
+        )
+        raw_fee = row.get("fee")
+        fee = raw_fee if type(raw_fee) is int and not isinstance(raw_fee, bool) and raw_fee >= 0 else 0
+        raw_dur = row.get("duration_ms")
+        if type(raw_dur) is not int or isinstance(raw_dur, bool) or raw_dur < 0:
+            raw_dur = row.get("duration")
+        duration = raw_dur if type(raw_dur) is int and not isinstance(raw_dur, bool) and raw_dur >= 0 else 0
+        tracks.append({
+            "song_id": sid,
+            "title": title_str,
+            "artist": artist_str,
+            "album": album_str,
+            "max_quality": max_q,
+            "playable_status": playable_status,
+            "fee": fee,
+            "has_sq": row.get("has_sq") is True,
+            "has_hr": row.get("has_hr") is True,
+            "has_jm": row.get("has_jm") is True,
+            "has_sky": row.get("has_sky") is True,
+            "duration": duration,
+        })
+    raw_total = payload.get("total")
+    total = raw_total if type(raw_total) is int and not isinstance(raw_total, bool) and raw_total >= len(tracks) else len(tracks)
+    truncated = (payload.get("truncated") is True) or (total > len(tracks))
+    return {
+        "playlist_id": playlist_id,
+        "total": total,
+        "truncated": truncated,
+        "tracks": tracks,
+    }
+
+
+def _manual_save_playlist_tracks_result(fetcher, playlist_id: int, timeout: float) -> dict:
+    return _manual_save_playlist_result(
+        _manual_save_playlist_tracks_data(playlist_id, fetcher(playlist_id, timeout))
+    )
+
+
+def handle_manual_save_playlist_tracks(client: socket.socket, head_raw: bytes, *,
+                                       deps=None, engine=None,
+                                       tracks_fetcher=None, timeout=None) -> None:
+    """GET .../playlist/tracks?playlist_id=N: sanitized playlist track preview."""
+    try:
+        parsed = _manual_save_playlist_get_head(
+            client, head_raw,
+            targets=MANUAL_SAVE_PLAYLIST_TRACKS_PATHS, allow_query=True)
+        if parsed is None:
+            return
+        headers, target = parsed
+        if _manual_save_playlist_actor_scope(head_raw, headers) is None:
+            _send_manual_save_playlist(
+                client, 403, _manual_save_playlist_error("forbidden"))
+            return
+        _active, failed = _manual_save_playlist_gate(client, engine, deps)
+        if failed:
+            return
+        value, query_error = _manual_save_playlist_query_value(target, "playlist_id")
+        if query_error:
+            _send_manual_save_playlist(
+                client, 400, _manual_save_playlist_error(query_error))
+            return
+        playlist_id = _manual_save_playlist_parse_playlist_id(value)
+        if playlist_id is None:
+            _send_manual_save_playlist(
+                client, 400, _manual_save_playlist_error("invalid_playlist_id"))
+            return
+        budget = MANUAL_SAVE_PLAYLIST_READ_TIMEOUT if timeout is None else timeout
+        fetcher = (
+            _manual_save_playlist_default_tracks_fetcher
+            if tracks_fetcher is None
+            else tracks_fetcher
+        )
+        _manual_save_playlist_run(
+            client,
+            lambda: _manual_save_playlist_tracks_result(fetcher, playlist_id, budget),
+            budget,
+        )
+    except OSError:
+        pass
+    finally:
+        _close_quietly(client)
 
 
 def handle_manual_save_playlist_playlists(client: socket.socket, head_raw: bytes, *,
@@ -2632,6 +2773,7 @@ def handle_manual_save_playlist_cancel(client: socket.socket, head_raw: bytes, *
 _MANUAL_SAVE_PLAYLIST_ROUTES = (
     ("playlists", "GET", MANUAL_SAVE_PLAYLIST_PLAYLISTS_PATHS),
     ("snapshot", "GET", MANUAL_SAVE_PLAYLIST_SNAPSHOT_PATHS),
+    ("tracks", "GET", MANUAL_SAVE_PLAYLIST_TRACKS_PATHS),
     ("create", "POST", MANUAL_SAVE_PLAYLIST_JOBS_PATHS),
     ("job", "GET", MANUAL_SAVE_PLAYLIST_JOB_PATHS),
     ("advance", "POST", MANUAL_SAVE_PLAYLIST_ADVANCE_PATHS),
@@ -2640,6 +2782,7 @@ _MANUAL_SAVE_PLAYLIST_ROUTES = (
 _MANUAL_SAVE_PLAYLIST_HANDLERS = {
     "playlists": handle_manual_save_playlist_playlists,
     "snapshot": handle_manual_save_playlist_snapshot,
+    "tracks": handle_manual_save_playlist_tracks,
     "create": handle_manual_save_playlist_create,
     "job": handle_manual_save_playlist_job,
     "advance": handle_manual_save_playlist_advance,
