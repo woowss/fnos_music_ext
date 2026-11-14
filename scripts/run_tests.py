@@ -67,6 +67,20 @@ def print_child_log(text: str) -> None:
 def suite_environment(name: str, work: Path) -> dict[str, str]:
     """Build a suite environment without leaking test state to the caller."""
     env = os.environ.copy()
+    if name == "offline":
+        if sys.platform == "linux":
+            offline_root = (work / "offline" / "runner").resolve()
+            offline_root.mkdir(parents=True, exist_ok=True)
+            os.chmod(offline_root, 0o700)
+            marker = offline_root / ".fnmusic-offline-isolated-runner"
+            if not marker.exists():
+                marker.write_bytes(b"fnmusic-offline-isolated-runner-v1\n")
+            os.chmod(marker, 0o400)
+            env.update({
+                "FNMUSIC_OFFLINE_TEST_ISOLATION": "dedicated-disposable-runner-v1",
+                "FNMUSIC_OFFLINE_TEST_ROOT": str(offline_root),
+            })
+        return env
     if name != "proxy":
         return env
 

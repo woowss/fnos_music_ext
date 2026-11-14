@@ -867,7 +867,8 @@ def test_observer_exception_does_not_change_forwarded_head_bytes(monkeypatch):
 
     assert observer_calls == [(client, raw)]
     assert threads[0][1][0] is client and threads[0][1][1] is remote
-    assert threads[0][1][2] == raw
+    assert threads[0][1][2] == gw._force_connection_close(raw)
+    assert threads[0][1][2] == b"GET /unchanged HTTP/1.1\r\nX-Data: secret\r\nConnection: close\r\n\r\nBODY"
 
 
 def test_default_handle_does_not_read_peer_and_keeps_strict_head_boundary(monkeypatch):
@@ -903,8 +904,8 @@ def test_default_handle_does_not_read_peer_and_keeps_strict_head_boundary(monkey
     gw._handle(client, ("unused", 0))
 
     # L2 admission lives at accept time (serve), never in the per-request
-    # handler; the L3 boundary is the only identity parse and it must leave the
-    # forwarded head bytes untouched.
+    # handler; the L3 boundary is the only identity parse and non-Upgrade HTTP
+    # heads only gain Connection: close so nginx cannot reuse the tunnel.
     assert len(parsed) == 1
     assert forwarded[0][0] is client and forwarded[0][1] is remote
-    assert forwarded[0][2] == raw
+    assert forwarded[0][2] == b"GET /ordinary HTTP/1.1\r\nX-Trim-IsAdmin: true\r\nConnection: close\r\n\r\n"
